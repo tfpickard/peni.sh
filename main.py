@@ -211,7 +211,7 @@ async def root():
                     <head>
                         <meta charset="utf-8">
                         <meta name="viewport" content="width=device-width, initial-scale=1">
-                        <title>peni.sh - AI-Powered WiFi Name Generator | Creative SSID & Password Generator</title>
+                        <title>peni.sh - State of the Art WiFi Name Generator | Sophistiicated SSID & Password Generator</title>
                         <meta name="description" content="Generate creative WiFi network names and memorable passwords using AI. Free online tool for unique SSID generation with easy-to-remember password patterns.">
                         <meta name="keywords" content="wifi name generator, ssid generator, creative wifi names, password generator, ai wifi names, network name ideas">
                         <link rel="canonical" href="https://peni.sh">
@@ -409,11 +409,11 @@ async def root():
                                 </div>
                                 <div class="feature">
                                     <h3>🔐 Smart Passwords</h3>
-                                    <p>Generates passwords that are easy to derive from the SSID</p>
+                                    <p>Generates insecure passwords that are way too easy to derive from the SSID</p>
                                 </div>
                                 <div class="feature">
                                     <h3>🆓 Completely Free</h3>
-                                    <p>No registration, no limits, no cost - just great WiFi names</p>
+                                    <p>No registration, no limits, no cost - just WiFi names and hopelessly insecure Passwords</p>
                                 </div>
                                 <div class="feature">
                                     <h3>🚀 Instant Results</h3>
@@ -422,7 +422,7 @@ async def root():
                             </div>
                             
                             <div style="margin-top: 40px;">
-                                <h3>🎯 Perfect For:</h3>
+                                <h3>🎯 Suboptimal For:</h3>
                                 <p>Home networks • Office WiFi • Coffee shops • Events • Hotels • Co-working spaces</p>
                             </div>
                         </div>
