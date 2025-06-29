@@ -2,117 +2,172 @@ name: 🚀 Deploy peni.sh to Production
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   deploy:
     name: 🌍 Deploy to Server
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: 📥 Checkout Code
-      uses: actions/checkout@v4
-      
-    - name: 🔐 Setup SSH
-      uses: webfactory/ssh-agent@v0.7.0
-      with:
-        ssh-private-key: ${{ secrets.SSH_KEY }}
-        
-    - name: 🚀 Deploy to Server
-      run: |
-        ssh -o StrictHostKeyChecking=no ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'ENDSSH'
-          # Navigate to project directory
-          cd /opt/penish-repo || { 
-            echo "Creating project directory..."
-            sudo mkdir -p /opt/penish-repo
-            sudo chown $(whoami):$(whoami) /opt/penish-repo
-            cd /opt/penish-repo
-          }
-          
-          # Clone or pull latest changes
-          if [ ! -d ".git" ]; then
-            echo "🔄 Initial clone..."
-            git clone ${{ github.event.repository.clone_url }} .
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+
+      - name: 🚀 Deploy to Server
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'ENDSSH'
+            set -e
+            
+            echo "🚀 Starting deployment..."
+            
+            cd /opt/penish-repo || { 
+              echo "Creating project directory..."
+              sudo mkdir -p /opt/penish-repo
+              sudo chown $(whoami):$(whoami) /opt/penish-repo
+              cd /opt/penish-repo
+            }
+            
+            if [ ! -d ".git" ]; then
+              echo "🔄 Initial clone..."
+              git clone ${{ github.event.repository.clone_url }} .
+            else
+              echo "🔄 Pulling latest changes..."
+              git fetch --all
+              git reset --hard origin/main
+            fi
+            
+            echo "🔧 Setting up environment variables..."
+            sudo rm -f /opt/penish/.env
+            echo "IMAGE_DIR=/var/www/peni.sh/images" | sudo tee /opt/penish/.env >/dev/null
+            echo "ENVIRONMENT=production" | sudo tee -a /opt/penish/.env >/dev/null
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" | sudo tee -a /opt/penish/.env >/dev/null
+            echo "OPENAI_MODEL=gpt-4" | sudo tee -a /opt/penish/.env >/dev/null
+            sudo chmod 600 /opt/penish/.env
+            sudo chown penish:penish /opt/penish/.env
+
+            echo "📁 Copying application files..."
+            if [ -f "main.py" ]; then
+              sudo cp main.py /opt/penish/
+              sudo chown penish:penish /opt/penish/main.py
+              echo "✅ Copied main.py"
+            fi
+            
+            if [ -f "requirements.txt" ]; then
+              sudo cp requirements.txt /opt/penish/
+              echo "✅ Copied requirements.txt"
+            fi
+            
+            if [ -f "nginx.conf" ]; then
+              sudo cp nginx.conf /etc/nginx/sites-available/peni.sh
+              echo "✅ Copied nginx.conf"
+            fi
+            
+            echo "🐍 Installing Python dependencies..."
+            sudo -u penish /opt/penish/venv/bin/pip install -r /opt/penish/requirements.txt
+            
+            echo "🧪 Testing nginx configuration..."
+            sudo nginx -t
+            
+            echo "🔄 Restarting services..."
+            sudo systemctl restart penish
+            sudo systemctl reload nginx
+            
+            echo "✅ Verifying services..."
+            sleep 5
+            
+            if sudo systemctl is-active --quiet penish; then
+              echo "✅ penish service is running"
+            else
+              echo "❌ penish service failed to start"
+              sudo journalctl -u penish --no-pager -l | tail -5
+              exit 1
+            fi
+            
+            if sudo systemctl is-active --quiet nginx; then
+              echo "✅ nginx service is running"
+            else
+              echo "❌ nginx service failed to start"  
+              sudo journalctl -u nginx --no-pager -l | tail -5
+              exit 1
+            fi
+            
+            echo "🎉 Deployment completed successfully!"
+          ENDSSH
+
+      - name: 🧪 Test Deployment
+        run: |
+          echo "⏳ Waiting for services to fully start..."
+          sleep 15
+
+          echo "🔍 Testing deployment with multiple methods..."
+          SUCCESS=false
+
+          # Try HTTPS first
+          echo "Testing HTTPS..."
+          if curl -f -s --max-time 10 https://${{ secrets.HOST }}/health | grep -q "healthy"; then
+            echo "✅ HTTPS Health check passed!"
+            SUCCESS=true
+            WORKING_URL="https://${{ secrets.HOST }}"
           else
-            echo "🔄 Pulling latest changes..."
-            git fetch --all
-            git reset --hard origin/main
+            echo "⚠️ HTTPS failed, trying HTTP..."
+            
+            # Try HTTP
+            if curl -f -s --max-time 10 http://${{ secrets.HOST }}/health | grep -q "healthy"; then
+              echo "✅ HTTP Health check passed!"  
+              SUCCESS=true
+              WORKING_URL="http://${{ secrets.HOST }}"
+            else
+              echo "⚠️ HTTP failed, trying direct port..."
+              
+              # Try direct port 8000
+              if curl -f -s --max-time 10 http://${{ secrets.HOST }}:8000/health | grep -q "healthy"; then
+                echo "✅ Direct port 8000 health check passed!"
+                SUCCESS=true
+                WORKING_URL="http://${{ secrets.HOST }}:8000"
+              else
+                echo "❌ All connection methods failed!"
+                echo
+                echo "Debug information:"
+                echo "=================="
+                echo "HTTPS response:"
+                curl -v --max-time 10 https://${{ secrets.HOST }}/health 2>&1 || echo "No HTTPS response"
+                echo
+                echo "HTTP response:"
+                curl -v --max-time 10 http://${{ secrets.HOST }}/health 2>&1 || echo "No HTTP response"  
+                echo
+                echo "Direct port response:"
+                curl -v --max-time 10 http://${{ secrets.HOST }}:8000/health 2>&1 || echo "No direct port response"
+              fi
+            fi
           fi
-          
-          # Set up environment variables using echo instead of cat
-          echo "🔧 Setting up environment variables..."
-          sudo rm -f /opt/penish/.env
-          echo "IMAGE_DIR=/var/www/peni.sh/images" | sudo tee /opt/penish/.env
-          echo "ENVIRONMENT=production" | sudo tee -a /opt/penish/.env
-          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" | sudo tee -a /opt/penish/.env
-          echo "OPENAI_MODEL=gpt-4" | sudo tee -a /opt/penish/.env
-          sudo chmod 600 /opt/penish/.env
-          sudo chown penish:penish /opt/penish/.env
-        
-          # Copy files to production directory
-          echo "📁 Copying application files..."
-          sudo cp main.py /opt/penish/ 2>/dev/null || echo "main.py not found, skipping"
-          sudo cp requirements.txt /opt/penish/ 2>/dev/null || echo "requirements.txt not found, skipping"
-          sudo cp nginx.conf /etc/nginx/sites-available/peni.sh 2>/dev/null || echo "nginx.conf not found, skipping"
-          sudo chown penish:penish /opt/penish/main.py 2>/dev/null || true
-          
-          # Install/update Python dependencies
-          echo "🐍 Installing Python dependencies..."
-          sudo -u penish /opt/penish/venv/bin/pip install -r /opt/penish/requirements.txt
-          
-          # Test nginx configuration
-          echo "🧪 Testing nginx configuration..."
-          sudo nginx -t
-          
-          # Restart services
-          echo "🔄 Restarting services..."
-          sudo systemctl restart penish
-          sudo systemctl reload nginx
-          
-          # Verify services are running
-          echo "✅ Verifying services..."
-          sleep 5
-          if sudo systemctl is-active --quiet penish; then
-            echo "✅ penish service is running"
+
+          if [ "$SUCCESS" = true ]; then
+            echo
+            echo "🔍 Testing WiFi API endpoint..."
+            if curl -f -s --max-time 10 ${WORKING_URL}/api/wifi | grep -q "ssid"; then
+              echo "✅ WiFi API is working!"
+              echo "Sample response:"
+              curl -s --max-time 10 ${WORKING_URL}/api/wifi | head -3
+              echo
+              echo "🎉 All tests passed! Deployment successful!"
+              echo "🌐 Your site is available at: ${WORKING_URL}"
+            else
+              echo "⚠️ Health check passed but WiFi API failed!"
+              echo "This might be an OpenAI API key issue."
+              echo "API response:"
+              curl -s --max-time 10 ${WORKING_URL}/api/wifi || echo "No API response"
+              exit 1
+            fi
           else
-            echo "❌ penish service failed to start"
-            sudo journalctl -u penish --no-pager -l
+            echo "❌ Health check failed - deployment has issues"
+            exit 1
           fi
-          
-          if sudo systemctl is-active --quiet nginx; then
-            echo "✅ nginx service is running"
-          else
-            echo "❌ nginx service failed to start"
-            sudo journalctl -u nginx --no-pager -l
-          fi
-          
-          echo "✅ Deployment completed successfully!"
-        ENDSSH
-        
-    - name: 🧪 Test Deployment
-      run: |
-        echo "⏳ Waiting for services to fully start..."
-        sleep 15
-        
-        # Test health endpoint
-        echo "🔍 Testing health endpoint..."
-        if curl -f -s https://144.126.220.220/health | grep -q "healthy"; then
-          echo "✅ Health check passed!"
-        else
-          echo "❌ Health check failed!"
-          curl -s https://144.126.220.220/health || echo "Failed to reach health endpoint"
-          exit 1
-        fi
-        
-        # Test WiFi API endpoint
-        echo "🔍 Testing WiFi API endpoint..."
-        if curl -f -s https://144.126.220.220/api/wifi | grep -q "ssid"; then
-          echo "✅ WiFi API is working!"
-        else
-          echo "❌ WiFi API failed!"
-          curl -s https://144.126.220.220/api/wifi || echo "Failed to reach WiFi API"
-          exit 1
-        fi
-        
-        echo "🎉 All tests passed! Deployment successful!"
+
