@@ -1,0 +1,9 @@
+{
+  "default/example.jpg": {
+    "filename": "default/example.jpg",
+    "category": "default",
+    "tags": ["example", "sample"],
+    "title": "Example Image",
+    "description": "This is an example image entry. Add your own images using the add_image.py script!"
+  }
+}

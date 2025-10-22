@@ -115,8 +115,8 @@ setup_python_env() {
 
 install_application() {
     log "Installing application files..."
-    
-    # Copy application files
+
+    # Copy main application file
     if [[ -f "main.py" ]]; then
         cp main.py "$APP_DIR/"
         chown "$USER:$USER" "$APP_DIR/main.py"
@@ -124,17 +124,49 @@ install_application() {
     else
         error "main.py not found in current directory"
     fi
-    
+
+    # Copy app directory
+    if [[ -d "app" ]]; then
+        cp -r app "$APP_DIR/"
+        chown -R "$USER:$USER" "$APP_DIR/app"
+        log "Copied app/ directory"
+    else
+        error "app/ directory not found in current directory"
+    fi
+
+    # Copy scripts directory
+    if [[ -d "scripts" ]]; then
+        cp -r scripts "$APP_DIR/"
+        chown -R "$USER:$USER" "$APP_DIR/scripts"
+        chmod +x "$APP_DIR/scripts/"*.py
+        log "Copied scripts/ directory"
+    fi
+
+    # Initialize images directory structure
+    mkdir -p "$IMAGES_DIR/default"
+    if [[ -f "images/metadata.json" ]]; then
+        cp images/metadata.json "$IMAGES_DIR/"
+        chown "$USER:$USER" "$IMAGES_DIR/metadata.json"
+    fi
+    if [[ -f "images/README.md" ]]; then
+        cp images/README.md "$IMAGES_DIR/"
+        chown "$USER:$USER" "$IMAGES_DIR/README.md"
+    fi
+
     # Create environment file
     cat > "$APP_DIR/.env" << EOF
 IMAGE_DIR=$IMAGES_DIR
 ENVIRONMENT=production
 OPENAI_API_KEY=${OPENAI_API_KEY:-}
 OPENAI_MODEL=${OPENAI_MODEL:-gpt-4}
+HOST=127.0.0.1
+PORT=8000
+LOG_LEVEL=info
+ALLOWED_ORIGINS=https://$DOMAIN
 EOF
     chown "$USER:$USER" "$APP_DIR/.env"
     chmod 600 "$APP_DIR/.env"  # Protect API key
-    
+
     if [[ -z "${OPENAI_API_KEY:-}" ]]; then
         warn "OPENAI_API_KEY not set. You'll need to add it to $APP_DIR/.env"
         warn "Example: echo 'OPENAI_API_KEY=sk-...' | sudo tee -a $APP_DIR/.env"
