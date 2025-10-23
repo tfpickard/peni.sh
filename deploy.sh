@@ -79,19 +79,27 @@ create_user() {
 
 setup_directories() {
     log "Setting up directories..."
-    
+
     # Application directory
     mkdir -p "$APP_DIR"
     chown "$USER:$USER" "$APP_DIR"
-    
+
     # Images directory
     mkdir -p "$IMAGES_DIR"
     chown "$USER:$USER" "$IMAGES_DIR"
-    
+
+    # Thumbnails directory
+    mkdir -p "$IMAGES_DIR/thumbnails"
+    chown "$USER:$USER" "$IMAGES_DIR/thumbnails"
+
+    # Database directory (parent of images.db)
+    mkdir -p "$(dirname /var/www/peni.sh/images.db)"
+    chown "$USER:$USER" "$(dirname /var/www/peni.sh/images.db)"
+
     # Log directory
     mkdir -p "/var/log/$SERVICE_NAME"
     chown "$USER:$USER" "/var/log/$SERVICE_NAME"
-    
+
     log "Directories created and permissions set"
 }
 
@@ -125,16 +133,26 @@ install_application() {
         error "main.py not found in current directory"
     fi
     
+    # Generate upload token if not provided
+    if [[ -z "${UPLOAD_TOKEN:-}" ]]; then
+        UPLOAD_TOKEN=$(openssl rand -base64 32 | tr -d '/+=' | cut -c1-43)
+        log "Generated new upload token"
+    fi
+
     # Create environment file
     cat > "$APP_DIR/.env" << EOF
 IMAGE_DIR=$IMAGES_DIR
+THUMBNAIL_DIR=$IMAGES_DIR/thumbnails
+DB_PATH=/var/www/peni.sh/images.db
 ENVIRONMENT=production
 OPENAI_API_KEY=${OPENAI_API_KEY:-}
 OPENAI_MODEL=${OPENAI_MODEL:-gpt-4}
+UPLOAD_TOKEN=$UPLOAD_TOKEN
+MAX_UPLOAD_SIZE_MB=10
 EOF
     chown "$USER:$USER" "$APP_DIR/.env"
-    chmod 600 "$APP_DIR/.env"  # Protect API key
-    
+    chmod 600 "$APP_DIR/.env"  # Protect API key and upload token
+
     if [[ -z "${OPENAI_API_KEY:-}" ]]; then
         warn "OPENAI_API_KEY not set. You'll need to add it to $APP_DIR/.env"
         warn "Example: echo 'OPENAI_API_KEY=sk-...' | sudo tee -a $APP_DIR/.env"
@@ -165,7 +183,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$APP_DIR $IMAGES_DIR /var/log/$SERVICE_NAME
+ReadWritePaths=$APP_DIR $IMAGES_DIR /var/www/peni.sh /var/log/$SERVICE_NAME
 
 # Logging
 StandardOutput=append:/var/log/$SERVICE_NAME/app.log
@@ -324,13 +342,21 @@ show_status() {
     echo
     echo "URLs:"
     echo "  Main site: https://$DOMAIN"
+    echo "  Admin panel: https://$DOMAIN/admin"
     echo "  API docs: https://$DOMAIN/api/docs"
     echo "  WiFi endpoint: https://$DOMAIN/api/wifi"
     echo
     echo "Configuration:"
     echo "  Images directory: $IMAGES_DIR"
+    echo "  Thumbnails directory: $IMAGES_DIR/thumbnails"
+    echo "  Database: /var/www/peni.sh/images.db"
     echo "  Application directory: $APP_DIR"
     echo "  Environment file: $APP_DIR/.env"
+    echo
+    echo "🔐 UPLOAD TOKEN (save this securely!):"
+    echo "  Token: $UPLOAD_TOKEN"
+    echo "  Use this token in the admin panel to upload/delete images"
+    echo "  Token is also saved in: $APP_DIR/.env"
     echo
     if [[ -z "${OPENAI_API_KEY:-}" ]]; then
         echo "⚠️  IMPORTANT: Set your OpenAI API key:"

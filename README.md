@@ -21,6 +21,9 @@ peni.sh is not just another web application. It's a **paradigm-shifting, life-al
 - 🧠 **AI-Powered SSID Generation**: Our OpenAI integration doesn't just create network names—it births digital poetry
 - 🎲 **Cryptographically Memorable Passwords**: Easy to derive, hard to crack, impossible to explain to your grandmother
 - 🖼️ **Quantum Random Image Display**: Because sometimes you need to see a random picture to remember why you're alive
+- 📤 **Secure Image Upload System**: Drag-and-drop your way to image glory with token-based auth
+- 🎨 **Automatic Thumbnail Generation**: 300x300 pixel perfection, automatically created
+- 🗄️ **Database-Backed Metadata**: SQLite tracking for all your image management needs
 - 🔒 **Military-Grade HTTPS**: Your WiFi credentials are protected like state secrets
 - ⚡ **Lightning-Fast API**: Faster than your ability to come up with excuses for bad WiFi names
 - 🎨 **Retro Terminal Aesthetic**: Green text on black background because we're not animals
@@ -631,6 +634,66 @@ mod tests {
 }
 ```
 
+## 📤 Image Upload System - NEW!
+
+### Upload Your Way to Visual Greatness
+
+Navigate to **`https://peni.sh/admin`** to access the admin panel where dreams become JPEGs.
+
+### Features That Make Other Upload Systems Weep
+
+- **🎯 Drag & Drop Interface**: Just drag your images into the zone of enlightenment
+- **🔐 Token-Based Security**: No unauthorized uploads allowed in this house
+- **🎨 Automatic Thumbnails**: 300x300 pixel perfection, created on-the-fly
+- **🛡️ EXIF Stripping**: Your location metadata stays private, unlike your social media posts
+- **✨ Magic Byte Validation**: We check the actual file content, not just the extension
+- **🔄 Deduplication**: SHA256 hashing prevents you from uploading the same meme twice
+- **📊 Metadata Tracking**: Upload dates, dimensions, file sizes—we got it all
+
+### Quick Start for the Impatient
+
+```bash
+# 1. Get your upload token (shown after deployment)
+sudo grep UPLOAD_TOKEN /opt/penish/.env
+
+# 2. Open the admin panel
+open https://peni.sh/admin
+
+# 3. Enter your token and start uploading!
+```
+
+### Upload via API (For the Command Line Elite)
+
+```bash
+# Upload an image like a boss
+curl -X POST https://peni.sh/api/upload \
+  -H "Authorization: Bearer YOUR_TOKEN_HERE" \
+  -F "file=@my-awesome-image.jpg"
+
+# Delete an image (with great power comes great responsibility)
+curl -X DELETE https://peni.sh/api/images/my-awesome-image.jpg \
+  -H "Authorization: Bearer YOUR_TOKEN_HERE"
+
+# List all your glorious images
+curl https://peni.sh/api/images | jq '.'
+
+# Get a thumbnail (because bandwidth matters)
+curl https://peni.sh/thumbnail/my-awesome-image.jpg -o thumb.jpg
+```
+
+### Security Features That Would Make Fort Knox Jealous
+
+- **Token Authentication**: All uploads/deletes require your secret token
+- **Magic Byte Detection**: Fake file extensions detected and rejected
+- **File Size Limits**: Default 10MB max (configurable for your massive meme collection)
+- **Path Traversal Protection**: Nice try, hacker. Not today.
+- **EXIF Stripping**: Location data removed automatically for privacy
+- **HTTPS Only**: Because we're not savages
+
+**📖 For detailed documentation, see [UPLOAD_GUIDE.md](UPLOAD_GUIDE.md)**
+
+---
+
 ## 🏗️ Deployment Instructions for Maximum Impact
 
 ### Prerequisites for Greatness
@@ -803,9 +866,11 @@ This project is licensed under the "Do Whatever Makes You Happy" License, which 
 - [x] Multi-language client examples
 
 ### Phase 2: Enhancement 🚧
+- [x] **Secure Image Upload System** ✨ NEW!
+- [x] **Admin Panel with Drag-and-Drop**
+- [x] **Automatic Thumbnail Generation**
+- [x] **Database-Backed Image Metadata**
 - [ ] WebSocket real-time updates
-- [ ] User authentication system
-- [ ] Image tagging and categorization
 - [ ] Custom SSID patterns
 - [ ] Analytics dashboard
 
@@ -842,6 +907,7 @@ This project is licensed under the "Do Whatever Makes You Happy" License, which 
 ## 🔗 Links to Enlightenment
 
 - 🌐 **Live Site**: [https://peni.sh](https://peni.sh)
+- 🎛️ **Admin Panel**: [https://peni.sh/admin](https://peni.sh/admin) ✨ NEW!
 - 📚 **API Documentation**: [https://peni.sh/api/docs](https://peni.sh/api/docs)
 - 🏥 **Health Check**: [https://peni.sh/health](https://peni.sh/health)
 - 🎲 **Generate WiFi**: [https://peni.sh/api/wifi](https://peni.sh/api/wifi)
