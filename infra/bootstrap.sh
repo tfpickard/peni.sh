@@ -131,6 +131,9 @@ s_ssh() {
 			MaxAuthTries 4
 		EOF
 	fi
+	# Socket activation means sshd may never have run yet, and sshd -t refuses
+	# to check anything without its privilege separation directory.
+	install -d -m 755 /run/sshd
 	sshd -t && { systemctl try-restart ssh.service || systemctl try-restart sshd.service || true; }
 }
 
@@ -309,7 +312,10 @@ write_caddyfiles() {
 
 		(placeholder) {
 			root * /srv/peni.sh/www
-			@cli header_regexp User-Agent (?i)^(curl|wget|httpie|xh)/
+			@cli {
+				path /
+				header_regexp User-Agent (?i)^(curl|wget|httpie|xh)/
+			}
 			rewrite @cli /index.txt
 			file_server
 		}
