@@ -3,8 +3,8 @@
 # github.com/tfpickard/peni.sh at a pinned commit, refuses to run it unless
 # the sha256 matches, then runs it. Output lands in /post_install.log.
 set -euo pipefail
-url=https://raw.githubusercontent.com/tfpickard/peni.sh/cfcc63ddedfd23512733dfef28e4a2568588a5ce/infra/bootstrap.sh
-want=e626d233caad167929faba72ec2ad07a01fadecd220078592c0d94faf750417f
+url=https://raw.githubusercontent.com/tfpickard/peni.sh/f49e1283a04128589e6d2ae34736750c20d81231/infra/bootstrap.sh
+want=9b3e61f79f035038c29055f9c06180a93002d0a872fe85125e23fd70d5de2fba
 for i in 1 2 3 4 5 6; do
   curl -fsSL --retry 3 -o /root/bootstrap.sh "$url" && break
   sleep $((i * 10))
