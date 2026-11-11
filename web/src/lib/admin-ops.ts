@@ -32,8 +32,8 @@ export const deleteComment = (id: number) => del(`/comments/${id}`);
 
 export type Haiku = { id: number; lines: string[]; source: string; active: boolean };
 export type HaikuPage = { items: Haiku[]; total: number };
-export const haikus = (source: string, active: string) => {
-	const q = new URLSearchParams();
+export const haikus = (source: string, active: string, limit = 50, offset = 0) => {
+	const q = new URLSearchParams({ limit: String(limit), offset: String(offset) });
 	if (source) q.set('source', source);
 	if (active) q.set('active', active);
 	return get<HaikuPage>(`/haikus?${q}`);
