@@ -84,9 +84,12 @@
 			}
 			animating = true;
 			dx = -dir * w;
+			// Load during the exit slide but swap only after it: a preloaded page would
+			// otherwise replace the picture mid-slide and the new one would slide out.
+			await Promise.all([preloadData(href(slug)).catch(() => {}), wait(SLIDE_MS)]);
 			// Swiping is browsing, not drilling down: replacing the entry keeps back pointed
 			// at wherever the picture was opened from.
-			await Promise.all([goto(href(slug), { replace: true }), wait(SLIDE_MS)]);
+			await goto(href(slug), { replace: true });
 			animating = false;
 			dx = dir * w;
 			await tick();
