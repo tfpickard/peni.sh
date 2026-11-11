@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Pull-based deploy poller. Run by penish-deploy.timer as the deploy user.
-# Env overrides (testing): APP_ROOT, API_URL, RAW_URL_BASE, DRY_RUN=1, WAIT_SECS.
+# Env overrides (testing): APP_ROOT, API_URL, RAW_URL_BASE, STATE_DIRECTORY, DRY_RUN=1, WAIT_SECS.
 set -euo pipefail
+umask 077
 
 ROOT=${APP_ROOT:-/srv/peni.sh}
 ENV_FILE=$ROOT/.env
 DATA=$ROOT/data
+# deploy is effectively root (docker group) and data/ is writable from the containers, so every
+# file this script trusts (state, staged and backed-up compose) lives in a private dir instead.
+STATE=${STATE_DIRECTORY:-/var/lib/penish-deploy}
 WAIT_SECS=${WAIT_SECS:-120}
 RETRY_AFTER_MIN=${RETRY_AFTER_MIN:-10}
 DRY_RUN=${DRY_RUN:-0}
@@ -18,6 +22,40 @@ compose_swapped=0
 
 log() { printf 'penish-deploy: %s\n' "$*"; }
 err() { printf 'penish-deploy: ERROR: %s\n' "$*" >&2; }
+
+# GNU stat first, BSD stat (macOS, for tests) second.
+stat_owner_mode() { stat -c '%u %a' "$1" 2>/dev/null || stat -f '%u %Lp' "$1"; }
+
+if [ -L "$STATE" ] || [ ! -d "$STATE" ] || [ "$(stat_owner_mode "$STATE")" != "$(id -u) 700" ]; then
+  err "$STATE must be a real directory owned by uid $(id -u) with mode 700; refusing to run"
+  exit 1
+fi
+
+# A symlink in the state dir means something other than this script wrote there.
+refuse_symlink() {
+  if [ -L "$1" ]; then
+    err "$1 is a symlink; refusing to run"
+    exit 1
+  fi
+}
+
+# Reads a state file after the symlink check; prints nothing when absent.
+read_state() {
+  refuse_symlink "$STATE/$1"
+  if [ -f "$STATE/$1" ]; then tr -d '[:space:]' <"$STATE/$1"; fi
+}
+
+# Write via a temp name and rename so a reader never sees a half-written sha.
+write_state() {
+  refuse_symlink "$STATE/$1"
+  refuse_symlink "$STATE/$1.tmp"
+  printf '%s\n' "$2" >"$STATE/$1.tmp"
+  mv -f "$STATE/$1.tmp" "$STATE/$1"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
 
 # /run/lock is world-writable on Ubuntu; the fallbacks keep the script usable unprivileged.
 lock_dir=/run/lock
@@ -46,6 +84,24 @@ run() {
 # The value ends up in .env and in image refs, so reject anything but a full sha.
 valid_sha() { [[ $1 =~ ^[0-9a-f]{40}$ ]]; }
 
+# State used to live in data/, which the containers can write, so only a strictly shaped
+# deployed_sha is carried over; pinned_sha and failed_sha are not trusted from there.
+migrate_old_state() {
+  local old=$DATA/deployed_sha content
+  [ ! -e "$STATE/deployed_sha" ] && [ ! -L "$STATE/deployed_sha" ] || return 0
+  [ -f "$old" ] && [ ! -L "$old" ] || return 0
+  content=$(tr -d '[:space:]' <"$old")
+  if valid_sha "$content"; then
+    log "migrating deployed_sha $content from $DATA to $STATE"
+    if [ "$DRY_RUN" = 1 ]; then printf '+ write %s/deployed_sha\n' "$STATE"; else write_state deployed_sha "$content"; fi
+  else
+    err "ignoring old $old: not a 40-char sha"
+  fi
+  if [ -e "$DATA/pinned_sha" ] || [ -L "$DATA/pinned_sha" ]; then
+    log "WARNING: ignoring old $DATA/pinned_sha; re-pin in $STATE/pinned_sha if needed"
+  fi
+}
+
 set_image_tag() {
   if [ "$DRY_RUN" = 1 ]; then
     printf '+ set IMAGE_TAG=%s in %s\n' "$1" "$ENV_FILE"
@@ -60,11 +116,11 @@ set_image_tag() {
   fi
 }
 
-# The app root is owned by another user, so the temp file lives in data/ and the file is
-# overwritten in place (keeps deploy's ownership; compose only reads it at deploy time).
+# The app root is owned by another user, so the file is overwritten in place (keeps its
+# ownership; compose only reads it at deploy time). Staging and backup stay in $STATE.
 sync_compose() {
-  local sha=$1 tmp
-  tmp=$(mktemp "$DATA/compose.XXXXXX")
+  local sha=$1 tmp staged_sum
+  tmp=$(mktemp "$STATE/compose.XXXXXX")
   if ! curl -fsSL --max-time 30 -o "$tmp" "$RAW_URL_BASE/$sha/compose.yaml"; then
     rm -f "$tmp"
     err "could not fetch compose.yaml for $sha; aborting deploy"
@@ -78,16 +134,23 @@ sync_compose() {
     return 1
   fi
   log "compose.yaml for $sha validated"
+  staged_sum=$(sha256_of "$tmp")
   if cmp -s "$tmp" "$COMPOSE" 2>/dev/null; then
     rm -f "$tmp"
     return 0
   fi
-  compose_prev=$ROOT/compose.yaml.prev
-  [ -w "$ROOT" ] || compose_prev=$DATA/compose.yaml.prev
+  compose_prev=$STATE/compose.yaml.prev
+  refuse_symlink "$compose_prev"
   if [ "$DRY_RUN" = 1 ]; then
     printf '+ back up %s to %s, then replace it with the fetched compose.yaml\n' "$COMPOSE" "$compose_prev"
   else
     if [ -f "$COMPOSE" ]; then cat "$COMPOSE" >"$compose_prev"; else : >"$compose_prev"; fi
+    # Install exactly the bytes that were validated.
+    if [ "$(sha256_of "$tmp")" != "$staged_sum" ]; then
+      rm -f "$tmp"
+      err "staged compose.yaml changed after validation; aborting deploy"
+      return 1
+    fi
     cat "$tmp" >"$COMPOSE"
     compose_swapped=1
   fi
@@ -121,8 +184,11 @@ wait_healthy() {
 cd "$ROOT"
 [ -f "$ROOT/compose.yaml" ] || [ "$DRY_RUN" = 1 ] || exit 0
 
-if [ -f "$DATA/pinned_sha" ]; then
-  target=$(tr -d '[:space:]' <"$DATA/pinned_sha")
+migrate_old_state
+
+pinned=$(read_state pinned_sha)
+if [ -n "$pinned" ]; then
+  target=$pinned
 else
   token=$(env_get GH_READ_TOKEN)
   # Unauthenticated calls would exhaust the rate limit at one poll per minute, so do nothing instead.
@@ -145,12 +211,16 @@ if ! valid_sha "$target"; then
   exit 1
 fi
 
-deployed=$(cat "$DATA/deployed_sha" 2>/dev/null || true)
+deployed=$(read_state deployed_sha)
+if [ -n "$deployed" ] && ! valid_sha "$deployed"; then
+  err "ignoring malformed $STATE/deployed_sha"
+  deployed=
+fi
 [ "$target" != "$deployed" ] || exit 0
 
 # A sha that failed its health check is retried only after a pause, not every minute.
-if [ -f "$DATA/failed_sha" ] && [ "$(cat "$DATA/failed_sha")" = "$target" ] \
-  && [ -n "$(find "$DATA/failed_sha" -mmin "-$RETRY_AFTER_MIN" 2>/dev/null)" ]; then
+if [ "$(read_state failed_sha)" = "$target" ] \
+  && [ -n "$(find "$STATE/failed_sha" -mmin "-$RETRY_AFTER_MIN" 2>/dev/null)" ]; then
   exit 0
 fi
 
@@ -177,7 +247,7 @@ fi
 
 if [ "$failed" = 1 ]; then
   err "DEPLOY FAILED for $target: api not healthy within ${WAIT_SECS}s"
-  printf '%s\n' "$target" >"$DATA/failed_sha"
+  write_state failed_sha "$target"
   if [ -n "$deployed" ]; then
     err "rolling back to $deployed"
     set_image_tag "$deployed"
@@ -190,11 +260,10 @@ if [ "$failed" = 1 ]; then
 fi
 
 if [ "$DRY_RUN" = 1 ]; then
-  printf '+ write %s/deployed_sha = %s\n' "$DATA" "$target"
+  printf '+ write %s/deployed_sha = %s\n' "$STATE" "$target"
 else
-  printf '%s\n' "$target" >"$DATA/deployed_sha.tmp"
-  mv "$DATA/deployed_sha.tmp" "$DATA/deployed_sha"
-  rm -f "$DATA/failed_sha"
+  write_state deployed_sha "$target"
+  rm -f "$STATE/failed_sha"
 fi
 log "deployed $target"
 

@@ -258,12 +258,13 @@ async def test_no_store_when_off(off_client: httpx.AsyncClient) -> None:
     assert (await off_client.get("/api/admin/me")).headers["cache-control"] == "no-store"
 
 
-async def test_global_failure_budget_locks_everyone(client: httpx.AsyncClient) -> None:
+async def test_global_failure_budget_spares_correct_password(client: httpx.AsyncClient) -> None:
     for i in range(admin.GLOBAL_LOGIN_FAILURES):
         admin._failures[f"10.0.0.{i}"].append(time.time())
-    r = await client.post(
-        "/api/admin/login", json={"password": PW}, headers={**XHR, "cf-connecting-ip": "10.9.9.9"}
-    )
+    headers = {**XHR, "cf-connecting-ip": "10.9.9.9"}
+    r = await client.post("/api/admin/login", json={"password": PW}, headers=headers)
+    assert r.status_code == 200
+    r = await client.post("/api/admin/login", json={"password": "wrong"}, headers=headers)
     assert r.status_code == 429
 
 

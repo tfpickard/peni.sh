@@ -127,14 +127,19 @@ async def login(body: Login, request: Request, response: Response) -> dict[str, 
     assert password
     ip = _client_ip(request)
     q = _recent_failures(ip)
-    if len(q) >= LOGIN_FAILURES or _global_failures() >= GLOBAL_LOGIN_FAILURES:
+    if len(q) >= LOGIN_FAILURES:
         raise HTTPException(status_code=429, detail="wait")
     ok = hmac.compare_digest(
         hashlib.sha256(body.password.encode()).digest(), hashlib.sha256(password.encode()).digest()
     )
     if not ok:
+        # Checked only after the password so a botnet spraying wrong guesses cannot lock the
+        # owner out; once spent, wrong guesses get the same 429 whatever the IP.
+        exhausted = _global_failures() >= GLOBAL_LOGIN_FAILURES
         q.append(time.time())
-        raise HTTPException(status_code=401, detail="no")
+        raise HTTPException(
+            status_code=429 if exhausted else 401, detail="wait" if exhausted else "no"
+        )
     expiry = int(time.time()) + SESSION_SECONDS
     response.set_cookie(
         COOKIE,
