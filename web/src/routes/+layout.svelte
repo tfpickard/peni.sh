@@ -1,13 +1,14 @@
 <script lang="ts">
 	import '../app.css';
 	import type { LayoutProps } from './$types';
+	import Chicken from '../lib/components/Chicken.svelte';
 
 	let { children }: LayoutProps = $props();
 </script>
 
 <div class="shell">
 	<header>
-		<a class="mark" href="/">peni.sh</a>
+		<a class="mark" href="/"><Chicken /></a>
 	</header>
 	<main>
 		{@render children()}
@@ -21,14 +22,8 @@
 		padding: 1.5rem 1.5rem 6rem;
 	}
 	.mark {
-		font-family: 'Fungal', system-ui, sans-serif;
-		font-size: 1.75rem;
-		font-variation-settings:
-			'grow' 800,
-			'THCK' 350;
-		color: var(--foreground);
 		display: inline-block;
-		padding-block: 0.3em;
+		width: 9rem;
 	}
 	.mark:hover {
 		text-decoration: none;
