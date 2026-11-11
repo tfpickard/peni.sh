@@ -6,7 +6,8 @@
 	let active = $state('');
 	let items = $state<ops.Haiku[]>([]);
 	let total = $state(0);
-	let sources = $state<string[]>([]);
+	// The api's own list. Learning it from the rows shown missed any source not on page one.
+	const sources = ['seed', 'model', 'owner'];
 	let loaded = $state(false);
 	let editing = $state<number | null>(null);
 	let draft = $state(['', '', '']);
@@ -14,16 +15,44 @@
 	let n = $state(20);
 	let queued = $state(false);
 
+	const PAGE = 50;
+	// The api's cap on one request.
+	const CHUNK = 200;
+	// How many rows the list should hold. An edit reloads this many, so it keeps its place.
+	let want = PAGE;
+	// A slow reload must not overwrite the list a later filter change asked for.
+	let epoch = 0;
+
 	async function load() {
+		const e = ++epoch;
 		try {
-			({ items, total } = await ops.haikus(source, active));
-			// The source filter lists what exists, so it is learned from the unfiltered view.
-			if (!source) sources = [...new Set(items.map((h) => h.source))].sort();
+			const got: ops.Haiku[] = [];
+			let all = 0;
+			do {
+				const page = await ops.haikus(source, active, Math.min(CHUNK, want - got.length), got.length);
+				if (e !== epoch) return;
+				all = page.total;
+				got.push(...page.items);
+				if (!page.items.length) break;
+			} while (got.length < Math.min(want, all));
+			items = got;
+			total = all;
 		} catch {
+			if (e !== epoch) return;
 			items = [];
 			total = 0;
 		}
 		loaded = true;
+	}
+
+	function filter() {
+		want = PAGE;
+		load();
+	}
+
+	function more() {
+		want = items.length + PAGE;
+		load();
 	}
 
 	onMount(load);
@@ -64,11 +93,11 @@
 </script>
 
 <div class="row filters">
-	<select bind:value={source} onchange={load} aria-label="source">
+	<select bind:value={source} onchange={filter} aria-label="source">
 		<option value="">any source</option>
 		{#each sources as s}<option value={s}>{s}</option>{/each}
 	</select>
-	<select bind:value={active} onchange={load} aria-label="active">
+	<select bind:value={active} onchange={filter} aria-label="active">
 		<option value="">any</option>
 		<option value="true">active</option>
 		<option value="false">inactive</option>
@@ -103,7 +132,12 @@
 			</li>
 		{/each}
 	</ul>
-	{#if total > items.length}<p class="dim">{items.length} of {total}</p>{/if}
+	{#if total > items.length}
+		<div class="row">
+			<span class="dim">{items.length} of {total}</span>
+			<button onclick={more}>more</button>
+		</div>
+	{/if}
 {:else if loaded}
 	<p class="dim">0 haikus</p>
 {/if}

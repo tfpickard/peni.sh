@@ -19,7 +19,10 @@ export type ImageItem = {
 	palette: string[];
 	variants: Variant[];
 };
-export type ImagePage = { items: ImageItem[]; next_cursor: string | null };
+// count rides only on the first page of a tag listing.
+export type ImagePage = { items: ImageItem[]; next_cursor: string | null; count?: number };
+export type TagCount = { tag: string; n: number };
+export type SearchResult = { q: string; tags: TagCount[]; items: ImageItem[] };
 export type Text = { body: string; source: string; model: string | null };
 export type Neighbor = { slug: string; score: number; blurhash: string; src: string };
 export type Votes = { up: number; down: number; net: number; mine: -1 | 0 | 1 };
@@ -42,9 +45,15 @@ export type ImageDetail = ImageItem & {
 };
 export type ImageRedirect = { redirect: string };
 
-export const getImages = (cursor: string | null, limit = 48, f: typeof fetch = fetch) => {
+export const getImages = (
+	cursor: string | null,
+	limit = 48,
+	f: typeof fetch = fetch,
+	tag: string | null = null
+) => {
 	const q = new URLSearchParams({ limit: String(limit) });
 	if (cursor) q.set('cursor', cursor);
+	if (tag) q.set('tag', tag);
 	return f(`/api/images?${q}`).then((r) => {
 		if (!r.ok) throw new Error(`images ${r.status}`);
 		return r.json() as Promise<ImagePage>;
@@ -56,6 +65,14 @@ export class ApiError extends Error {
 		super(`${status}`);
 	}
 }
+
+export const getTags = () => get<{ tags: TagCount[] }>('/api/tags');
+
+export const search = async (q: string): Promise<SearchResult> => {
+	const res = await fetch(`/api/search?${new URLSearchParams({ q })}`);
+	if (!res.ok) throw new ApiError(res.status);
+	return res.json();
+};
 
 async function post<T>(path: string, body: unknown): Promise<T> {
 	const res = await fetch(path, {

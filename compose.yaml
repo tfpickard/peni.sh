@@ -40,6 +40,9 @@ services:
       TURNSTILE_SECRET: ${TURNSTILE_SECRET:-}
       # The worker's internal embed server, over the compose network only.
       EMBED_SERVER_URL: http://worker:8001
+      # Unset keeps the defaults: the 60 most used tags, each on at least 2 pictures.
+      TAG_CLOUD_LIMIT: ${TAG_CLOUD_LIMIT:-}
+      TAG_CLOUD_MIN: ${TAG_CLOUD_MIN:-}
     ports:
       # Loopback only: Docker's published ports bypass ufw, so anything wider would be public.
       # The host cloudflared reaches it at http://localhost:8000.

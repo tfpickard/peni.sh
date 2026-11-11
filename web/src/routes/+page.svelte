@@ -3,7 +3,7 @@
 	import { snapshot } from '$app/navigation';
 	import FungalHaiku from '../lib/haiku/FungalHaiku.svelte';
 	import { randomSeed } from '../lib/haiku/rng';
-	import Picture from '../lib/components/Picture.svelte';
+	import Grid from '../lib/components/Grid.svelte';
 	import {
 		getHaiku,
 		getImages,
@@ -28,7 +28,6 @@
 	let cursor = $state<string | null>(null);
 	let done = $state(false);
 	let loading = false;
-	let sentinel = $state<HTMLElement>();
 	// Bumped by a restore so fetches started by the fresh mount cannot append to or replace
 	// the restored state when they land.
 	let epoch = 0;
@@ -91,17 +90,6 @@
 		}
 	}
 
-	$effect(() => {
-		if (!sentinel) return;
-		// Re-observing after each page makes the callback fire again if the sentinel is still in view.
-		items.length;
-		const io = new IntersectionObserver((e) => e[0].isIntersecting && more(), {
-			rootMargin: '800px'
-		});
-		io.observe(sentinel);
-		return () => io.disconnect();
-	});
-
 	onMount(async () => {
 		// The component has just drawn the same seeded markup; dropping the server copy in the same
 		// task means no frame shows both and none shows neither.
@@ -135,14 +123,7 @@
 		{pictures} pictures{#if temperature !== null}<span class="temp">temperature {temperature.toFixed(2)}</span>{/if}
 	</p>
 {/if}
-<section class="grid">
-	{#each items as image, i (image.slug)}
-		<a href="/i/{image.slug}" aria-label={image.slug}>
-			<Picture {image} eager={i < 8} sizes="(min-width: 60rem) 19rem, (min-width: 40rem) 30vw, 50vw" />
-		</a>
-	{/each}
-</section>
-{#if !done}<div bind:this={sentinel} class="sentinel"></div>{/if}
+<Grid {items} {done} {more} />
 
 <style>
 	.label {
@@ -157,23 +138,5 @@
 	.temp {
 		margin-left: 1rem;
 		font-size: 0.8rem;
-	}
-	.grid {
-		margin-top: 3rem;
-		columns: 2;
-		column-gap: 0.5rem;
-	}
-	@media (min-width: 40rem) {
-		.grid {
-			columns: 3;
-		}
-	}
-	.grid a {
-		display: block;
-		margin-bottom: 0.5rem;
-		break-inside: avoid;
-	}
-	.sentinel {
-		height: 1px;
 	}
 </style>
