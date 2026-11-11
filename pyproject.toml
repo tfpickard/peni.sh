@@ -63,7 +63,8 @@ strict = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["pgvector.*", "pyvips.*", "blurhash.*"]
+# torch and sentence_transformers live in the worker extra, which CI does not install.
+module = ["pgvector.*", "pyvips.*", "blurhash.*", "torch.*", "sentence_transformers.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
