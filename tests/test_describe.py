@@ -41,7 +41,7 @@ async def test_only_wanted_keys_requested() -> None:
     out = await describe(b"x", "image/png", want={"caption"}, settings=SETTINGS, client=client)
     call = client.messages.calls[0]
     schema = call["output_config"]["format"]["schema"]
-    assert list(schema["properties"]) == ["caption"]
+    assert list(schema["properties"]) == ["concern", "caption"]
     assert call["messages"][0]["content"][1]["text"].endswith("caption.")
     assert call["model"] == SETTINGS.describe_model
     assert out.caption == "cat on a stove"
@@ -61,7 +61,13 @@ async def test_description_brings_analysis() -> None:
     out = await describe(b"x", "image/png", want={"description"}, settings=SETTINGS, client=client)
     call = client.messages.calls[0]
     schema = call["output_config"]["format"]["schema"]
-    assert set(schema["properties"]) == set(schema["required"]) == {"description", "analysis"}
+    assert (
+        set(schema["properties"])
+        == set(schema["required"])
+        == {"description", "analysis", "concern"}
+    )
+    # The faithful analysis is written before the misreading it informs.
+    assert list(schema["properties"]) == ["analysis", "concern", "description"]
     assert call["messages"][0]["content"][1]["text"].endswith("description, analysis.")
     assert (out.description, out.analysis) == (DESCRIPTION, ANALYSIS)
 

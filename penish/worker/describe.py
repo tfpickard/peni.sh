@@ -46,14 +46,19 @@ class Described:
     analysis: str | None = None
 
 
-def build_schema(want: set[str]) -> dict[str, Any]:
+def build_schema(want: set[str], *, scratch: bool = True) -> dict[str, Any]:
+    # Order is generation order. The faithful analysis comes first and the misreading is
+    # committed to in `concern` before the public text, which otherwise drifts back into an
+    # inventory of the scene. `concern` is scratch and never stored.
     props: dict[str, Any] = {}
+    if "analysis" in want:
+        props["analysis"] = {"type": "string"}
+    if scratch and want & {"caption", "description"}:
+        props["concern"] = {"type": "string"}
     if "caption" in want:
         props["caption"] = {"type": "string"}
     if "description" in want:
         props["description"] = {"type": "string"}
-    if "analysis" in want:
-        props["analysis"] = {"type": "string"}
     if "tags" in want:
         props["tags"] = {"type": "array", "items": {"type": "string"}}
     return {
@@ -109,7 +114,9 @@ def check_public(field: str, text: str) -> None:
 
 def _validate(text: str, want: set[str]) -> dict[str, Any]:
     data = parse_json(text)
-    jsonschema.validate(data, build_schema(want))
+    if isinstance(data, dict):
+        data.pop("concern", None)
+    jsonschema.validate(data, build_schema(want, scratch=False))
     out: dict[str, Any] = {}
     for key in want:
         if key == "tags":
