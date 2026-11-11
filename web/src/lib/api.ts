@@ -36,6 +36,9 @@ export type ImageDetail = ImageItem & {
 	published_at: string;
 	votes: Votes;
 	comments: Comment[];
+	// Neighbours in grid order, wrapping; null only when this is the sole picture.
+	prev: string | null;
+	next: string | null;
 };
 export type ImageRedirect = { redirect: string };
 

@@ -61,10 +61,14 @@
 		gap: 0.75rem;
 		overflow-x: auto;
 		padding-bottom: 0.5rem;
+		/* A fling along the strip should not bounce the page or carry on into it. */
+		overscroll-behavior-x: contain;
+		scroll-snap-type: x proximity;
 	}
 	li {
 		flex: none;
 		width: 7rem;
+		scroll-snap-align: start;
 	}
 	.thumb {
 		display: block;
