@@ -19,6 +19,10 @@
 		max-width: 60rem;
 		margin: 0 auto;
 		padding: 1.5rem 1.5rem 6rem;
+		/* Landscape on a notched phone puts the sensor housing over the content otherwise. */
+		padding-left: max(1.5rem, env(safe-area-inset-left));
+		padding-right: max(1.5rem, env(safe-area-inset-right));
+		padding-bottom: calc(6rem + env(safe-area-inset-bottom));
 	}
 	.mark {
 		font-family: 'Fungal', system-ui, sans-serif;
@@ -30,8 +34,10 @@
 		display: inline-block;
 		padding-block: 0.3em;
 	}
-	.mark:hover {
-		text-decoration: none;
+	@media (hover: hover) {
+		.mark:hover {
+			text-decoration: none;
+		}
 	}
 	main {
 		margin-top: 4rem;

@@ -37,6 +37,11 @@
 
 html {
 	background: var(--background);
+	/* iOS inflates text on rotation to landscape. */
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+	/* The grey tap flash is a box on a dark page; navigating is feedback enough. */
+	-webkit-tap-highlight-color: transparent;
 }
 
 body {
@@ -53,8 +58,16 @@ a {
 	color: var(--primary);
 	text-decoration: none;
 }
-a:hover {
-	text-decoration: underline;
+/* Touch screens keep :hover after a tap, which would leave links underlined. */
+@media (hover: hover) {
+	a:hover {
+		text-decoration: underline;
+	}
+}
+/* No double-tap zoom wait on things that are only ever tapped. */
+a,
+button {
+	touch-action: manipulation;
 }
 :focus-visible {
 	outline: 2px solid var(--secondary);
