@@ -8,7 +8,7 @@ import pytest
 from penish.config import Settings
 from penish.text import no_em_dash, slugify
 from penish.worker.describe import DescribeError, describe
-from penish.worker.haiku import build_prompt, haiku_from, seed_examples
+from penish.worker.haiku import build_prompt, haiku_from
 
 SETTINGS = Settings(anthropic_api_key="test")
 TAGS = ["cat", "kitchen", "photo", "warm-light", "tiled-floor", "orange", "indoor"]
@@ -103,11 +103,9 @@ async def test_haiku_rejects_bad_shape(lines: list[str]) -> None:
     assert len(client.messages.calls) == 2
 
 
-def test_haiku_prompt_has_six_seed_examples() -> None:
-    assert len(seed_examples()) == 6
-    prompt = build_prompt()
-    assert "{examples}" not in prompt
-    assert seed_examples()[0][0] in prompt
+def test_haiku_prompt_fills_examples() -> None:
+    prompt = build_prompt("before\n{examples}\nafter", [("a", "b", "c"), ("d", "e", "f")])
+    assert prompt == "before\na\nb\nc\n\nd\ne\nf\nafter"
 
 
 def test_no_em_dash() -> None:

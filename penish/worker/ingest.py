@@ -34,6 +34,7 @@ from penish.worker.derive import (
     load_and_validate,
     make_derivatives,
     palette_of,
+    rebuild_public,
 )
 from penish.worker.describe import Described, DescribeError, describe
 from penish.worker.haiku import haiku_from
@@ -104,18 +105,47 @@ def _describe_bytes(img: Any) -> bytes:
     return out
 
 
+def _orig_key(decoded: Decoded) -> str:
+    return f"orig/{decoded.sha256}.{_EXT[decoded.mime]}"
+
+
+async def _ensure_orig(storage: LocalStorage, decoded: Decoded) -> int:
+    key = _orig_key(decoded)
+    if not storage.exists(key):
+        data = await asyncio.to_thread(clean_original, decoded.image, decoded.mime)
+        storage.put_bytes(key, data)
+    return storage.path(key).stat().st_size
+
+
 async def _write_media(storage: LocalStorage, decoded: Decoded, settings: Settings) -> int:
+    # Only for images still displayed as uploaded, where pub_sha == sha256.
     sha, img = decoded.sha256, decoded.image
-    orig_key = f"orig/{sha}.{_EXT[decoded.mime]}"
-    if not storage.exists(orig_key):
-        data = await asyncio.to_thread(clean_original, img, decoded.mime)
-        storage.put_bytes(orig_key, data)
+    size = await _ensure_orig(storage, decoded)
     if not all(storage.exists(k) for k in _all_keys(sha, decoded.width)):
         derivs = await asyncio.to_thread(make_derivatives, img, sha, settings.watermark)
         for d in derivs:
             if not storage.exists(d.key):
                 storage.put_bytes(d.key, d.data)
-    return storage.path(orig_key).stat().st_size
+    return size
+
+
+async def _rebuild(
+    conn: Conn, storage: LocalStorage, decoded: Decoded, row: dict[str, Any], settings: Settings
+) -> tuple[str, int]:
+    data = await asyncio.to_thread(storage.path(_orig_key(decoded)).read_bytes)
+    pub = await asyncio.to_thread(rebuild_public, data, row["crop"], settings.watermark)
+    for d in pub.derivatives:
+        if not storage.exists(d.key):
+            storage.put_bytes(d.key, d.data)
+    await conn.execute(
+        """
+        update images set pub_sha = %s, width = %s, height = %s, blurhash = %s, palette = %s,
+               updated_at = now()
+         where id = %s
+        """,
+        (pub.pub_sha, pub.width, pub.height, pub.blurhash, Jsonb(pub.palette), row["id"]),
+    )
+    return pub.pub_sha, pub.width
 
 
 # -- text -----------------------------------------------------------------
@@ -364,9 +394,9 @@ async def _reslug(conn: Conn, image_id: int, old: str | None, base: str) -> None
 
 async def _image_row(conn: Conn, sha: str, stem: str) -> tuple[dict[str, Any], bool]:
     cur = await conn.execute(
-        "insert into images (sha256, stem, status) values (%s, %s, 'processing')"
+        "insert into images (sha256, pub_sha, stem, status) values (%s, %s, %s, 'processing')"
         " on conflict (sha256) do nothing returning *",
-        (sha, stem),
+        (sha, sha, stem),
     )
     row = await cur.fetchone()
     if row is not None:
@@ -452,8 +482,18 @@ async def _ingest_locked(
     image_id = int(row["id"])
     was_live = row["status"] == "live"
     storage = LocalStorage(settings.media_pub.parent)
+    pub_sha = str(row["pub_sha"])
+    # Width of the displayed pixels, which is what names the derivative ladder.
+    pub_width = decoded.width
 
-    if (
+    if pub_sha != sha:
+        # Cropped (or otherwise rebuilt) by an admin job: the displayed pixels are not the
+        # upload's, so ingest must not lay the uncropped ladder back down. It only heals.
+        await _ensure_orig(storage, decoded)
+        pub_width = int(row["width"])
+        if not all(storage.exists(k) for k in _all_keys(pub_sha, pub_width)):
+            pub_sha, pub_width = await _rebuild(conn, storage, decoded, row, settings)
+    elif (
         not existed
         or row["width"] is None
         or not all(storage.exists(k) for k in _all_keys(sha, decoded.width))
@@ -476,7 +516,9 @@ async def _ingest_locked(
     if want:
         img_bytes = await asyncio.to_thread(_describe_bytes, decoded.image)
         try:
-            described = await describer(img_bytes, "image/webp", want=want, settings=settings)
+            described = await describer(
+                img_bytes, "image/webp", want=want, settings=settings, pool=pool
+            )
         except DescribeError as e:
             if e.retryable:
                 await _set_status(conn, image_id, "pending_enrichment")
@@ -497,7 +539,7 @@ async def _ingest_locked(
         (image_id, KIND, settings.embed_model),
     )
     emb = await cur.fetchone()
-    media_ok = all(storage.exists(k) for k in _webp_keys(sha, decoded.width))
+    media_ok = all(storage.exists(k) for k in _webp_keys(pub_sha, pub_width))
     if not (media_ok and "description" in texts and emb and emb["e"]):
         await _set_status(conn, image_id, "pending_enrichment")
         raise SoftError(
@@ -542,7 +584,7 @@ async def handle_haiku(
         log.info("haiku: image %s has no description (deleted?); skipping", image_id)
         return
     try:
-        l1, l2, l3 = await writer(row["body"], settings=settings)
+        l1, l2, l3 = await writer(row["body"], settings=settings, pool=pool)
     except DescribeError as e:
         if e.retryable:
             raise SoftError(f"haiku: {e}") from e

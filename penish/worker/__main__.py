@@ -1,4 +1,5 @@
-"""Worker entrypoint: the inbox watcher and the job loop, side by side in one process."""
+"""Worker entrypoint: the inbox watcher, the job loop, the heartbeat and the internal embed
+server, side by side in one process."""
 
 from __future__ import annotations
 
@@ -13,6 +14,8 @@ from penish.config import get_settings
 from penish.db import make_pool
 from penish.worker import jobs
 from penish.worker.embed import Embedder
+from penish.worker.embed_server import serve as serve_embed
+from penish.worker.heartbeat import run_heartbeat
 from penish.worker.ingest import handle_haiku, handle_ingest
 from penish.worker.jobs import Job
 from penish.worker.watcher import InboxWatcher
@@ -89,6 +92,8 @@ async def main() -> None:
         await asyncio.gather(
             watcher.run(stop),
             jobs.run_loop(pool, {"ingest": ingest, "haiku": haiku}, stop=stop, concurrency=2),
+            run_heartbeat(pool, stop, version=settings.git_sha),
+            serve_embed(embedder, stop, port=settings.embed_server_port),
         )
         warm.cancel()
     finally:

@@ -638,6 +638,7 @@ dependencies = [
     { name = "anthropic" },
     { name = "blurhash-python" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "jsonschema" },
     { name = "numpy" },
     { name = "pgvector" },
@@ -658,7 +659,6 @@ worker = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -671,6 +671,7 @@ requires-dist = [
     { name = "anthropic" },
     { name = "blurhash-python" },
     { name = "fastapi" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "jsonschema" },
     { name = "numpy" },
     { name = "pgvector" },
@@ -687,7 +688,6 @@ provides-extras = ["worker"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.28.1" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },

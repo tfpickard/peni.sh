@@ -43,7 +43,7 @@ async def list_images(
     async with request.app.state.pool.connection() as conn:
         cur = await conn.execute(
             f"""
-            select id, sha256, slug, width, height, blurhash, palette, published_at
+            select id, pub_sha, slug, width, height, blurhash, palette, published_at
             from images
             where status = 'live' and published_at is not null {where}
             order by published_at desc, id desc
@@ -55,7 +55,7 @@ async def list_images(
     # One extra row tells us whether another page exists without a count query.
     more = len(rows) > limit
     rows = rows[:limit]
-    variants = variants_for_many((r["sha256"], r["width"], r["height"]) for r in rows)
+    variants = variants_for_many((r["pub_sha"], r["width"], r["height"]) for r in rows)
     items = [
         {
             "slug": r["slug"],
@@ -63,7 +63,7 @@ async def list_images(
             "height": r["height"],
             "blurhash": r["blurhash"],
             "palette": r["palette"],
-            "variants": variants[r["sha256"]],
+            "variants": variants[r["pub_sha"]],
         }
         for r in rows
     ]
@@ -122,17 +122,17 @@ async def image_detail(
     if ids:
         async with pool.connection() as conn:
             cur = await conn.execute(
-                "select id, sha256, width, height, blurhash from images where id = any(%s)",
+                "select id, pub_sha, width, height, blurhash from images where id = any(%s)",
                 (ids,),
             )
             meta = {r["id"]: r for r in await cur.fetchall()}
-    nb_variants = variants_for_many((m["sha256"], m["width"], m["height"]) for m in meta.values())
+    nb_variants = variants_for_many((m["pub_sha"], m["width"], m["height"]) for m in meta.values())
 
     def strip(neighbor_list: list[Any]) -> list[dict[str, Any]]:
         out = []
         for n in neighbor_list:
             m = meta[n.image_id]
-            vs = nb_variants[m["sha256"]]
+            vs = nb_variants[m["pub_sha"]]
             # 480 is the grid size; a small source may only have its native width.
             pick = next((v for v in vs if v["w"] == 480), vs[0] if vs else None)
             out.append(
@@ -151,7 +151,7 @@ async def image_detail(
         "height": img["height"],
         "blurhash": img["blurhash"],
         "palette": img["palette"],
-        "variants": variants_for(img["sha256"], img["width"], img["height"]),
+        "variants": variants_for(img["pub_sha"], img["width"], img["height"]),
         "caption": texts.get("caption"),
         "description": texts.get("description"),
         "prompt": texts.get("prompt"),

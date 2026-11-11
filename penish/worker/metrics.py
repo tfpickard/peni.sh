@@ -35,7 +35,8 @@ def _sampled_mean_pairwise_distance(vecs: np.ndarray, pairs: int, seed: int) -> 
 
 
 async def refresh_corpus_stats(pool: Pool, *, kind: str, model: str) -> None:
-    """Recompute mean, n and temperature for one (kind, model) space and upsert them.
+    """Recompute mean, n and temperature for one (kind, model) space, upsert them and
+    append a corpus_stats_history row.
 
     temperature is the mean pairwise cosine distance between live images: how
     spread out the corpus is. Null below two images.
@@ -79,6 +80,12 @@ async def refresh_corpus_stats(pool: Pool, *, kind: str, model: str) -> None:
               updated_at = excluded.updated_at
             """.encode(),
             {**params, "t": temperature},
+        )
+        # Same transaction as the upsert, so the history never disagrees with the current row.
+        await conn.execute(
+            "insert into corpus_stats_history (kind, model, n, temperature)"
+            " values (%(kind)s, %(model)s, %(n)s, %(t)s)",
+            {**params, "n": n, "t": temperature},
         )
 
 

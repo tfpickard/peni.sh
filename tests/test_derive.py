@@ -4,12 +4,15 @@ import pytest
 import pyvips
 
 from penish.worker.derive import (
+    MIN_CROP,
     UndecodableImage,
     blurhash_of,
+    clamp_rect,
     clean_original,
     load_and_validate,
     make_derivatives,
     palette_of,
+    rebuild_public,
 )
 
 
@@ -139,3 +142,66 @@ def test_blurhash_input_is_png_buffer() -> None:
     buf = _gradient(40, 40).write_to_buffer(".png")
     assert isinstance(buf, bytes)
     assert io.BytesIO(buf).read(4) == b"\x89PNG"
+
+
+def _clean(w: int = 2000, h: int = 1000) -> bytes:
+    d = load_and_validate(_png(w, h))
+    return clean_original(d.image, d.mime)
+
+
+def test_rebuild_public_uncropped() -> None:
+    data = _clean()
+    pub = rebuild_public(data, None, False)
+    assert (pub.width, pub.height) == (2000, 1000)
+    assert sorted({d.width for d in pub.derivatives}) == [480, 960, 1600]
+    assert all(d.key.startswith(f"pub/{pub.pub_sha}-") for d in pub.derivatives)
+    assert len(pub.pub_sha) == 64 and len(pub.palette) == 5 and pub.blurhash
+    # Deterministic, so a retried crop job writes the same file names.
+    assert rebuild_public(data, None, False).pub_sha == pub.pub_sha
+    # The watermark changes the pixels, so it must change the immutable URLs too.
+    assert rebuild_public(data, None, True).pub_sha != pub.pub_sha
+
+
+def test_rebuild_public_cropped() -> None:
+    data = _clean()
+    full = rebuild_public(data, None, False)
+    pub = rebuild_public(data, {"x": 100, "y": 50, "w": 700, "h": 400}, False)
+    assert (pub.width, pub.height) == (700, 400)
+    assert pub.pub_sha != full.pub_sha
+    # 700 wide: only the 480 rung fits under the source width.
+    assert sorted({d.width for d in pub.derivatives}) == [480]
+    # Red ramps with x, so the left strip has a different palette from the whole frame.
+    assert pub.palette != full.palette
+
+
+def test_rebuild_public_full_frame_rect_is_uncropped() -> None:
+    data = _clean(800, 600)
+    whole = rebuild_public(data, {"x": -10, "y": -10, "w": 5000, "h": 5000}, False)
+    assert whole.pub_sha == rebuild_public(data, None, False).pub_sha
+
+
+def test_clamp_rect() -> None:
+    assert clamp_rect({"x": 10, "y": 20, "w": 100, "h": 50}, 800, 600) == {
+        "x": 10,
+        "y": 20,
+        "w": 100,
+        "h": 50,
+    }
+    # Spills past the edges are clipped, floats rounded.
+    assert clamp_rect({"x": -5.4, "y": 550, "w": 900, "h": 100.6}, 800, 600) == {
+        "x": 0,
+        "y": 550,
+        "w": 800,
+        "h": 50,
+    }
+    assert clamp_rect({"x": 0, "y": 0, "w": 800, "h": 600}, 800, 600) is None
+    for bad in (
+        {"x": 0, "y": 0, "w": MIN_CROP - 1, "h": 100},
+        {"x": 900, "y": 0, "w": 100, "h": 100},
+        {"x": 0, "y": 0, "w": 100},
+        {"x": "1", "y": 0, "w": 100, "h": 100},
+        {"x": True, "y": 0, "w": 100, "h": 100},
+        {"x": float("nan"), "y": 0, "w": 100, "h": 100},
+    ):
+        with pytest.raises(ValueError):
+            clamp_rect(bad, 800, 600)

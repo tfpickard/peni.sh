@@ -9,8 +9,10 @@ from typing import Any, cast
 import numpy as np
 import pytest
 import pyvips
+from psycopg.types.json import Jsonb
 
 from penish.config import Settings
+from penish.worker.derive import rebuild_public
 from penish.worker.describe import Described, DescribeError
 from penish.worker.ingest import handle_haiku, handle_ingest
 from penish.worker.jobs import HardError, Job, SoftError
@@ -36,7 +38,7 @@ class FakeDescriber:
         self.calls: list[set[str]] = []
 
     async def __call__(
-        self, image_bytes: bytes, mime: str, *, want: set[str], settings: Settings
+        self, image_bytes: bytes, mime: str, *, want: set[str], settings: Settings, pool: Any
     ) -> Described:
         self.calls.append(set(want))
         assert image_bytes and mime.startswith("image/")
@@ -138,6 +140,7 @@ async def test_lone_png_goes_live(p: Any, settings: Settings) -> None:
     assert {r["tag"] for r in tags} == set(TAGS) and {r["source"] for r in tags} == {"model"}
     emb = await q(p, "select model, dim from embeddings")
     assert emb == [{"model": "test/embed", "dim": DIM}]
+    assert img["pub_sha"] == img["sha256"]
     assert f"{img['sha256']}-480.webp" in pub_files(settings, img["sha256"])
     assert (settings.media_orig / f"{img['sha256']}.png").is_file()
     assert not present(job)
@@ -147,6 +150,30 @@ async def test_lone_png_goes_live(p: Any, settings: Settings) -> None:
     ]
     stats = await q(p, "select n from corpus_stats where kind = 'description'")
     assert stats == [{"n": 1}]
+
+
+async def test_redrop_of_cropped_image_keeps_crop(p: Any, settings: Settings) -> None:
+    data = png(30, 1200, 800)
+    await run(drop(settings, "c", data), p, settings)
+    img = await image(p)
+    # What the crop job will do: point pub_sha at a cropped ladder and drop the old one.
+    orig = (settings.media_orig / f"{img['sha256']}.png").read_bytes()
+    crop = {"x": 100, "y": 100, "w": 600, "h": 500}
+    pub = rebuild_public(orig, crop, False)
+    async with p.connection() as conn:
+        await conn.execute(
+            "update images set crop = %s, pub_sha = %s, width = %s, height = %s where id = %s",
+            (Jsonb(crop), pub.pub_sha, pub.width, pub.height, img["id"]),
+        )
+    for f in settings.media_pub.iterdir():
+        f.unlink()
+
+    # The cropped files are gone too, so this re-drop must heal them, not the full frame.
+    await run(drop(settings, "c", data), p, settings)
+    again = await image(p)
+    assert again["pub_sha"] == pub.pub_sha and again["width"] == 600
+    assert pub_files(settings, img["sha256"]) == []
+    assert f"{pub.pub_sha}-480.webp" in pub_files(settings, pub.pub_sha)
 
 
 async def test_owner_sidecars_skip_describe(p: Any, settings: Settings) -> None:
@@ -338,7 +365,7 @@ async def test_haiku_job(p: Any, settings: Settings) -> None:
     img = await image(p)
     seen: list[str] = []
 
-    async def writer(description: str, *, settings: Settings) -> tuple[str, str, str]:
+    async def writer(description: str, *, settings: Settings, pool: Any) -> tuple[str, str, str]:
         seen.append(description)
         return "moss holds the lamp", "brass remembers nothing", "evening, still"
 
@@ -349,7 +376,7 @@ async def test_haiku_job(p: Any, settings: Settings) -> None:
     assert rows == [{"l1": "moss holds the lamp", "source": "model", "image_id": img["id"]}]
     assert seen[0].startswith("A brass lamp")
 
-    async def flaky(description: str, *, settings: Settings) -> tuple[str, str, str]:
+    async def flaky(description: str, *, settings: Settings, pool: Any) -> tuple[str, str, str]:
         raise DescribeError("overloaded", retryable=True)
 
     with pytest.raises(SoftError):

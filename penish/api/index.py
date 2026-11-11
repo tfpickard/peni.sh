@@ -84,7 +84,7 @@ async def _image_page(request: Request, slug: str) -> HTMLResponse:
     tags = [tag("og:type", "article"), tag("twitter:card", "summary_large_image", "name")]
     if "description" in texts:
         tags.append(tag("og:description", _subject(texts["description"])))
-    variants = variants_for(img["sha256"], img["width"], img["height"])
+    variants = variants_for(img["pub_sha"], img["width"], img["height"])
     webps = [v for v in variants if v["webp"]]
     if webps:
         big = webps[-1]

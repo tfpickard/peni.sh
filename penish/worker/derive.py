@@ -1,7 +1,10 @@
 import hashlib
 import io
 import logging
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 import numpy as np
 import pyvips
@@ -10,6 +13,8 @@ from blurhash import encode as _blurhash_encode
 log = logging.getLogger(__name__)
 
 WIDTHS = (480, 960, 1600)
+# Smaller than this and the 480 rung, the blurhash and the palette are all mush.
+MIN_CROP = 32
 
 # Keyed on vips' own loader name rather than the file extension or sniffed
 # magic bytes, so what we accept is exactly what libvips actually decoded.
@@ -203,3 +208,71 @@ def palette_of(img: pyvips.Image, n: int = 5) -> list[str]:
     while len(hexes) < n:
         hexes.append(hexes[0])
     return hexes
+
+
+class Public(NamedTuple):
+    pub_sha: str
+    derivatives: list[Derivative]
+    width: int
+    height: int
+    blurhash: str
+    palette: list[str]
+
+
+def clamp_rect(rect: Mapping[str, Any], width: int, height: int) -> dict[str, int] | None:
+    """Clamp {x,y,w,h} (original pixels) into the frame.
+
+    Raises ValueError for a malformed rect or one that ends up under MIN_CROP on a side.
+    Returns None when the clamped rect is the whole frame, so callers store it as uncropped.
+    """
+    vals: dict[str, int] = {}
+    for k in ("x", "y", "w", "h"):
+        v = rect.get(k) if isinstance(rect, Mapping) else None
+        # bool is an int subclass; True as a coordinate is a client bug, not a pixel.
+        if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v):
+            raise ValueError(f"crop {k} must be a finite number")
+        vals[k] = round(v)
+    x0 = min(max(vals["x"], 0), width)
+    y0 = min(max(vals["y"], 0), height)
+    x1 = min(max(vals["x"] + vals["w"], 0), width)
+    y1 = min(max(vals["y"] + vals["h"], 0), height)
+    w, h = x1 - x0, y1 - y0
+    if w < MIN_CROP or h < MIN_CROP:
+        raise ValueError(f"crop must be at least {MIN_CROP}x{MIN_CROP} inside the image")
+    if (x0, y0, w, h) == (0, 0, width, height):
+        return None
+    return {"x": x0, "y": y0, "w": w, "h": h}
+
+
+def pub_hash(img: pyvips.Image, watermark: bool) -> str:
+    # Hash of the displayed pixels, not of any encoded file: deterministic, so a retried
+    # crop job lands on the same names, and the watermark flag is folded in because the
+    # files are served immutable and a toggle must change every URL.
+    h = hashlib.sha256(b"penish-pub-v1\0")
+    h.update(f"{img.width}x{img.height}x{img.bands}:{img.format}:{int(watermark)}\0".encode())
+    h.update(img.write_to_memory())
+    return h.hexdigest()
+
+
+def rebuild_public(
+    original_bytes: bytes, crop_rect: Mapping[str, Any] | None, watermark: bool
+) -> Public:
+    """Everything public about an image, recomputed from the clean original.
+
+    crop_rect is in original pixels and is clamped first (ValueError if unusable). The
+    caller writes the derivatives, then sets pub_sha, width, height, blurhash and palette.
+    """
+    img = load_and_validate(original_bytes).image
+    if crop_rect is not None:
+        rect = clamp_rect(crop_rect, img.width, img.height)
+        if rect is not None:
+            img = img.crop(rect["x"], rect["y"], rect["w"], rect["h"]).copy_memory()
+    sha = pub_hash(img, watermark)
+    return Public(
+        pub_sha=sha,
+        derivatives=make_derivatives(img, sha, watermark),
+        width=img.width,
+        height=img.height,
+        blurhash=blurhash_of(img),
+        palette=palette_of(img),
+    )

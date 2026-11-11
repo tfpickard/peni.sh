@@ -15,7 +15,8 @@ services:
     ports: !override
       - "8000:8000"
     volumes: !override
-      - ./data-dev/media/pub:/data/media/pub:ro
+      - ./data-dev/media/pub:/data/media/pub
+      - ./data-dev/media/orig:/data/media/orig
 
   worker:
     image: ghcr.io/tfpickard/penish-worker:${IMAGE_TAG:-dev}

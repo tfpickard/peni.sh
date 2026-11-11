@@ -288,16 +288,16 @@ async def status(request: Request, sha256: str, stem: str = "") -> dict[str, str
 async def recent(request: Request) -> list[dict[str, Any]]:
     async with request.app.state.pool.connection() as conn:
         cur = await conn.execute(
-            "select sha256, slug, status, width, height, created_at from images "
+            "select pub_sha, slug, status, width, height, created_at from images "
             "order by created_at desc limit 20"
         )
         rows = await cur.fetchall()
-    variants = variants_for_many([(r["sha256"], r["width"], r["height"]) for r in rows])
+    variants = variants_for_many([(r["pub_sha"], r["width"], r["height"]) for r in rows])
     out: list[dict[str, Any]] = []
     for r in rows:
         thumb = None
         if r["status"] == "live":
-            webps = [v["webp"] for v in variants[r["sha256"]] if v["webp"]]
+            webps = [v["webp"] for v in variants[r["pub_sha"]] if v["webp"]]
             thumb = webps[0] if webps else None
         out.append(
             {

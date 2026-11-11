@@ -19,7 +19,7 @@ _PUB_URL = "/media/pub/"
 
 
 def _scan(shas: Iterable[str]) -> dict[str, dict[int, dict[str, str]]]:
-    """One directory scan for any number of shas: sha -> width -> format -> filename."""
+    """One directory scan for any number of pub_shas: pub_sha -> width -> format -> filename."""
     wanted = set(shas)
     found: dict[str, dict[int, dict[str, str]]] = defaultdict(lambda: defaultdict(dict))
     try:
@@ -56,21 +56,21 @@ def _shape(
 def variants_for_many(
     images: Iterable[tuple[str, int | None, int | None]],
 ) -> dict[str, list[dict[str, Any]]]:
-    """sha -> variants for a batch, so a page of neighbors costs one directory scan."""
+    """pub_sha -> variants for a batch, so a page of neighbors costs one directory scan."""
     dims = {sha: (w, h) for sha, w, h in images}
     found = _scan(dims)
     return {sha: _shape(found.get(sha, {}), *dims[sha]) for sha in dims}
 
 
 def variants_for(
-    sha: str, width: int | None = None, height: int | None = None
+    pub_sha: str, width: int | None = None, height: int | None = None
 ) -> list[dict[str, Any]]:
     """Widths that exist on disk for one image, smallest first.
 
     Listing the directory keeps the API honest about small sources that only have
     a native width. If the scan gets slow, swap this for a variants column.
     """
-    return variants_for_many([(sha, width, height)])[sha]
+    return variants_for_many([(pub_sha, width, height)])[pub_sha]
 
 
 @router.api_route("/media/pub/{name}", methods=["GET", "HEAD"], include_in_schema=False)

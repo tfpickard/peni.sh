@@ -23,7 +23,7 @@ from penish.worker.describe import Described
 
 
 async def fake_describe(
-    image_bytes: bytes, mime: str, *, want: set[str], settings: Settings
+    image_bytes: bytes, mime: str, *, want: set[str], settings: Settings, pool: Any = None
 ) -> Described:
     tag = hashlib.sha256(image_bytes).hexdigest()[:8]
     # The test counts lines here to tell whether the model was consulted at all.
@@ -40,7 +40,9 @@ async def fake_describe(
     )
 
 
-async def fake_haiku(description: str, *, settings: Settings) -> tuple[str, str, str]:
+async def fake_haiku(
+    description: str, *, settings: Settings, pool: Any = None
+) -> tuple[str, str, str]:
     return "one fake line", "another fake line", "a last fake line"
 
 

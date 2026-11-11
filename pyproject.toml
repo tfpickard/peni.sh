@@ -16,6 +16,7 @@ dependencies = [
     "numpy",
     "jsonschema",
     "python-multipart>=0.0.33",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
@@ -32,7 +33,6 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "types-jsonschema",
-    "httpx>=0.28.1",
 ]
 
 [build-system]

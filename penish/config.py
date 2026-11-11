@@ -1,18 +1,36 @@
+import logging
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+log = logging.getLogger(__name__)
+
+DEV_SECRET_KEY = "dev-secret-not-for-production"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # compose passes unset keys as ${VAR:-}, an empty string; that must mean "default",
+    # or an unset SECRET_KEY would quietly become the empty key.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_ignore_empty=True)
 
     database_url: str = "postgresql://penish:penish@localhost:5432/penish"
     data_dir: Path = Path("/srv/penish/data")
     anthropic_api_key: str | None = None
     # Unset turns the whole admin surface off (404), so a fresh deploy exposes nothing.
     admin_password: str | None = None
+    # Keys the hmac of voter ids and ip hashes. Rotating it orphans existing votes.
+    secret_key: str = DEV_SECRET_KEY
+    # Baked in at image build time so /system can say what is deployed.
+    git_sha: str = "dev"
+    # Both unset means comments fall back to the rate limit alone.
+    turnstile_site_key: str | None = None
+    turnstile_secret: str | None = None
+    # The worker's internal embed server; compose publishes no port for it.
+    embed_server_url: str = "http://worker:8001"
+    # Where the worker listens for it. Only tests move it, to dodge a busy 8001.
+    embed_server_port: int = 8001
 
     # Model ids are env vars so they can be swapped without a code change.
     describe_model: str = "claude-sonnet-5-5"
@@ -56,4 +74,8 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    s = Settings()
+    # /data is the container layout, so a default key there means a prod box without one.
+    if s.secret_key == DEV_SECRET_KEY and s.data_dir == Path("/data"):
+        log.warning("SECRET_KEY is the dev default; set it in .env")
+    return s

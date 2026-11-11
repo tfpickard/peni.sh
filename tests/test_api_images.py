@@ -50,17 +50,20 @@ def add_image(
     description: str | None = None,
     widths: tuple[int, ...] = (480, 960, 1600),
     vec: list[float] | None = None,
+    pub_n: int | None = None,
 ) -> int:
+    """pub_n names the derivatives (pub_sha) separately from the upload hash, as after a crop."""
+    pub_sha = sha(n if pub_n is None else pub_n)
     pub = get_settings().media_pub
     for w in widths:
         for ext in ("avif", "webp"):
-            (pub / f"{sha(n)}-{w}.{ext}").write_bytes(b"x")
+            (pub / f"{pub_sha}-{w}.{ext}").write_bytes(b"x")
     with psycopg.connect(dsn) as conn:
         row = conn.execute(
-            "insert into images (sha256, slug, width, height, blurhash, palette, status, "
-            "published_at) values (%s, %s, 3200, 2400, 'LEHV6n', '[\"#fff\"]', %s, %s) "
+            "insert into images (sha256, pub_sha, slug, width, height, blurhash, palette, status, "
+            "published_at) values (%s, %s, %s, 3200, 2400, 'LEHV6n', '[\"#fff\"]', %s, %s) "
             "returning id",
-            (sha(n), f"img-{n}", status, BASE + timedelta(minutes=n)),
+            (sha(n), pub_sha, f"img-{n}", status, BASE + timedelta(minutes=n)),
         ).fetchone()
         assert row
         image_id = row[0]
@@ -225,3 +228,27 @@ async def test_og_unknown_slug_is_404_spa(client: httpx.AsyncClient, clean_db: s
         assert r.status_code == 404
         assert "<div id=app>" in r.text
         assert "og:image" not in r.text
+
+
+async def test_variants_follow_pub_sha(client: httpx.AsyncClient, clean_db: str) -> None:
+    # A cropped image keeps its upload hash but serves files named by pub_sha.
+    add_image(clean_db, 1, pub_n=901, description="Subject: a cup.", vec=unit(0))
+    add_image(clean_db, 2, pub_n=902, vec=unit(0, 1))
+    listed = (await client.get("/api/images")).json()["items"]
+    assert listed[0]["variants"][0]["webp"] == f"/media/pub/{sha(902)}-480.webp"
+    body = (await client.get("/api/images/img-1")).json()
+    assert body["variants"][-1]["webp"] == f"/media/pub/{sha(901)}-1600.webp"
+    assert body["similar"][0]["src"] == f"/media/pub/{sha(902)}-480.webp"
+    page = (await client.get("/i/img-1")).text
+    assert f"/media/pub/{sha(901)}-1600.webp" in page
+    assert sha(1) not in page
+
+
+async def test_pub_sha_defaults_to_sha256(clean_db: str) -> None:
+    # Raw inserts without pub_sha (tests, psql) must still name files that exist.
+    with psycopg.connect(clean_db) as conn:
+        row = conn.execute(
+            "insert into images (sha256, status) values (%s, 'queued') returning pub_sha",
+            (sha(77),),
+        ).fetchone()
+    assert row == (sha(77),)

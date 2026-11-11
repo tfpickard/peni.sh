@@ -1,17 +1,19 @@
 import base64
 import json
+import logging
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import anthropic
 import jsonschema
 
+from penish import runtime
 from penish.config import Settings
+from penish.runtime import Getter, Pool, UsageRecorder
 from penish.text import no_em_dash
 
-PROMPT = (Path(__file__).resolve().parent.parent / "prompts" / "describe.md").read_text()
+log = logging.getLogger(__name__)
 
 _FIELDS = ("caption", "description", "tags")
 _FENCE = re.compile(r"^\s*```[a-zA-Z]*\s*\n?(.*?)\n?```\s*$", re.S)
@@ -102,12 +104,32 @@ def map_api_error(exc: anthropic.APIError) -> DescribeError:
     return DescribeError(str(exc), retryable=False)
 
 
-async def call_text(client: Any, *, model: str, create_kwargs: dict[str, Any]) -> str:
+async def call_text(
+    client: Any,
+    *,
+    model: str,
+    create_kwargs: dict[str, Any],
+    record: UsageRecorder | None = None,
+) -> str:
     try:
         resp = await client.messages.create(model=model, **create_kwargs)
     except anthropic.APIError as exc:
         raise map_api_error(exc) from exc
+    if record is not None:
+        try:
+            await record(model, getattr(resp, "usage", None))
+        except Exception:
+            # Accounting must not throw away a response that was already paid for.
+            log.exception("could not record api usage for %s", model)
     return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+
+
+def output_config(schema: dict[str, Any], effort: str | None) -> dict[str, Any]:
+    cfg: dict[str, Any] = {"format": {"type": "json_schema", "schema": schema}}
+    # Only when set: models without effort support reject the key outright.
+    if effort:
+        cfg["effort"] = effort
+    return cfg
 
 
 async def describe(
@@ -116,21 +138,31 @@ async def describe(
     *,
     want: set[str],
     settings: Settings,
+    pool: Pool | None = None,
+    get: Getter | None = None,
     client: Any = None,
 ) -> Described:
+    """`get` overrides the runtime lookup (tests); otherwise `pool` supplies it, and usage
+    is recorded whenever a pool is given."""
     want = set(want)
     if not want or not want <= set(_FIELDS):
         raise ValueError(f"want must be a non-empty subset of {_FIELDS}")
     if client is None:
         client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    get = get or runtime.getter(pool, settings)
+    # Read per call so an admin change applies to the next image without a restart.
+    model = await get("describe.model")
+    effort = await get("describe.effort")
+    prompt = await get("describe.prompt")
+    record = runtime.usage_recorder(pool, "describe")
 
     keys = [k for k in _FIELDS if k in want]
     # temperature is not accepted for claude-sonnet-5-5 (the SDK no longer exposes
     # it), so determinism comes from the fixed description structure instead.
     kwargs: dict[str, Any] = {
         "max_tokens": 1500,
-        "system": PROMPT,
-        "output_config": {"format": {"type": "json_schema", "schema": build_schema(want)}},
+        "system": prompt,
+        "output_config": output_config(build_schema(want), effort),
         "messages": [
             {
                 "role": "user",
@@ -151,7 +183,7 @@ async def describe(
 
     last: Exception | None = None
     for _ in range(2):
-        text = await call_text(client, model=settings.describe_model, create_kwargs=kwargs)
+        text = await call_text(client, model=model, create_kwargs=kwargs, record=record)
         try:
             out = _validate(text, want)
         except (ValueError, jsonschema.ValidationError) as exc:
@@ -161,6 +193,6 @@ async def describe(
             caption=out.get("caption"),
             description=out.get("description"),
             tags=out.get("tags"),
-            model=settings.describe_model,
+            model=model,
         )
     raise DescribeError(f"invalid describer output: {last}", retryable=True)

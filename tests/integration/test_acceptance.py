@@ -102,6 +102,8 @@ def worker(env: Env, **extra: str) -> Iterator[subprocess.Popen[bytes]]:
         "DATA_DIR": str(env.data),
         "SETTLE_SECONDS": "1",
         "PYTHONPATH": str(ROOT),
+        # Ephemeral, so a dev box with something on 8001 does not matter.
+        "EMBED_SERVER_PORT": "0",
         **extra,
     }
     log = (env.data / "worker.log").open("ab")

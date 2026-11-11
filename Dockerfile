@@ -44,6 +44,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 COPY --from=web /web/build /app/web
 ENV WEB_BUILD_DIR=/app/web
+# Last, so a new sha only rebuilds this metadata layer. /system reports it.
+ARG GIT_SHA=dev
+ENV GIT_SHA=$GIT_SHA
 USER app
 EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=5 \
@@ -58,6 +61,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Created before the volume mounts so the named volume inherits app ownership.
 RUN mkdir /models && chown app:app /models
 ENV HF_HOME=/models
+# The heartbeat reports it.
+ARG GIT_SHA=dev
+ENV GIT_SHA=$GIT_SHA
 USER app
 CMD ["python", "-m", "penish.worker"]
 

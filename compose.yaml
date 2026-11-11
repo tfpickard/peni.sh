@@ -35,13 +35,20 @@ services:
       DATABASE_URL: *db-url
       DATA_DIR: /data
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SECRET_KEY: ${SECRET_KEY:-}
+      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET: ${TURNSTILE_SECRET:-}
+      # The worker's internal embed server, over the compose network only.
+      EMBED_SERVER_URL: http://worker:8001
     ports:
       # Loopback only: Docker's published ports bypass ufw, so anything wider would be public.
       # The host cloudflared reaches it at http://localhost:8000.
       - "127.0.0.1:8000:8000"
     volumes:
-      # Published derivatives only; originals stay out of reach.
-      - ./data/media/pub:/data/media/pub:ro
+      # rw for admin delete, which removes the files after the row. The admin crop UI also
+      # streams originals from here. Bind mounts stay writable under read_only.
+      - ./data/media/pub:/data/media/pub
+      - ./data/media/orig:/data/media/orig
       # Admin uploads land here for the worker. Bind mounts stay writable under read_only.
       - ./data/inbox:/data/inbox
       # Read-only: the admin status call quotes the .err file of a failed group.
@@ -62,6 +69,7 @@ services:
       DATABASE_URL: *db-url
       DATA_DIR: /data
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SECRET_KEY: ${SECRET_KEY:-}
       # Leaves a core free for the db and api on the 4-core box.
       EMBED_THREADS: "3"
     volumes:
@@ -70,6 +78,7 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    # No ports: the embed server on :8001 has no auth and must stay on the compose network.
     mem_limit: 6g
     cap_drop: [ALL]
     restart: unless-stopped
