@@ -87,18 +87,22 @@ async def search(
             f"""
             select t.tag, count(*)::int as n
               from tags t join images i on i.id = t.image_id
-             where {_LIVE} and position(%(needle)s in t.tag) > 0
+             where {_LIVE}
+               and exists (select 1 from unnest(%(exact)s::text[]) s
+                            where position(s in lower(t.tag)) > 0)
              group by t.tag
-             order by (t.tag = any(%(exact)s)) desc, n desc, t.tag
+             order by (lower(t.tag) = any(%(exact)s)) desc, n desc, t.tag
              limit %(k)s
             """.encode(),
-            {"needle": as_tag or q.lower(), "exact": spellings, "k": _TAG_MATCHES},
+            {"exact": spellings, "k": _TAG_MATCHES},
         )
         tags = [{"tag": r["tag"], "n": r["n"]} for r in await cur.fetchall()]
 
     emb = await _query_vector(request, q)
     params: dict[str, Any] = {"exact": spellings, "limit": limit, "kind": KIND}
-    tagged = "exists (select 1 from tags t where t.image_id = i.id and t.tag = any(%(exact)s))"
+    tagged = (
+        "exists (select 1 from tags t where t.image_id = i.id and lower(t.tag) = any(%(exact)s))"
+    )
     cols = "i.id, i.pub_sha, i.slug, i.width, i.height, i.blurhash, i.palette"
     if emb is None:
         # Without the worker there is no ranking, only pictures that carry the tag outright.

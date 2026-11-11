@@ -35,9 +35,15 @@ export function layout(
 	for (const t of sorted) {
 		// Log scale: counts are long-tailed, and linear would leave one giant among specks.
 		const weight = hi > lo ? (Math.log(t.n) - lo) / (hi - lo) : 0;
-		const size = Math.round(MIN_PX + weight * (maxPx - MIN_PX));
-		const w = Math.min(measure(t.tag, size), width);
+		let size = Math.round(MIN_PX + weight * (maxPx - MIN_PX));
+		let w = measure(t.tag, size);
+		// A tag wider than the column is set smaller until it fits, never clipped.
+		if (w > width) {
+			size = Math.max(1, Math.floor((size * width) / w));
+			w = measure(t.tag, size);
+		}
 		const h = size * LINE;
+		let placed = false;
 		for (let i = 0; i < MAX_STEPS; i++) {
 			const a = 0.3 * i;
 			const r = 1.1 * a;
@@ -51,7 +57,16 @@ export function layout(
 			if (hit) continue;
 			boxes.push({ x, y, w, h });
 			words.push({ ...t, x, y, size, weight });
+			placed = true;
 			break;
+		}
+		// The spiral can run out of room for a word nearly as wide as the column; it goes
+		// under everything placed so far rather than vanishing.
+		if (!placed) {
+			const y = boxes.length ? Math.max(...boxes.map((b) => b.y + b.h)) + PAD_Y : 0;
+			const x = -Math.min(w, width) / 2;
+			boxes.push({ x, y, w, h });
+			words.push({ ...t, x, y, size, weight });
 		}
 	}
 

@@ -120,6 +120,33 @@ async def test_search_tagged_first_then_nearest(
     assert asked == ["Blue chair"]
 
 
+async def test_search_finds_free_text_owner_tags(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    add_image(clean_db, 1, vec=unit(0))
+    add_image(clean_db, 2, vec=unit(1))
+    # A sidecar keeps spaces, so slugifying the query alone would never reach this tag.
+    tag(clean_db, 2, "black and white")
+    fake_embed(monkeypatch, unit(0))
+    body = (await client.get("/api/search", params={"q": "Black and white"})).json()
+    assert body["tags"] == [{"tag": "black and white", "n": 1}]
+    assert [i["slug"] for i in body["items"]] == ["img-2", "img-1"]
+
+
+async def test_list_by_long_owner_tag(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+) -> None:
+    long = "a-tag-from-a-sidecar-that-runs-well-past-the-admin-form-limit-of-sixty"
+    add_image(clean_db, 1)
+    tag(clean_db, 1, long)
+    r = await client.get("/api/images", params={"tag": long})
+    assert r.status_code == 200
+    assert r.json()["count"] == 1
+
+
 async def test_search_blank(client: httpx.AsyncClient) -> None:  # noqa: F811
     assert (await client.get("/api/search", params={"q": "  "})).json() == {
         "q": "",

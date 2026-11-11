@@ -12,8 +12,6 @@ router = APIRouter()
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _K = 8
 PUBLIC_TEXTS = ("caption", "description", "prompt")
-# The admin form's cap on one tag; nothing longer can be stored.
-TAG_MAX = 60
 _LIVE = "status = 'live' and published_at is not null"
 
 
@@ -55,7 +53,8 @@ async def list_images(
     request: Request,
     cursor: str | None = None,
     limit: int = Query(48, ge=1, le=100),
-    tag: str | None = Query(None, max_length=TAG_MAX),
+    # No length cap: owner sidecars store tags of any length, and every stored tag is linked.
+    tag: str | None = None,
 ) -> dict[str, Any]:
     where = ""
     params: list[Any] = []
