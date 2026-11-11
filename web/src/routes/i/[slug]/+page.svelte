@@ -75,6 +75,10 @@
 		const w = stage?.clientWidth ?? innerWidth;
 		try {
 			if (reduced()) {
+				// No slide, but a committed drag still leaves the finger's offset on the track,
+				// which outlives the picture because same-route navigation reuses this component.
+				animating = false;
+				dx = 0;
 				await goto(href(slug), { replace: true });
 				return;
 			}
