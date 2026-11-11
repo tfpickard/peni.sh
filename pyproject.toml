@@ -1,0 +1,72 @@
+[project]
+name = "penish"
+version = "2.0.0"
+description = "peni.sh"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "psycopg[binary,pool]",
+    "pgvector",
+    "pydantic-settings",
+    "pyvips[binary]",
+    "blurhash-python",
+    "anthropic",
+    "watchfiles",
+    "numpy",
+    "jsonschema",
+]
+
+[project.optional-dependencies]
+# Kept out of the base set so the api image stays slim.
+worker = [
+    "torch",
+    "sentence-transformers",
+]
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pytest-asyncio",
+    "types-jsonschema",
+    "httpx>=0.28.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["penish"]
+
+# CPU-only torch wheels: the default index ships CUDA builds that are several GB.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", extra = "worker" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["pgvector.*", "pyvips.*", "blurhash.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["live: calls the real Anthropic API (needs ANTHROPIC_API_KEY)"]

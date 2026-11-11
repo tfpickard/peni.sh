@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Nightly backup, run by penish-backup.timer as the deploy user.
+# Env overrides (testing): APP_ROOT, DRY_RUN=1, KEEP.
+set -euo pipefail
+
+ROOT=${APP_ROOT:-/srv/peni.sh}
+ENV_FILE=$ROOT/.env
+KEEP=${KEEP:-14}
+DRY_RUN=${DRY_RUN:-0}
+
+run() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '+ %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+cd "$ROOT"
+mkdir -p backups
+
+env_get() {
+  local line
+  line=$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 || true)
+  line=${line#*=}
+  line=${line#[\"\']}
+  line=${line%[\"\']}
+  printf '%s' "$line"
+}
+target=$(env_get BACKUP_TARGET)
+
+dump=backups/$(date +%F).dump
+if [ "$DRY_RUN" = 1 ]; then
+  printf '+ docker compose exec -T db pg_dump -Fc > %s\n' "$dump"
+else
+  # Credentials come from the container's own env so this script needs no db settings.
+  # Dump to a temp name so a failed run never leaves a truncated file that looks valid.
+  if ! docker compose exec -T db sh -c 'pg_dump -Fc -U "$POSTGRES_USER" "$POSTGRES_DB"' >"$dump.tmp"; then
+    rm -f "$dump.tmp"
+    echo "penish-backup: ERROR: pg_dump failed" >&2
+    exit 1
+  fi
+  mv "$dump.tmp" "$dump"
+fi
+
+# ISO dates sort lexically, so name order is age order.
+find backups -maxdepth 1 -name '*.dump' | sort -r | tail -n "+$((KEEP + 1))" | while read -r old; do
+  run rm -f "$old"
+done
+
+# Restic wins when configured: encrypted, deduplicated, and retention is handled by the tool.
+restic_repo=$(env_get RESTIC_REPOSITORY)
+if [ -n "$restic_repo" ]; then
+  # Export only backend settings and credentials; .env also holds unrelated secrets.
+  while IFS= read -r line; do
+    case $line in
+      RESTIC_*=* | AWS_*=* | B2_*=* | AZURE_*=* | GOOGLE_*=* | OS_*=* | ST_*=*)
+        key=${line%%=*}
+        val=${line#*=}
+        val=${val#[\"\']}
+        val=${val%[\"\']}
+        export "$key=$val"
+        ;;
+    esac
+  done <"$ENV_FILE"
+  run restic backup --tag penish backups data/media/orig
+  run restic forget --tag penish --keep-daily "$KEEP" --prune
+  exit 0
+fi
+
+if [ -z "$target" ]; then
+  echo "penish-backup: WARNING: neither RESTIC_REPOSITORY nor BACKUP_TARGET set in $ENV_FILE; backup is local only" >&2
+  exit 0
+fi
+
+# No --delete: an emptied source must never erase the off-box copy of the originals.
+run rsync -a backups/ "$target/backups/"
+run rsync -a data/media/orig/ "$target/media/orig/"

@@ -1,0 +1,93 @@
+@font-face {
+	font-family: 'Fungal';
+	src: url('/fonts/FungalVF.woff2') format('woff2');
+	font-weight: 100 900;
+	font-display: swap;
+}
+
+:root {
+	--background: #0b0618;
+	--foreground: #f7e8d9;
+	--muted: #2a1f4a;
+	--muted-foreground: rgb(168 140 196);
+	--card: #1a0f2e;
+	--primary: #ff4d9d;
+	--secondary: #4adcff;
+	--accent: #c8a2ff;
+
+	--ink-50: rgb(253 245 255);
+	--ink-100: #f7e8d9;
+	--ink-200: rgb(224 208 248);
+	--ink-300: #c8a2ff;
+	--ink-400: rgb(168 140 196);
+	--ink-500: rgb(122 92 140);
+	--ink-700: rgb(61 44 106);
+	--ink-800: #2a1f4a;
+	--ink-900: #1a0f2e;
+	--ink-950: #0b0618;
+
+	color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	background: var(--background);
+}
+
+body {
+	margin: 0;
+	background-color: var(--background);
+	color: var(--foreground);
+	font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+	font-size: 1rem;
+	line-height: 1.5;
+	overflow-x: hidden;
+}
+
+a {
+	color: var(--primary);
+	text-decoration: none;
+}
+a:hover {
+	text-decoration: underline;
+}
+:focus-visible {
+	outline: 2px solid var(--secondary);
+	outline-offset: 3px;
+}
+
+/* The fallback and the hydrated heading share one rule so swapping them does not move the text. */
+.haiku,
+.haiku-ssr {
+	font-family: 'Fungal', system-ui, sans-serif;
+	font-size: clamp(2rem, 6vw, 4.5rem);
+	font-weight: 400;
+	line-height: 1.25;
+	margin: 0;
+	/* Tendrils draw outside the em box. */
+	padding-block: 0.4em;
+	overflow: visible;
+	overflow-wrap: anywhere;
+}
+
+.haiku-line {
+	display: block;
+}
+
+.haiku-ssr {
+	font-variation-settings:
+		'grow' 120,
+		'THCK' 400;
+	max-width: 60rem;
+	margin-inline: auto;
+	padding-inline: 1.5rem;
+}
+
+.haiku-ssr[hidden] {
+	display: none;
+}

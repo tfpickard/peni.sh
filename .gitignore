@@ -1,0 +1,22 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+
+# node
+node_modules/
+
+# web
+web/build/
+web/.svelte-kit/
+
+# local state and secrets
+.env
+data/
+.DS_Store
+data-dev/

@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Pull-based deploy poller. Run by penish-deploy.timer as the deploy user.
+# Env overrides (testing): APP_ROOT, API_URL, DRY_RUN=1, WAIT_SECS.
+set -euo pipefail
+
+ROOT=${APP_ROOT:-/srv/peni.sh}
+ENV_FILE=$ROOT/.env
+DATA=$ROOT/data
+WAIT_SECS=${WAIT_SECS:-120}
+RETRY_AFTER_MIN=${RETRY_AFTER_MIN:-10}
+DRY_RUN=${DRY_RUN:-0}
+DEFAULT_API_URL='https://api.github.com/repos/tfpickard/peni.sh/actions/workflows/ci.yml/runs?branch=main&status=success&event=push&per_page=1'
+API_URL=${API_URL:-$DEFAULT_API_URL}
+
+log() { printf 'penish-deploy: %s\n' "$*"; }
+err() { printf 'penish-deploy: ERROR: %s\n' "$*" >&2; }
+
+# /run/lock is world-writable on Ubuntu; the fallbacks keep the script usable unprivileged.
+lock_dir=/run/lock
+[ -w "$lock_dir" ] || lock_dir=${XDG_RUNTIME_DIR:-/tmp}
+exec 9>"$lock_dir/penish-deploy.lock"
+flock -n 9 || exit 0
+
+# Parsed rather than sourced: .env is not guaranteed to be valid shell.
+env_get() {
+  local line
+  line=$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 || true)
+  line=${line#*=}
+  line=${line#[\"\']}
+  line=${line%[\"\']}
+  printf '%s' "$line"
+}
+
+run() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '+ %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+# The value ends up in .env and in image refs, so reject anything but a full sha.
+valid_sha() { [[ $1 =~ ^[0-9a-f]{40}$ ]]; }
+
+set_image_tag() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '+ set IMAGE_TAG=%s in %s\n' "$1" "$ENV_FILE"
+  elif grep -q '^IMAGE_TAG=' "$ENV_FILE"; then
+    # Rewrite in place rather than sed -i: the app root is not writable by deploy, only .env is.
+    tmp=$(mktemp)
+    sed "s/^IMAGE_TAG=.*/IMAGE_TAG=$1/" "$ENV_FILE" >"$tmp"
+    cat "$tmp" >"$ENV_FILE"
+    rm -f "$tmp"
+  else
+    printf '\nIMAGE_TAG=%s\n' "$1" >>"$ENV_FILE"
+  fi
+}
+
+api_healthy() {
+  local health
+  # Newer compose prints one JSON object per line, older prints an array; slurp handles both.
+  health=$(docker compose ps api --format json 2>/dev/null | jq -rs 'flatten | .[0].Health // ""' 2>/dev/null || true)
+  [ "$health" = healthy ]
+}
+
+wait_healthy() {
+  local waited=0
+  while [ "$waited" -lt "$WAIT_SECS" ]; do
+    api_healthy && return 0
+    sleep 2
+    waited=$((waited + 2))
+  done
+  return 1
+}
+
+cd "$ROOT"
+[ -f "$ROOT/compose.yaml" ] || [ "$DRY_RUN" = 1 ] || exit 0
+
+if [ -f "$DATA/pinned_sha" ]; then
+  target=$(tr -d '[:space:]' <"$DATA/pinned_sha")
+else
+  token=$(env_get GH_READ_TOKEN)
+  # Unauthenticated calls would exhaust the rate limit at one poll per minute, so do nothing instead.
+  if [ -z "$token" ] && [ "$API_URL" = "$DEFAULT_API_URL" ]; then
+    exit 0
+  fi
+  auth=()
+  [ -z "$token" ] || auth=(-H "Authorization: Bearer $token")
+  if ! resp=$(curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' "${auth[@]}" "$API_URL"); then
+    err "could not query $API_URL"
+    exit 1
+  fi
+  target=$(printf '%s' "$resp" | jq -r '.workflow_runs[0].head_sha // empty')
+  # No successful run yet is not an error.
+  [ -n "$target" ] || exit 0
+fi
+
+if ! valid_sha "$target"; then
+  err "refusing malformed sha: $target"
+  exit 1
+fi
+
+deployed=$(cat "$DATA/deployed_sha" 2>/dev/null || true)
+[ "$target" != "$deployed" ] || exit 0
+
+# A sha that failed its health check is retried only after a pause, not every minute.
+if [ -f "$DATA/failed_sha" ] && [ "$(cat "$DATA/failed_sha")" = "$target" ] \
+  && [ -n "$(find "$DATA/failed_sha" -mmin "-$RETRY_AFTER_MIN" 2>/dev/null)" ]; then
+  exit 0
+fi
+
+log "deploying $target (was ${deployed:-none})"
+set_image_tag "$target"
+
+if ! run docker compose pull; then
+  err "pull failed for $target; running containers untouched"
+  [ -z "$deployed" ] || set_image_tag "$deployed"
+  exit 1
+fi
+
+failed=0
+run docker compose up -d --remove-orphans || failed=1
+if [ "$failed" = 0 ]; then
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '+ wait up to %ss for api healthy\n' "$WAIT_SECS"
+  else
+    wait_healthy || failed=1
+  fi
+fi
+
+if [ "$failed" = 1 ]; then
+  err "DEPLOY FAILED for $target: api not healthy within ${WAIT_SECS}s"
+  printf '%s\n' "$target" >"$DATA/failed_sha"
+  if [ -n "$deployed" ]; then
+    err "rolling back to $deployed"
+    set_image_tag "$deployed"
+    run docker compose up -d --remove-orphans || err "rollback up failed; manual intervention needed"
+  else
+    err "no previous deploy to roll back to"
+  fi
+  exit 1
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+  printf '+ write %s/deployed_sha = %s\n' "$DATA" "$target"
+else
+  printf '%s\n' "$target" >"$DATA/deployed_sha.tmp"
+  mv "$DATA/deployed_sha.tmp" "$DATA/deployed_sha"
+  rm -f "$DATA/failed_sha"
+fi
+log "deployed $target"
+
+# Each deploy pulls a torch-sized image; without this the disk fills in days.
+run docker image prune -af --filter until=72h >/dev/null || true

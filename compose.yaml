@@ -1,0 +1,79 @@
+# Prod stack. No build: keys, the VPS only pulls. Every tag comes from IMAGE_TAG in .env.
+x-db-url: &db-url postgresql://penish:${POSTGRES_PASSWORD:?}@db:5432/penish?sslmode=disable
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: penish
+      POSTGRES_DB: penish
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Default 64mb /dev/shm is too small for parallel queries and index builds.
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U penish -d penish"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    image: ghcr.io/tfpickard/penish-migrate:${IMAGE_TAG:?}
+    environment:
+      DATABASE_URL: *db-url
+    command: ["--wait", "up"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: ghcr.io/tfpickard/penish-api:${IMAGE_TAG:?}
+    environment:
+      DATABASE_URL: *db-url
+      DATA_DIR: /data
+    volumes:
+      # The api only serves published derivatives; it never needs the inbox or originals.
+      - ./data/media/pub:/data/media/pub:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  worker:
+    image: ghcr.io/tfpickard/penish-worker:${IMAGE_TAG:?}
+    environment:
+      DATABASE_URL: *db-url
+      DATA_DIR: /data
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Leaves a core free for the db and api on the 4-core box.
+      EMBED_THREADS: "3"
+    volumes:
+      - ./data:/data
+      - models:/models
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    mem_limit: 6g
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.7
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  models:

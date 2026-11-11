@@ -1,0 +1,10 @@
+[Unit]
+Description=penish nightly backup
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+WorkingDirectory=/srv/peni.sh
+ExecStart=/usr/local/bin/penish-backup

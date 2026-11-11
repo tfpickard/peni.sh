@@ -1,0 +1,30 @@
+# Mac override: docker compose -f compose.yaml -f compose.dev.yaml up --build
+services:
+  migrate:
+    image: ghcr.io/tfpickard/penish-migrate:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      target: migrate
+
+  api:
+    image: ghcr.io/tfpickard/penish-api:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      target: api
+    ports:
+      - "8000:8000"
+    volumes: !override
+      - ./data-dev/media/pub:/data/media/pub:ro
+
+  worker:
+    image: ghcr.io/tfpickard/penish-worker:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      target: worker
+    volumes: !override
+      - ./data-dev:/data
+      - models:/models
+
+  # Needs a real tunnel token; skipped unless --profile prod.
+  cloudflared:
+    profiles: [prod]

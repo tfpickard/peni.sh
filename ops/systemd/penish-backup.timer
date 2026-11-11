@@ -1,0 +1,10 @@
+[Unit]
+Description=penish nightly backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+# Catches up after downtime instead of skipping the night.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
