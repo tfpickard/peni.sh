@@ -1,3 +1,4 @@
+import html
 import json
 import re
 from collections.abc import AsyncIterator
@@ -8,6 +9,7 @@ import psycopg
 import pytest
 
 from penish.api.app import create_app
+from penish.api.haiku_render import render_haiku_html
 from penish.config import get_settings
 
 
@@ -67,7 +69,7 @@ async def test_index_injects_haiku(client: httpx.AsyncClient, clean_db: str) -> 
     assert m
     lines = json.loads(m.group(1))["lines"]
     assert set(lines) <= _seed_lines(clean_db)
-    assert "<body class='x'><h1 class=\"haiku-ssr\">" in r.text
+    assert "<body class='x'><h1 class=\"haiku\" " in r.text
 
 
 async def test_spa_fallback(client: httpx.AsyncClient) -> None:
@@ -91,3 +93,36 @@ async def test_immutable_asset_headers(client: httpx.AsyncClient) -> None:
 async def test_head_on_pages_is_allowed(client: httpx.AsyncClient) -> None:
     r = await client.head("/")
     assert r.status_code == 200
+
+
+def _growths(text: str) -> list[float]:
+    return [float(g) for g in re.findall(r"'grow' ([\d.]+)", text)]
+
+
+async def test_index_varies_without_js(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = (await client.get("/")).text
+    b = (await client.get("/")).text
+    ga, gb = _growths(a), _growths(b)
+    assert len(ga) > 20
+    assert len(set(ga)) > 10
+    assert ga != gb
+    m = re.search(r'<h1 class="haiku" aria-label="(.*?)">', a)
+    assert m
+    # aria-label is the plain haiku: every part is a line from the deck.
+    assert set(html.unescape(m.group(1)).split(" / ")) <= _seed_lines(clean_db)
+    assert "haiku-ssr" not in a
+
+
+async def test_gen_param_and_window_seed(client: httpx.AsyncClient) -> None:
+    r = await client.get("/?gen=ou")
+    m = re.search(r"window\.__HAIKU__=(.*?)</script>", r.text)
+    assert m
+    data = json.loads(m.group(1))
+    assert data["gen"] == "ou"
+    again = render_haiku_html(data["lines"], seed=data["seed"], gen="ou")
+    assert again in r.text
+
+
+async def test_image_page_has_no_server_haiku(client: httpx.AsyncClient) -> None:
+    r = await client.get("/i/whatever")
+    assert '<h1 class="haiku"' not in r.text

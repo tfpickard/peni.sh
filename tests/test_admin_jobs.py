@@ -17,12 +17,13 @@ from penish.worker.admin_jobs import (
     make_handlers,
     regen_key,
 )
-from penish.worker.describe import Described, DescribeError
+from penish.worker.describe import Described, DescribeError, expand
 from penish.worker.grow import Stats
 from penish.worker.jobs import HardError, Job, SoftError
 from tests.test_ingest import DIM, FakeDescriber, FakeEmbedder, drop, png, pub_files, q, run
 
 TAGS2 = ["fern", "bulb", "stool", "pane", "ash", "night"]
+ANALYSIS2 = "Subject: a bulb.\n\nSetting: ferns.\n\nStyle: photo.\n\nMood: still."
 
 
 @pytest.fixture
@@ -53,11 +54,13 @@ class Redescriber:
         self.calls.append(set(want))
         if self.fail is not None:
             raise self.fail
+        want = expand(want)
         return Described(
             caption="A bulb among ferns" if "caption" in want else None,
             description="A bare bulb hangs over ferns." if "description" in want else None,
             tags=list(TAGS2) if "tags" in want else None,
             model="re-describer",
+            analysis=ANALYSIS2 if "analysis" in want else None,
         )
 
 
@@ -149,16 +152,18 @@ async def test_regen_skips_owner_text(p: Any, settings: Settings) -> None:
     image_id = await live(p, settings)
     await owner(p, image_id, "caption", "Mine")
     before_vec, before_hist = await vec(p, image_id), await history(p)
-    d = Redescriber()
-    await regen(p, settings, image_id, ["caption", "description", "tags"], describer=d)
+    d, e = Redescriber(), FakeEmbedder()
+    await regen(p, settings, image_id, ["caption", "description", "tags"], describer=d, embedder=e)
 
-    assert d.calls == [{"description", "tags"}]
+    assert d.calls == [{"description", "analysis", "tags"}]
     t = await text_rows(p, image_id)
     assert (t["caption"]["body"], t["caption"]["source"]) == ("Mine", "owner")
     assert t["description"]["body"] == "A bare bulb hangs over ferns."
     assert t["description"]["model"] == "re-describer"
+    assert (t["analysis"]["body"], t["analysis"]["model"]) == (ANALYSIS2, "re-describer")
     assert await tag_rows(p, image_id) == sorted((x, "model") for x in TAGS2)
-    # A new description is a new vector and a stats refresh.
+    # A new analysis is a new vector and a stats refresh.
+    assert e.calls == [[ANALYSIS2]]
     after = await vec(p, image_id)
     assert after is not None and after != before_vec
     assert await history(p) == before_hist + 1
@@ -188,6 +193,31 @@ async def test_force_owner_applies_only_to_listed_fields(p: Any, settings: Setti
     assert (t["description"]["body"], t["description"]["source"]) == ("My words.", "owner")
 
 
+async def test_regen_description_brings_analysis_unless_owner(p: Any, settings: Settings) -> None:
+    image_id = await live(p, settings)
+    d, e = Redescriber(), FakeEmbedder()
+    await regen(p, settings, image_id, ["description"], force=True, describer=d, embedder=e)
+    assert d.calls == [{"description", "analysis"}] and e.calls == [[ANALYSIS2]]
+    t = await text_rows(p, image_id)
+    assert (t["analysis"]["body"], t["analysis"]["source"]) == (ANALYSIS2, "model")
+
+    await owner(p, image_id, "analysis", "Subject: mine.")
+    await owner(p, image_id, "description", "My words.")
+    before = await vec(p, image_id)
+    d, e = Redescriber(), FakeEmbedder()
+    await regen(p, settings, image_id, ["description"], force=True, describer=d, embedder=e)
+    assert d.calls == [{"description"}] and e.calls == []
+    t = await text_rows(p, image_id)
+    assert t["description"]["source"] == "model"
+    assert (t["analysis"]["body"], t["analysis"]["source"]) == ("Subject: mine.", "owner")
+    assert await vec(p, image_id) == before
+
+    # Asked for by name, the owner analysis goes back to the model.
+    await regen(p, settings, image_id, ["analysis"], force=True, describer=d, embedder=e)
+    assert d.calls[-1] == {"analysis"} and e.calls == [[ANALYSIS2]]
+    assert (await text_rows(p, image_id))["analysis"]["source"] == "model"
+
+
 async def test_force_owner_replaces_owner_tags(p: Any, settings: Settings) -> None:
     image_id = await live(p, settings)
     async with p.connection() as conn:
@@ -202,15 +232,16 @@ async def test_force_owner_replaces_owner_tags(p: Any, settings: Settings) -> No
     assert await tag_rows(p, image_id) == sorted((x, "model") for x in TAGS2)
 
 
-async def test_regen_embedding_uses_current_description(p: Any, settings: Settings) -> None:
+async def test_regen_embedding_uses_current_analysis(p: Any, settings: Settings) -> None:
     image_id = await live(p, settings)
     await owner(p, image_id, "description", "Owner words now.")
+    await owner(p, image_id, "analysis", "Subject: owner analysis now.")
     async with p.connection() as conn:
         await conn.execute("delete from embeddings")
     e = FakeEmbedder()
     before = await history(p)
     await regen(p, settings, image_id, ["embedding"], embedder=e)
-    assert e.calls == [["Owner words now."]]
+    assert e.calls == [["Subject: owner analysis now."]]
     assert await vec(p, image_id) is not None
     assert await history(p) == before + 1
 
@@ -258,7 +289,7 @@ async def test_crop_then_uncrop(p: Any, settings: Settings) -> None:
     assert pub_files(settings, sha) == []
     assert f"{r['pub_sha']}-480.webp" in pub_files(settings, r["pub_sha"])
     # Described from the cropped pixels, model fields only.
-    assert d.calls == [{"description", "tags"}] and d.sizes == [(600, 500)]
+    assert d.calls == [{"description", "analysis", "tags"}] and d.sizes == [(600, 500)]
     t = await text_rows(p, image_id)
     assert t["caption"]["body"] == "Mine" and t["description"]["model"] == "re-describer"
     assert await vec(p, image_id) is not None
@@ -361,8 +392,11 @@ async def test_redescribe_all_live_only(p: Any, settings: Settings) -> None:
     rows = await q(p, "select payload, dedupe_key from jobs where type = 'regen'")
     assert rows == [
         {
-            "payload": {"image_id": a, "fields": ["caption", "description", "tags"]},
-            "dedupe_key": f"regen:{a}:caption,description,tags",
+            "payload": {
+                "image_id": a,
+                "fields": ["caption", "description", "analysis", "tags"],
+            },
+            "dedupe_key": f"regen:{a}:caption,description,analysis,tags",
         }
     ]
 

@@ -1,26 +1,30 @@
 <script lang="ts">
+	import { axes } from './axes';
 	import { noise } from './noise';
 	import { ou } from './ou';
-	import { seededRng } from './rng';
+	import { mulberry32, randomSeed } from './rng';
 
-	let { lines }: { lines: string[] } = $props();
+	// seed and gen come from the server on first load so this renders the markup it already sent.
+	let { lines, seed, gen }: { lines: string[]; seed?: number; gen?: string } = $props();
 
 	const gens = { noise, ou };
 
 	function pickGen() {
-		const name = new URLSearchParams(location.search).get('gen');
+		const name = gen ?? new URLSearchParams(location.search).get('gen');
 		return name === 'ou' ? gens.ou : gens.noise;
 	}
 
 	// Generated once per mount: the shape is fixed for the page load and does not animate.
 	const values = $derived.by(() => {
 		const total = lines.reduce((s, l) => s + l.length, 0);
-		return pickGen()(total, seededRng());
+		return pickGen()(total, mulberry32(seed ?? randomSeed()));
 	});
 
 	// Lowercase 'grow' and uppercase 'THCK' are the font's axis tags; the wrong case silently no-ops.
-	const style = (v: number) =>
-		`font-variation-settings: 'grow' ${60 + v * (900 - 60)}, 'THCK' ${450 - v * (450 - 300)}`;
+	const style = (v: number) => {
+		const [grow, thck] = axes(v);
+		return `font-variation-settings: 'grow' ${grow}, 'THCK' ${thck}`;
+	};
 
 	const rows = $derived.by(() => {
 		let i = 0;

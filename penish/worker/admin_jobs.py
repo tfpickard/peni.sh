@@ -32,6 +32,7 @@ from penish.worker.describe import Described, DescribeError, describe
 from penish.worker.grow import Stats, grow_into, summary
 from penish.worker.haiku import haiku_from
 from penish.worker.ingest import (
+    EMBED_FIELD,
     KIND,
     Conn,
     Describer,
@@ -49,10 +50,11 @@ Handler = Callable[[Job], Awaitable[None]]
 HandlerFactory = Callable[[Pool, Settings, DocumentEmbedder], Handler]
 Grower = Callable[..., Awaitable[Stats]]
 
-REGEN_FIELDS = ("caption", "description", "tags", "haiku", "embedding")
-_DESCRIBED = ("caption", "description", "tags")
-# What a crop invalidates: everything derived from the pixels or from the new description.
-_AFTER_CROP = frozenset({"caption", "description", "tags", "embedding"})
+REGEN_FIELDS = ("caption", "description", "analysis", "tags", "haiku", "embedding")
+_TEXTS = ("caption", "description", "analysis")
+_DESCRIBED = (*_TEXTS, "tags")
+# What a crop invalidates: everything derived from the pixels or from the new analysis.
+_AFTER_CROP = frozenset({*_DESCRIBED, "embedding"})
 ORIG_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp"}
 MAX_GROW = 200
 
@@ -164,35 +166,31 @@ _GUARD = " where image_texts.source <> 'owner'"
 
 
 async def _apply_described(
-    conn: Conn, image_id: int, d: Described, want: set[str], force_owner: bool
+    conn: Conn, image_id: int, d: Described, want: set[str], force: set[str]
 ) -> bool:
-    """Write the described fields; True if the description text changed."""
+    """Write the wanted fields; True if the analysis text changed. `force` is the subset the
+    admin explicitly handed back to the model, so owner text there is overwritten."""
     changed = False
     async with conn.transaction():
         cur = await conn.execute(
-            "select body from image_texts where image_id = %s and field = 'description'",
-            (image_id,),
+            "select body from image_texts where image_id = %s and field = %s",
+            (image_id, EMBED_FIELD),
         )
         prev = await cur.fetchone()
-        for field in ("caption", "description"):
+        for field in _TEXTS:
             body = getattr(d, field)
             if field not in want or not body:
                 continue
-            # force_owner is the admin explicitly handing the field back to the model.
-            sql = _MODEL_TEXT if force_owner else _MODEL_TEXT + _GUARD
+            sql = _MODEL_TEXT if field in force else _MODEL_TEXT + _GUARD
             cur = await conn.execute(sql, (image_id, field, body, d.model))
-            if (
-                field == "description"
-                and cur.rowcount > 0
-                and (prev is None or prev["body"] != body)
-            ):
+            if field == EMBED_FIELD and cur.rowcount > 0 and (prev is None or prev["body"] != body):
                 # Same transaction as the text, as in ingest: no stale vector survives a crash.
                 await conn.execute(
                     "delete from embeddings where image_id = %s and kind = %s", (image_id, KIND)
                 )
                 changed = True
         if "tags" in want and d.tags:
-            if force_owner:
+            if "tags" in force:
                 await conn.execute("delete from tags where image_id = %s", (image_id,))
             else:
                 await conn.execute(
@@ -217,10 +215,10 @@ async def _embed(pool: Pool, image_id: int, settings: Settings, embedder: Docume
             "select model from embeddings where image_id = %s and kind = %s", (image_id, KIND)
         )
         prev = await cur.fetchone()
-    if "description" not in texts:
-        log.info("regen: image %s has no description; nothing to embed", image_id)
+    if EMBED_FIELD not in texts:
+        log.info("regen: image %s has no analysis; nothing to embed", image_id)
         return
-    body = texts["description"]["body"]
+    body = texts[EMBED_FIELD]["body"]
     out = await embedder.embed_documents([body])
     vec = np.asarray(out[0], dtype=np.float32)
     if vec.shape != (settings.embed_dim,):
@@ -234,7 +232,7 @@ async def _embed(pool: Pool, image_id: int, settings: Settings, embedder: Docume
             insert into embeddings (image_id, kind, vec, model, dim, created_at)
             select %(id)s, %(kind)s, %(vec)s, %(model)s, %(dim)s, now()
              where exists (select 1 from image_texts where image_id = %(id)s
-                             and field = 'description' and body = %(body)s)
+                             and field = %(field)s and body = %(body)s)
             on conflict (image_id, kind) do update set
               vec = excluded.vec, model = excluded.model, dim = excluded.dim, created_at = now()
             """,
@@ -244,13 +242,14 @@ async def _embed(pool: Pool, image_id: int, settings: Settings, embedder: Docume
                 "vec": vec,
                 "model": settings.embed_model,
                 "dim": settings.embed_dim,
+                "field": EMBED_FIELD,
                 "body": body,
             },
         )
         if cur.rowcount == 0:
             if await _row(conn, image_id) is None:
                 return
-            raise SoftError("description changed while embedding")
+            raise SoftError("analysis changed while embedding")
     await refresh_corpus_stats(pool, kind=KIND, model=settings.embed_model)
     if prev is not None and prev["model"] != settings.embed_model:
         # The row moved spaces, so the old space's mean and n are now stale too.
@@ -302,18 +301,27 @@ async def regen(
         tag_row = await cur.fetchone()
     owner_tags = bool(tag_row and tag_row["o"])
 
+    def owned(f: str) -> bool:
+        return bool(texts.get(f, {}).get("source") == "owner")
+
     want: set[str] = set()
-    for f in ("caption", "description"):
-        if f in fields and (force_owner or texts.get(f, {}).get("source") != "owner"):
+    for f in _TEXTS:
+        if f in fields and (force_owner or not owned(f)):
             want.add(f)
     if "tags" in fields and (force_owner or not owner_tags):
         want.add("tags")
+    # The describer writes both in one call, and a new description over an old analysis
+    # would leave the two describing different crops or prompts. An owner analysis is
+    # only replaced when asked for by name.
+    if "description" in want and not owned("analysis"):
+        want.add("analysis")
+    force = (want & fields) if force_owner else set()
 
     reembed = "embedding" in fields
     if want:
         described = await _describe(pool, row, want, settings, describer)
         async with pool.connection() as conn:
-            if await _apply_described(conn, image_id, described, want, force_owner):
+            if await _apply_described(conn, image_id, described, want, force):
                 reembed = True
     if reembed:
         await _embed(pool, image_id, settings, embedder)
@@ -502,12 +510,12 @@ async def _enqueue_each(pool: Pool, fields: list[str], where: str) -> int:
 
 
 async def handle_reembed_all(job: Job, *, pool: Pool) -> None:
-    # Every image with a description, live or not: it costs no API money, and search
+    # Every image with an analysis, live or not: it costs no API money, and search
     # covers non-live images too.
     n = await _enqueue_each(
         pool,
         ["embedding"],
-        "exists (select 1 from image_texts t where t.image_id = i.id and t.field = 'description')",
+        "exists (select 1 from image_texts t where t.image_id = i.id and t.field = 'analysis')",
     )
     log.info("reembed_all: enqueued %d", n)
 

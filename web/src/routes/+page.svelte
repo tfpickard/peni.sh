@@ -14,7 +14,12 @@
 	// Not in app.d.ts because that file is outside this step's scope.
 	type W = Window & { __HAIKU__?: Haiku | null };
 
-	let haiku = $state<Haiku | null>(null);
+	// Consumed once: later visits to home must show a fresh haiku, not the injected one.
+	// Read before the first render so the component draws the server's markup on the first pass.
+	const injected = (window as W).__HAIKU__ ?? null;
+	delete (window as W).__HAIKU__;
+
+	let haiku = $state<Haiku | null>(injected);
 	let pictures = $state<number | null>(null);
 	let temperature = $state<number | null>(null);
 	let items = $state<ImageItem[]>([]);
@@ -51,10 +56,9 @@
 	});
 
 	onMount(async () => {
-		// Consumed once: later visits to home must show a fresh haiku, not the injected one.
-		const w = window as W;
-		const injected = w.__HAIKU__;
-		delete w.__HAIKU__;
+		// The component has just drawn the same seeded markup; dropping the server copy in the same
+		// task means no frame shows both and none shows neither.
+		document.querySelector('body > .haiku')?.remove();
 		getStats().then(
 			(s: Stats) => {
 				pictures = s.pictures;
@@ -62,10 +66,7 @@
 			},
 			() => {}
 		);
-		if (injected) {
-			haiku = injected;
-			return;
-		}
+		if (injected) return;
 		try {
 			haiku = await getHaiku();
 		} catch {
@@ -77,7 +78,7 @@
 <p class="label">peni.sh</p>
 {#if haiku}
 	{#key haiku.id}
-		<FungalHaiku lines={haiku.lines} />
+		<FungalHaiku lines={haiku.lines} seed={haiku.seed} gen={haiku.gen} />
 	{/key}
 {/if}
 {#if pictures !== null}

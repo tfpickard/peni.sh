@@ -15,14 +15,23 @@
 	let confirming = $state(false);
 	let typed = $state('');
 
-	type Draft = { caption: string; description: string; prompt: string; tags: string; slug: string };
-	let draft = $state<Draft>({ caption: '', description: '', prompt: '', tags: '', slug: '' });
+	type Draft = {
+		caption: string;
+		description: string;
+		analysis: string;
+		prompt: string;
+		tags: string;
+		slug: string;
+	};
+	const blank: Draft = { caption: '', description: '', analysis: '', prompt: '', tags: '', slug: '' };
+	let draft = $state<Draft>({ ...blank });
 	// What the server last said, so a poll only replaces drafts the owner has not touched.
-	let seen: Draft = { caption: '', description: '', prompt: '', tags: '', slug: '' };
+	let seen: Draft = { ...blank };
 
 	const serverValues = (x: pics.Detail): Draft => ({
 		caption: x.caption?.body ?? '',
 		description: x.description?.body ?? '',
+		analysis: x.analysis?.body ?? '',
 		prompt: x.prompt?.body ?? '',
 		tags: x.tags.map((t) => t.tag).join('\n'),
 		slug: x.slug
@@ -149,6 +158,15 @@
 			</div>
 
 			<label>
+				<span class="l">analysis <span class="dim">{label(d.analysis)}</span></span>
+				<textarea rows="8" bind:value={draft.analysis}></textarea>
+			</label>
+			<div class="row">
+				<button disabled={!dirty('analysis')} onclick={() => save('analysis')}>save</button>
+				<button onclick={() => regen('analysis')}>regenerate</button>
+			</div>
+
+			<label>
 				<span class="l">prompt <span class="dim">{label(d.prompt)}</span></span>
 				<textarea rows="3" bind:value={draft.prompt}></textarea>
 			</label>
@@ -174,7 +192,7 @@
 			</div>
 
 			<div class="row all">
-				<button onclick={() => regen('caption', 'description', 'tags')}>regenerate all</button>
+				<button onclick={() => regen('caption', 'description', 'analysis', 'tags')}>regenerate all</button>
 				<button onclick={() => regen('haiku')}>regenerate haiku</button>
 				<button onclick={() => regen('embedding')}>re-embed</button>
 			</div>

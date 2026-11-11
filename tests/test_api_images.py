@@ -1,3 +1,4 @@
+import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -48,6 +49,7 @@ def add_image(
     status: str = "live",
     caption: str | None = None,
     description: str | None = None,
+    analysis: str | None = None,
     widths: tuple[int, ...] = (480, 960, 1600),
     vec: list[float] | None = None,
     pub_n: int | None = None,
@@ -67,7 +69,11 @@ def add_image(
         ).fetchone()
         assert row
         image_id = row[0]
-        for field, body in (("caption", caption), ("description", description)):
+        for field, body in (
+            ("caption", caption),
+            ("description", description),
+            ("analysis", analysis),
+        ):
             if body:
                 conn.execute(
                     "insert into image_texts (image_id, field, body, source, model) "
@@ -119,7 +125,14 @@ async def test_list_bad_cursor(client: httpx.AsyncClient) -> None:
 
 
 async def test_detail_with_neighbors(client: httpx.AsyncClient, clean_db: str) -> None:
-    add_image(clean_db, 1, caption="a cup", description="Subject: a cup.", vec=unit(0))
+    add_image(
+        clean_db,
+        1,
+        caption="a cup",
+        description="The table has a scratch. A cup is on it.",
+        analysis="Subject: a hidden cup analysis.",
+        vec=unit(0),
+    )
     add_image(clean_db, 2, vec=unit(0, 1))
     add_image(clean_db, 3, vec=unit(5))
     with psycopg.connect(clean_db) as conn:
@@ -133,7 +146,10 @@ async def test_detail_with_neighbors(client: httpx.AsyncClient, clean_db: str) -
     body = r.json()
     assert body["slug"] == "img-1"
     assert body["caption"] == {"body": "a cup", "source": "model", "model": "m"}
+    assert body["description"]["body"] == "The table has a scratch. A cup is on it."
     assert body["prompt"] is None
+    # The analysis is what the vector is made from; it never leaves the server.
+    assert "analysis" not in body and "hidden cup analysis" not in r.text
     assert body["tags"] == [{"tag": "cup", "source": "model"}]
     assert body["mode"] == "raw"
     assert [n["slug"] for n in body["similar"]] == ["img-2", "img-3"]
@@ -202,23 +218,39 @@ async def test_single_native_width(client: httpx.AsyncClient, clean_db: str) -> 
 
 
 async def test_og_page(client: httpx.AsyncClient, clean_db: str) -> None:
+    words = " ".join(f"w{i}" for i in range(80))
     add_image(
         clean_db,
         1,
         caption='a "cup" <b>&',
-        description="Subject: a cup on a table.\n\nSetting: a kitchen.\n\nMood: calm.",
+        description=f"The table edge is chipped.\n\n{words}",
+        analysis="Subject: a cup on a table.\n\nSetting: a kitchen.\n\nMood: calm.",
     )
     r = await client.get("/i/img-1")
     assert r.status_code == 200
     assert f'<meta property="og:image" content="http://t/media/pub/{sha(1)}-1600.webp">' in r.text
     assert 'content="a &quot;cup&quot; &lt;b&gt;&amp;"' in r.text
-    assert '<meta property="og:description" content="a cup on a table.">' in r.text
+    og = re.search(r'<meta property="og:description" content="([^"]*)">', r.text)
+    assert og is not None
+    # The opening of the public description, cut at a word, never the analysis.
+    assert og.group(1).startswith("The table edge is chipped. w0 w1")
+    assert len(og.group(1)) <= 200 and not og.group(1).endswith(" ")
+    assert (og.group(1) + " ") in f"The table edge is chipped. {words} "
+    assert "Subject" not in r.text and "kitchen" not in r.text
     assert 'property="og:image:width" content="1600"' in r.text
     assert 'property="og:image:height" content="1200"' in r.text
     assert 'property="og:type" content="article"' in r.text
     assert 'name="twitter:card" content="summary_large_image"' in r.text
     assert r.text.count('property="og:title"') == 1
     assert "<b>" not in r.text
+
+
+async def test_og_old_labelled_description(client: httpx.AsyncClient, clean_db: str) -> None:
+    add_image(
+        clean_db, 1, description="Subject: a cup on a table.\n\nSetting: a kitchen.\n\nMood: calm."
+    )
+    r = await client.get("/i/img-1")
+    assert '<meta property="og:description" content="a cup on a table. a kitchen. calm.">' in r.text
 
 
 async def test_og_unknown_slug_is_404_spa(client: httpx.AsyncClient, clean_db: str) -> None:

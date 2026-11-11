@@ -48,7 +48,12 @@ Conn = AsyncConnection[DictRow]
 Describer = Callable[..., Awaitable[Described]]
 HaikuWriter = Callable[..., Awaitable[tuple[str, str, str]]]
 
+# The embedding kind predates the analysis field; the vectors under it are made from the
+# analysis text, and renaming the kind would orphan every stored vector and stats row.
 KIND = "description"
+# The text the vector is made from. The public description is not it: it is written to
+# look past the subject, so it would put images near the wrong neighbors.
+EMBED_FIELD = "analysis"
 _EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
 # Claude downsamples anything larger, so sending more only costs upload time.
 _DESCRIBE_EDGE = 1568
@@ -179,7 +184,7 @@ async def _write_text(
 ) -> None:
     async with conn.transaction():
         cur = await conn.execute(_UPSERT_TEXT, (image_id, field, body, source, model))
-        if cur.rowcount > 0 and field == "description" and body != prev_body:
+        if cur.rowcount > 0 and field == EMBED_FIELD and body != prev_body:
             # No column records which text an embedding came from, so dropping it in the
             # same transaction is what guarantees a crash can never leave a stale vector.
             await conn.execute(
@@ -191,7 +196,7 @@ async def _apply_owner(conn: Conn, image_id: int, group: Group) -> bool:
     """Write owner sidecars; True if the caption text changed."""
     current = await _texts(conn, image_id)
     caption_changed = False
-    for field in ("caption", "description", "prompt"):
+    for field in ("caption", "description", "analysis", "prompt"):
         body = group.values.get(field)
         if not body:
             continue
@@ -217,7 +222,7 @@ async def _apply_owner(conn: Conn, image_id: int, group: Group) -> bool:
 
 async def _missing(conn: Conn, image_id: int) -> set[str]:
     have = set(await _texts(conn, image_id))
-    want = {f for f in ("caption", "description") if f not in have}
+    want = {f for f in ("caption", "description", "analysis") if f not in have}
     cur = await conn.execute(
         "select exists (select 1 from tags where image_id = %s) as t", (image_id,)
     )
@@ -228,7 +233,7 @@ async def _missing(conn: Conn, image_id: int) -> set[str]:
 
 
 async def _apply_model(conn: Conn, image_id: int, d: Described) -> None:
-    for field in ("caption", "description"):
+    for field in ("caption", "description", "analysis"):
         body = getattr(d, field)
         if body:
             await _write_text(conn, image_id, field, body, "model", d.model, None)
@@ -257,7 +262,10 @@ async def _ensure_embedding(
     if row is not None and row["model"] == settings.embed_model:
         return
     texts = await _texts(conn, image_id)
-    if "description" not in texts:
+    # Without an analysis there is nothing faithful to embed. Falling back to an owner
+    # description would file the image by whatever it chose to look at, so the publish
+    # gate keeps it pending until the describer can write one.
+    if EMBED_FIELD not in texts:
         return
 
     vec: np.ndarray | None = None
@@ -279,7 +287,7 @@ async def _ensure_embedding(
                 settings.embed_dim,
             )
     if vec is None:
-        out = await embedder.embed_documents([texts["description"]["body"]])
+        out = await embedder.embed_documents([texts[EMBED_FIELD]["body"]])
         vec = np.asarray(out[0], dtype=np.float32)
     if vec.shape != (settings.embed_dim,):
         raise HardError(f"embedding has shape {vec.shape}, want ({settings.embed_dim},)")
@@ -540,11 +548,12 @@ async def _ingest_locked(
     )
     emb = await cur.fetchone()
     media_ok = all(storage.exists(k) for k in _webp_keys(pub_sha, pub_width))
-    if not (media_ok and "description" in texts and emb and emb["e"]):
+    ok_texts = "description" in texts and EMBED_FIELD in texts
+    if not (media_ok and ok_texts and emb and emb["e"]):
         await _set_status(conn, image_id, "pending_enrichment")
         raise SoftError(
             f"publish gate not met: media={media_ok} description={'description' in texts}"
-            f" embedding={bool(emb and emb['e'])}"
+            f" analysis={EMBED_FIELD in texts} embedding={bool(emb and emb['e'])}"
         )
 
     caption = texts.get("caption")

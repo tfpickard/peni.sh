@@ -81,6 +81,7 @@ def add(
     status: str = "live",
     caption: str | None = None,
     description: str | None = None,
+    analysis: str | None = None,
     vec: list[float] | None = None,
     model: str = MODEL,
     pub_n: int | None = None,
@@ -107,7 +108,11 @@ def add(
         ).fetchone()
         assert row
         image_id: int = row[0]
-        for field, body in (("caption", caption), ("description", description)):
+        for field, body in (
+            ("caption", caption),
+            ("description", description),
+            ("analysis", analysis),
+        ):
             if body:
                 conn.execute(
                     "insert into image_texts (image_id, field, body, source, model)"
@@ -237,7 +242,7 @@ async def test_search_503_when_embed_server_down(
 
 
 async def test_detail(client: httpx.AsyncClient, clean_db: str) -> None:
-    a = add(clean_db, 1, caption="a cup", description="A cup.")
+    a = add(clean_db, 1, caption="a cup", description="A cup.", analysis="Subject: a cup.")
     sql(clean_db, "update image_texts set source = 'owner', model = null where field = 'caption'")
     sql(clean_db, "update images set crop = %s where id = %s", Jsonb({"x": 1}), a)
     sql(
@@ -270,6 +275,7 @@ async def test_detail(client: httpx.AsyncClient, clean_db: str) -> None:
     assert d["id"] == a and d["slug"] == "img-1" and d["status"] == "live"
     assert d["caption"] == {"body": "a cup", "source": "owner", "model": None}
     assert d["description"] == {"body": "A cup.", "source": "model", "model": "m"}
+    assert d["analysis"] == {"body": "Subject: a cup.", "source": "model", "model": "m"}
     assert d["prompt"] is None
     assert d["tags"] == [{"tag": "cup", "source": "model", "model": "m"}]
     assert d["crop"] == {"x": 1} and (d["width"], d["height"]) == (200, 100)
@@ -288,7 +294,9 @@ async def test_detail(client: httpx.AsyncClient, clean_db: str) -> None:
 
 
 async def test_patch_texts_become_owner(client: httpx.AsyncClient, clean_db: str) -> None:
-    a = add(clean_db, 1, caption="a cup", description="A cup.", vec=[1, 0, 0, 0])
+    a = add(
+        clean_db, 1, caption="a cup", description="A cup.", analysis="Subject: a cup.", vec=[1, 0]
+    )
 
     r = await client.patch(f"{URL}/{a}", json={"caption": " A Mug "}, headers=XHR)
     assert r.status_code == 200
@@ -299,15 +307,21 @@ async def test_patch_texts_become_owner(client: httpx.AsyncClient, clean_db: str
     assert sql(clean_db, "select count(*) from embeddings") == [(1,)]
     assert sql(clean_db, "select count(*) from jobs") == [(0,)]
 
+    # The description is public text only; the vector stays.
     r = await client.patch(f"{URL}/{a}", json={"description": "A mug."}, headers=XHR)
     assert r.json()["description"]["source"] == "owner"
+    assert sql(clean_db, "select count(*) from embeddings") == [(1,)]
+    assert sql(clean_db, "select count(*) from jobs") == [(0,)]
+
+    r = await client.patch(f"{URL}/{a}", json={"analysis": "Subject: a mug."}, headers=XHR)
+    assert r.json()["analysis"] == {"body": "Subject: a mug.", "source": "owner", "model": None}
     assert sql(clean_db, "select count(*) from embeddings") == [(0,)]
     jobs = sql(clean_db, "select type, payload, dedupe_key from jobs")
     assert jobs == [
         ("regen", {"image_id": a, "fields": ["embedding"]}, f"regen:{a}:embedding"),
     ]
     # Same text again: nothing new to embed.
-    await client.patch(f"{URL}/{a}", json={"description": "A mug."}, headers=XHR)
+    await client.patch(f"{URL}/{a}", json={"analysis": "Subject: a mug."}, headers=XHR)
     assert sql(clean_db, "select count(*) from jobs") == [(1,)]
 
     r = await client.patch(
@@ -322,7 +336,13 @@ async def test_patch_texts_become_owner(client: httpx.AsyncClient, clean_db: str
     r = await client.patch(f"{URL}/{a}", json={"prompt": ""}, headers=XHR)
     assert r.json()["prompt"] is None
 
-    for bad in ({"caption": "  "}, {"description": None}, {"nope": 1}, {"tags": "x"}):
+    for bad in (
+        {"caption": "  "},
+        {"description": None},
+        {"analysis": ""},
+        {"nope": 1},
+        {"tags": "x"},
+    ):
         r = await client.patch(f"{URL}/{a}", json=bad, headers=XHR)
         assert r.status_code == 422, bad
     # A rejected edit rolls back whole: the slug in the same body did not land either.

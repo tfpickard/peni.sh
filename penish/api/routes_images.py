@@ -11,6 +11,7 @@ router = APIRouter()
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _K = 8
+PUBLIC_TEXTS = ("caption", "description", "prompt")
 
 
 def _not_here() -> HTTPException:
@@ -104,9 +105,11 @@ async def image_detail(
             raise _not_here()
         if img["slug"] != slug:
             return {"redirect": img["slug"]}
+        # An allowlist, not a filter: the analysis and any future private field stay out.
         cur = await conn.execute(
-            "select field, body, source, model from image_texts where image_id = %s",
-            (img["id"],),
+            "select field, body, source, model from image_texts where image_id = %s"
+            " and field = any(%s)",
+            (img["id"], list(PUBLIC_TEXTS)),
         )
         texts = {
             r["field"]: {"body": r["body"], "source": r["source"], "model": r["model"]}

@@ -26,6 +26,7 @@ from penish.worker.admin_jobs import (
     remove_pub,
 )
 from penish.worker.derive import clamp_rect
+from penish.worker.ingest import EMBED_FIELD
 from penish.worker.jobs import enqueue
 from penish.worker.metrics import refresh_corpus_stats
 
@@ -254,6 +255,7 @@ async def _detail(request: Request, image_id: int) -> dict[str, Any]:
         "variants": variants_for(img["pub_sha"], img["width"], img["height"]),
         "caption": texts.get("caption"),
         "description": texts.get("description"),
+        "analysis": texts.get("analysis"),
         "prompt": texts.get("prompt"),
         "tags": tags,
         "aliases": aliases,
@@ -278,6 +280,7 @@ class Edit(BaseModel):
 
     caption: str | None = Field(None, max_length=500)
     description: str | None = Field(None, max_length=20000)
+    analysis: str | None = Field(None, max_length=20000)
     prompt: str | None = Field(None, max_length=20000)
     tags: list[str] | None = Field(None, max_length=50)
     slug: str | None = None
@@ -350,7 +353,7 @@ async def edit_picture(request: Request, image_id: int, body: Edit) -> dict[str,
                 "select field, body from image_texts where image_id = %s", (image_id,)
             )
             prev = {r["field"]: r["body"] for r in await cur.fetchall()}
-            for field in ("caption", "description", "prompt"):
+            for field in ("caption", "description", "analysis", "prompt"):
                 if field not in given:
                     continue
                 text = (getattr(body, field) or "").strip()
@@ -363,7 +366,8 @@ async def edit_picture(request: Request, image_id: int, body: Edit) -> dict[str,
                     )
                     continue
                 await conn.execute(_OWNER_TEXT, (image_id, field, text))
-                if field == "description" and prev.get("description") != text:
+                # Only the analysis feeds the vector; a description edit leaves it alone.
+                if field == EMBED_FIELD and prev.get(field) != text:
                     # Dropped with the text, as ingest does, so no vector outlives its words;
                     # the job rides the same transaction so a crash cannot lose it.
                     await conn.execute(
@@ -408,7 +412,7 @@ async def _require(request: Request, image_id: int) -> dict[str, Any]:
 
 
 class RegenBody(BaseModel):
-    fields: list[str] = Field(min_length=1, max_length=5)
+    fields: list[str] = Field(min_length=1, max_length=6)
 
 
 @router.post("/{image_id}/regen")

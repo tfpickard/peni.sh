@@ -16,17 +16,19 @@
 					.filter((m): m is readonly [typeof m[0], number] => m[1] !== null)
 			: []
 	);
-	// Labels are split off so they can be styled apart from the literal text.
-	const paragraphs = $derived(
-		(image?.description?.body ?? '')
+	// Descriptions are plain paragraphs. Older ones open with "Subject:" and keep their
+	// labels, split off so they can be styled apart from the literal text.
+	const paragraphs = $derived.by(() => {
+		const paras = (image?.description?.body ?? '')
 			.split(/\n\s*\n/)
 			.map((p) => p.trim())
-			.filter(Boolean)
-			.map((p) => {
-				const m = p.match(/^(Subject|Setting|Style|Mood):\s*([\s\S]*)$/);
-				return m ? { label: m[1].toLowerCase(), text: m[2] } : { label: '', text: p };
-			})
-	);
+			.filter(Boolean);
+		const labelled = /^Subject:/.test(paras[0] ?? '');
+		return paras.map((p) => {
+			const m = labelled ? p.match(/^(Subject|Setting|Style|Mood):\s*([\s\S]*)$/) : null;
+			return m ? { label: m[1].toLowerCase(), text: m[2] } : { label: '', text: p };
+		});
+	});
 	const title = $derived(image?.caption?.body ? `${image.caption.body} -- peni.sh` : 'peni.sh');
 
 	// Same-route navigation keeps the scroll offset, so strips would land mid-page.

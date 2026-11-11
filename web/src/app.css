@@ -61,9 +61,7 @@ a:hover {
 	outline-offset: 3px;
 }
 
-/* The fallback and the hydrated heading share one rule so swapping them does not move the text. */
-.haiku,
-.haiku-ssr {
+.haiku {
 	font-family: 'Fungal', system-ui, sans-serif;
 	font-size: clamp(2rem, 6vw, 4.5rem);
 	font-weight: 400;
@@ -79,15 +77,9 @@ a:hover {
 	display: block;
 }
 
-.haiku-ssr {
-	font-variation-settings:
-		'grow' 120,
-		'THCK' 400;
+/* The server's copy sits before the app mounts; match the shell so the swap does not move it. */
+body > .haiku {
 	max-width: 60rem;
-	margin-inline: auto;
+	margin: 9rem auto 0;
 	padding-inline: 1.5rem;
-}
-
-.haiku-ssr[hidden] {
-	display: none;
 }

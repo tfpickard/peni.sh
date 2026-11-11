@@ -19,6 +19,7 @@ from penish.worker.sidecars import SIDECARS, Embedding, GroupError, parse_group,
         ("my_cat.png", ("my_cat", "image")),
         ("my_cat_caption.txt", ("my_cat", "_caption")),
         ("my_cat_description.txt", ("my_cat", "_description")),
+        ("my_cat_analysis.txt", ("my_cat", "_analysis")),
         ("my_cat_tags.txt", ("my_cat", "_tags")),
         ("my_cat_prompt.txt", ("my_cat", "_prompt")),
         ("my_cat_embedding.json", ("my_cat", "_embedding")),
@@ -56,7 +57,14 @@ def test_stem_of_ignored(name: str) -> None:
 
 
 def test_registry_shape() -> None:
-    assert set(SIDECARS) == {"_caption", "_description", "_tags", "_prompt", "_embedding"}
+    assert set(SIDECARS) == {
+        "_caption",
+        "_description",
+        "_analysis",
+        "_tags",
+        "_prompt",
+        "_embedding",
+    }
 
 
 def _write(d: Path, files: dict[str, str]) -> None:
@@ -71,6 +79,7 @@ def test_parse_group_full(tmp_path: Path) -> None:
             "my_cat.png": "img",
             "my_cat_caption.txt": "  a cat  \n",
             "my_cat_description.txt": "A cat on a mat.\n",
+            "my_cat_analysis.txt": "Subject: a cat.\n\nMood: flat.\n",
             "my_cat_tags.txt": "Cat\n\n  mat \ncat\nMAT\n  \nfur\n",
             "my_cat_prompt.txt": "draw a cat",
             "my_cat_embedding.json": json.dumps({"model": "m", "dim": 3, "vector": [1, 0.5, 0]}),
@@ -82,6 +91,7 @@ def test_parse_group_full(tmp_path: Path) -> None:
     assert g.image == tmp_path / "my_cat.png"
     assert g.values["caption"] == "a cat"
     assert g.values["description"] == "A cat on a mat."
+    assert g.values["analysis"] == "Subject: a cat.\n\nMood: flat."
     assert g.values["tags"] == ["cat", "mat", "fur"]
     assert g.values["prompt"] == "draw a cat"
     assert g.values["embedding"] == Embedding("m", 3, [1.0, 0.5, 0.0])

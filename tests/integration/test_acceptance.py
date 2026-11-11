@@ -164,6 +164,7 @@ def test_owner_sidecars_win_and_skip_the_describer(env: Env) -> None:
     with worker(env):
         env.drop("y_caption.txt", "Owner caption")
         env.drop("y_description.txt", "Owner description of the thing.")
+        env.drop("y_analysis.txt", "Subject: owner analysis of the thing.")
         env.drop("y_tags.txt", "red\nblue\ngreen\n")
         env.drop("y.png", png(2))
         img = wait_live(env, "y")

@@ -6,12 +6,18 @@ from typing import Any
 import pytest
 
 from penish.config import Settings
+from penish.runtime import default
 from penish.text import no_em_dash, slugify
 from penish.worker.describe import DescribeError, describe
 from penish.worker.haiku import build_prompt, haiku_from
 
 SETTINGS = Settings(anthropic_api_key="test")
 TAGS = ["cat", "kitchen", "photo", "warm-light", "tiled-floor", "orange", "indoor"]
+ANALYSIS = (
+    "Subject: a cat sits on a stove.\n\nSetting: a kitchen.\n\n"
+    "Style: photograph, warm light.\n\nMood: The cat is on the stove."
+)
+DESCRIPTION = "The stove has four steel knobs, the second one turned a quarter. A cat is on it."
 
 
 class FakeMessages:
@@ -43,9 +49,60 @@ async def test_only_wanted_keys_requested() -> None:
 
 
 async def test_em_dash_converted() -> None:
-    client = FakeClient(json.dumps({"description": "Subject: a cat \u2014 sitting."}))
+    reply = {"description": "A knob \u2014 steel.", "analysis": ANALYSIS.replace(".", " \u2014 x.")}
+    client = FakeClient(json.dumps(reply))
     out = await describe(b"x", "image/png", want={"description"}, settings=SETTINGS, client=client)
-    assert out.description == "Subject: a cat -- sitting."
+    assert out.description == "A knob -- steel."
+    assert out.analysis is not None and "\u2014" not in out.analysis
+
+
+async def test_description_brings_analysis() -> None:
+    client = FakeClient(json.dumps({"description": DESCRIPTION, "analysis": ANALYSIS}))
+    out = await describe(b"x", "image/png", want={"description"}, settings=SETTINGS, client=client)
+    call = client.messages.calls[0]
+    schema = call["output_config"]["format"]["schema"]
+    assert set(schema["properties"]) == set(schema["required"]) == {"description", "analysis"}
+    assert call["messages"][0]["content"][1]["text"].endswith("description, analysis.")
+    assert (out.description, out.analysis) == (DESCRIPTION, ANALYSIS)
+
+
+async def test_analysis_alone() -> None:
+    client = FakeClient(json.dumps({"analysis": ANALYSIS}))
+    out = await describe(b"x", "image/png", want={"analysis"}, settings=SETTINGS, client=client)
+    schema = client.messages.calls[0]["output_config"]["format"]["schema"]
+    assert list(schema["properties"]) == ["analysis"]
+    assert out.analysis == ANALYSIS and out.description is None
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # The analysis lost a label, or has them out of order.
+        {"description": DESCRIPTION, "analysis": "Subject: a cat.\n\nMood: flat."},
+        {"description": DESCRIPTION, "analysis": ANALYSIS.replace("Setting:", "Place:")},
+        {
+            "description": DESCRIPTION,
+            "analysis": "Setting: a.\n\nSubject: b.\n\nStyle: c.\n\nMood: d.",
+        },
+        # The description copied the analysis structure, or gave itself away.
+        {"description": ANALYSIS, "analysis": ANALYSIS},
+        {"description": "The knob is, curiously, steel.", "analysis": ANALYSIS},
+    ],
+)
+async def test_bad_description_or_analysis_retried(reply: dict[str, str]) -> None:
+    client = FakeClient(*[json.dumps(reply)] * 2)
+    with pytest.raises(DescribeError) as ei:
+        await describe(b"x", "image/png", want={"description"}, settings=SETTINGS, client=client)
+    assert ei.value.retryable and len(client.messages.calls) == 2
+
+
+def test_prompt_rules() -> None:
+    prompt = default("describe.prompt")
+    for key in ("caption:", "description:", "analysis:", "tags:"):
+        assert key in prompt
+    for label in ("Subject:", "Setting:", "Style:", "Mood:"):
+        assert label in prompt
+    assert "\u2014" not in prompt
 
 
 async def test_code_fenced_json() -> None:
@@ -134,8 +191,9 @@ async def test_live_describe() -> None:
         want={"caption", "description", "tags"},
         settings=Settings(anthropic_api_key=os.environ["ANTHROPIC_API_KEY"]),
     )
-    assert out.caption and out.description and out.tags
+    assert out.caption and out.description and out.analysis and out.tags
     assert 6 <= len(out.tags) <= 14
-    assert "\u2014" not in out.description
+    assert "\u2014" not in out.description and "\u2014" not in out.analysis
     for label in ("Subject:", "Setting:", "Style:", "Mood:"):
-        assert label in out.description
+        assert label in out.analysis and label not in out.description
+    print(f"\ncaption: {out.caption}\ndescription: {out.description}\nanalysis: {out.analysis}")

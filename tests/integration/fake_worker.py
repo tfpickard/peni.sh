@@ -19,7 +19,7 @@ import numpy as np
 import penish.worker.__main__ as worker_main
 from penish.config import Settings, get_settings
 from penish.worker import ingest
-from penish.worker.describe import Described
+from penish.worker.describe import Described, expand
 
 
 async def fake_describe(
@@ -32,11 +32,13 @@ async def fake_describe(
     delay = float(os.environ.get("FAKE_DESCRIBE_SLEEP", "0"))
     if delay:
         await asyncio.sleep(delay)
+    want = expand(want)
     return Described(
         caption=f"Fake caption {tag}" if "caption" in want else None,
         description=f"Fake description of image {tag}." if "description" in want else None,
         tags=["alpha", "beta", "gamma", "delta", "epsilon", "zeta"] if "tags" in want else None,
         model="fake-describer",
+        analysis=f"Subject: fake analysis of image {tag}." if "analysis" in want else None,
     )
 
 

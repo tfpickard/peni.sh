@@ -1,11 +1,13 @@
 import html
 import json
 import re
+import secrets
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
+from penish.api.haiku_render import Gen, render_haiku_html
 from penish.api.media import variants_for
 from penish.api.routes_images import resolve_live
 from penish.api.routes_meta import random_haiku
@@ -41,27 +43,32 @@ async def render_index(
     og = f'<meta property="og:title" content="{html.escape(title)}">' + extra_head
     page = page.replace("<!--og-->", og, 1)
 
-    data = {"id": haiku["id"], "lines": haiku["lines"]} if haiku else None
+    # A fresh seed per request: the shape differs on every load, with or without JS.
+    seed = secrets.randbits(32)
+    gen: Gen = "ou" if request.query_params.get("gen") == "ou" else "noise"
+    data = {"id": haiku["id"], "lines": haiku["lines"], "seed": seed, "gen": gen} if haiku else None
     script = f"<script>window.__HAIKU__={_script_json(data)}</script>"
     page = page.replace("</head>", script + "</head>", 1)
 
-    if haiku:
-        lines = "<br>".join(html.escape(line) for line in haiku["lines"])
-        h1 = f'<h1 class="haiku-ssr">{lines}</h1>'
+    # Only home draws a haiku; the client removes this copy once it has rendered the same one.
+    if haiku and request.url.path == "/":
+        h1 = render_haiku_html(haiku["lines"], seed=seed, gen=gen)
         page = _BODY_OPEN.sub(lambda m: m.group(0) + h1, page, count=1)
 
     # The haiku changes every load, so nothing may cache this.
     return HTMLResponse(page, status_code=status_code, headers={"Cache-Control": "no-store"})
 
 
-def _subject(description: str, limit: int = 200) -> str:
-    """The Subject paragraph without its label, cut at a word boundary."""
-    paras = [p.strip() for p in re.split(r"\n\s*\n|\n", description) if p.strip()]
-    para = next((p for p in paras if p.lower().startswith("subject:")), paras[0] if paras else "")
-    para = re.sub(r"^subject:\s*", "", para, flags=re.I)
-    if len(para) <= limit:
-        return para
-    return para[:limit].rsplit(" ", 1)[0]
+_OLD_LABEL = re.compile(r"^\s*(Subject|Setting|Style|Mood):\s*", re.M)
+
+
+def _summary(description: str, limit: int = 200) -> str:
+    """The opening of the description, flattened to one line and cut at a word boundary."""
+    # Descriptions written before the analysis split still carry the old labels.
+    text = " ".join(_OLD_LABEL.sub("", description).split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0]
 
 
 async def _image_page(request: Request, slug: str) -> HTMLResponse:
@@ -83,7 +90,7 @@ async def _image_page(request: Request, slug: str) -> HTMLResponse:
     caption = texts.get("caption") or "peni.sh"
     tags = [tag("og:type", "article"), tag("twitter:card", "summary_large_image", "name")]
     if "description" in texts:
-        tags.append(tag("og:description", _subject(texts["description"])))
+        tags.append(tag("og:description", _summary(texts["description"])))
     variants = variants_for(img["pub_sha"], img["width"], img["height"])
     webps = [v for v in variants if v["webp"]]
     if webps:

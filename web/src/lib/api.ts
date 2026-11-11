@@ -1,4 +1,4 @@
-export type Haiku = { id: number | string; lines: string[] };
+export type Haiku = { id: number | string; lines: string[]; seed?: number; gen?: string };
 export type Stats = { pictures: number; temperature: number };
 
 async function get<T>(path: string): Promise<T> {

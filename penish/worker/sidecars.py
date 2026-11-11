@@ -76,6 +76,7 @@ class SidecarSpec:
 SIDECARS: dict[str, SidecarSpec] = {
     "_caption": SidecarSpec("caption", _text),
     "_description": SidecarSpec("description", _text),
+    "_analysis": SidecarSpec("analysis", _text),
     "_tags": SidecarSpec("tags", _lines),
     "_prompt": SidecarSpec("prompt", _text),
     "_embedding": SidecarSpec("embedding", _embedding, ".json"),
@@ -107,7 +108,7 @@ def stem_of(filename: str) -> tuple[str, str] | tuple[None, None]:
 class Group:
     stem: str
     image: Path
-    # Keyed by SidecarSpec.field: caption, description, tags, prompt, embedding.
+    # Keyed by SidecarSpec.field: caption, description, analysis, tags, prompt, embedding.
     values: dict[str, Any] = field(default_factory=dict)
     sidecars: dict[str, Path] = field(default_factory=dict)
     unknown: list[str] = field(default_factory=list)

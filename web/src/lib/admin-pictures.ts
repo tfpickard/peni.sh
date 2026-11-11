@@ -10,8 +10,8 @@ export type Item = {
 	created_at: string;
 };
 export type Page = { items: Item[]; next_cursor: string | null };
-export type Field = 'caption' | 'description' | 'prompt' | 'tags' | 'slug';
-export type Regen = 'caption' | 'description' | 'tags' | 'haiku' | 'embedding';
+export type Field = 'caption' | 'description' | 'analysis' | 'prompt' | 'tags' | 'slug';
+export type Regen = 'caption' | 'description' | 'analysis' | 'tags' | 'haiku' | 'embedding';
 export type Text = { body: string; source: string; model: string | null };
 export type Rect = { x: number; y: number; w: number; h: number };
 export type Job = {
@@ -32,6 +32,7 @@ export type Detail = {
 	variants: Variant[];
 	caption: Text | null;
 	description: Text | null;
+	analysis: Text | null;
 	prompt: Text | null;
 	slug_source: string | null;
 	tags: { tag: string; source: string; model?: string | null }[];
@@ -86,6 +87,7 @@ export async function detail(id: string | number): Promise<Detail> {
 		variants: [],
 		caption: null,
 		description: null,
+		analysis: null,
 		prompt: null,
 		slug_source: null,
 		tags: [],

@@ -1,14 +1,8 @@
 <script lang="ts">
 	import '../app.css';
-	import { onMount } from 'svelte';
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
-
-	// The server-rendered fallback only exists to avoid an empty first paint.
-	onMount(() => {
-		document.querySelector<HTMLElement>('.haiku-ssr')?.setAttribute('hidden', '');
-	});
 </script>
 
 <div class="shell">

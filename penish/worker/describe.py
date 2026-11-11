@@ -15,7 +15,15 @@ from penish.text import no_em_dash
 
 log = logging.getLogger(__name__)
 
-_FIELDS = ("caption", "description", "tags")
+_FIELDS = ("caption", "description", "analysis", "tags")
+ANALYSIS_LABELS = ("Subject", "Setting", "Style", "Mood")
+_LABEL = re.compile(r"^\s*(Subject|Setting|Style|Mood)\s*:", re.M)
+# The description is meant to read as plain and sincere; these words are how a model
+# signals that it knows it is looking at the wrong thing.
+_TELLS = re.compile(
+    r"\b(oddly|curiously|notably|interestingly|strangely|surprisingly|ironically|meanwhile)\b",
+    re.I,
+)
 _FENCE = re.compile(r"^\s*```[a-zA-Z]*\s*\n?(.*?)\n?```\s*$", re.S)
 _TAG_BAD = re.compile(r"[^a-z0-9]+")
 MIN_TAGS, MAX_TAGS = 6, 14
@@ -35,6 +43,7 @@ class Described:
     description: str | None
     tags: list[str] | None
     model: str
+    analysis: str | None = None
 
 
 def build_schema(want: set[str]) -> dict[str, Any]:
@@ -43,6 +52,8 @@ def build_schema(want: set[str]) -> dict[str, Any]:
         props["caption"] = {"type": "string"}
     if "description" in want:
         props["description"] = {"type": "string"}
+    if "analysis" in want:
+        props["analysis"] = {"type": "string"}
     if "tags" in want:
         props["tags"] = {"type": "array", "items": {"type": "string"}}
     return {
@@ -74,6 +85,28 @@ def clean_tags(raw: list[str]) -> list[str]:
     return tags
 
 
+def expand(want: set[str]) -> set[str]:
+    """The description looks away from the subject, so it never travels without the analysis
+    that the embedding is made from."""
+    want = set(want)
+    if "description" in want:
+        want.add("analysis")
+    return want
+
+
+def check_analysis(text: str) -> None:
+    labels = tuple(m.group(1) for m in _LABEL.finditer(text))
+    if labels != ANALYSIS_LABELS:
+        raise ValueError(f"analysis labels {labels}, want {ANALYSIS_LABELS}")
+
+
+def check_public(field: str, text: str) -> None:
+    if _LABEL.search(text):
+        raise ValueError(f"{field} has analysis labels")
+    if m := _TELLS.search(text):
+        raise ValueError(f"{field} uses {m.group(0)!r}")
+
+
 def _validate(text: str, want: set[str]) -> dict[str, Any]:
     data = parse_json(text)
     jsonschema.validate(data, build_schema(want))
@@ -85,6 +118,10 @@ def _validate(text: str, want: set[str]) -> dict[str, Any]:
             value = no_em_dash(data[key]).strip()
             if not value:
                 raise ValueError(f"empty {key}")
+            if key == "analysis":
+                check_analysis(value)
+            else:
+                check_public(key, value)
             out[key] = value
     return out
 
@@ -144,7 +181,7 @@ async def describe(
 ) -> Described:
     """`get` overrides the runtime lookup (tests); otherwise `pool` supplies it, and usage
     is recorded whenever a pool is given."""
-    want = set(want)
+    want = expand(want)
     if not want or not want <= set(_FIELDS):
         raise ValueError(f"want must be a non-empty subset of {_FIELDS}")
     if client is None:
@@ -158,9 +195,9 @@ async def describe(
 
     keys = [k for k in _FIELDS if k in want]
     # temperature is not accepted for claude-sonnet-5-5 (the SDK no longer exposes
-    # it), so determinism comes from the fixed description structure instead.
+    # it), so determinism comes from the fixed analysis structure instead.
     kwargs: dict[str, Any] = {
-        "max_tokens": 1500,
+        "max_tokens": 2500,
         "system": prompt,
         "output_config": output_config(build_schema(want), effort),
         "messages": [
@@ -194,5 +231,6 @@ async def describe(
             description=out.get("description"),
             tags=out.get("tags"),
             model=model,
+            analysis=out.get("analysis"),
         )
     raise DescribeError(f"invalid describer output: {last}", retryable=True)

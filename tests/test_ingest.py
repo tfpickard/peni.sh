@@ -13,12 +13,17 @@ from psycopg.types.json import Jsonb
 
 from penish.config import Settings
 from penish.worker.derive import rebuild_public
-from penish.worker.describe import Described, DescribeError
+from penish.worker.describe import Described, DescribeError, expand
 from penish.worker.ingest import handle_haiku, handle_ingest
 from penish.worker.jobs import HardError, Job, SoftError
 
 DIM = 16
 TAGS = ["moss", "lamp", "chair", "window", "dust", "evening"]
+DESCRIPTION = "The moss has a dry patch near the left edge. A lamp stands in it."
+ANALYSIS = (
+    "Subject: a brass lamp stands in a bed of moss.\n\nSetting: a forest floor.\n\n"
+    "Style: photograph, green and brass.\n\nMood: quiet."
+)
 
 
 @pytest.fixture
@@ -44,11 +49,14 @@ class FakeDescriber:
         assert image_bytes and mime.startswith("image/")
         if self.fail is not None:
             raise self.fail
+        # Same rule as the real describer: a description always comes with an analysis.
+        want = expand(want)
         return Described(
             caption=self.caption if "caption" in want else None,
-            description="A brass lamp stands in a bed of moss." if "description" in want else None,
+            description=DESCRIPTION if "description" in want else None,
             tags=list(TAGS) if "tags" in want else None,
             model="fake-describer",
+            analysis=ANALYSIS if "analysis" in want else None,
         )
 
 
@@ -126,15 +134,23 @@ def pub_files(settings: Settings, sha: str) -> list[str]:
 async def test_lone_png_goes_live(p: Any, settings: Settings) -> None:
     job = drop(settings, "lamp", png(1))
     desc = FakeDescriber()
-    await run(job, p, settings, desc)
+    emb = FakeEmbedder()
+    await run(job, p, settings, desc, emb)
 
     img = await image(p)
     assert img["status"] == "live" and img["slug"] == "a-lamp-in-moss"
     assert img["published_at"] is not None and img["width"] == 600 and img["mime"] == "image/png"
     assert img["blurhash"] and len(img["palette"]) == 5
-    assert desc.calls == [{"caption", "description", "tags"}]
+    assert desc.calls == [{"caption", "description", "analysis", "tags"}]
     t = await texts(p, img["id"])
-    assert {f: r["source"] for f, r in t.items()} == {"caption": "model", "description": "model"}
+    assert {f: r["source"] for f, r in t.items()} == {
+        "caption": "model",
+        "description": "model",
+        "analysis": "model",
+    }
+    assert t["description"]["body"] == DESCRIPTION and t["analysis"]["body"] == ANALYSIS
+    # The vector comes from the faithful analysis, never from the public description.
+    assert emb.calls == [[ANALYSIS]]
     assert t["caption"]["model"] == "fake-describer"
     tags = await q(p, "select tag, source from tags where image_id = %s order by tag", img["id"])
     assert {r["tag"] for r in tags} == set(TAGS) and {r["source"] for r in tags} == {"model"}
@@ -183,12 +199,15 @@ async def test_owner_sidecars_skip_describe(p: Any, settings: Settings) -> None:
         png(2),
         caption="Owner Caption",
         description="Owner words.",
+        analysis="Subject: owner analysis.",
         tags="Alpha\nbeta\n\nalpha\n",
     )
     desc = FakeDescriber()
-    await run(job, p, settings, desc)
+    emb = FakeEmbedder()
+    await run(job, p, settings, desc, emb)
 
     assert desc.calls == []
+    assert emb.calls == [["Subject: owner analysis."]]
     img = await image(p)
     assert img["status"] == "live" and img["slug"] == "owner-caption"
     t = await texts(p, img["id"])
@@ -197,6 +216,34 @@ async def test_owner_sidecars_skip_describe(p: Any, settings: Settings) -> None:
     assert all(r["model"] is None for r in t.values())
     tags = await q(p, "select tag, source from tags order by tag")
     assert tags == [{"tag": "alpha", "source": "owner"}, {"tag": "beta", "source": "owner"}]
+
+
+async def test_owner_description_gets_model_analysis(p: Any, settings: Settings) -> None:
+    desc = FakeDescriber()
+    emb = FakeEmbedder()
+    job = drop(settings, "o", png(16), caption="Mine", description="Owner words.", tags="a\nb")
+    await run(job, p, settings, desc, emb)
+
+    assert desc.calls == [{"analysis"}]
+    img = await image(p)
+    assert img["status"] == "live"
+    t = await texts(p, img["id"])
+    assert (t["description"]["body"], t["description"]["source"]) == ("Owner words.", "owner")
+    assert (t["analysis"]["body"], t["analysis"]["source"]) == (ANALYSIS, "model")
+    assert emb.calls == [[ANALYSIS]]
+
+
+async def test_owner_description_never_embedded(p: Any, settings: Settings) -> None:
+    emb = FakeEmbedder()
+    down = FakeDescriber(fail=DescribeError("overloaded", retryable=True))
+    job = drop(settings, "o", png(17), caption="Mine", description="Owner words.", tags="a\nb")
+    with pytest.raises(SoftError):
+        await run(job, p, settings, down, emb)
+
+    img = await image(p)
+    assert img["status"] == "pending_enrichment" and img["slug"] is None
+    assert emb.calls == [] and await q(p, "select 1 from embeddings") == []
+    assert present(job)
 
 
 async def test_redrop_dedupes_and_owner_caption_reslugs(p: Any, settings: Settings) -> None:
@@ -303,7 +350,7 @@ async def test_crash_mid_job_then_rerun(p: Any, settings: Settings) -> None:
     assert pub_files(settings, sha) == files
     assert {f: (settings.media_pub / f).stat().st_mtime_ns for f in files} == mtimes
     assert not [f for f in settings.media_pub.iterdir() if f.name.startswith(".")]
-    assert len(await q(p, "select 1 from image_texts")) == 2
+    assert len(await q(p, "select 1 from image_texts")) == 3
     assert len(await q(p, "select 1 from embeddings")) == 1
     assert len(emb.calls) == 1
 
@@ -335,7 +382,7 @@ async def test_owner_caption_survives_reprocess(p: Any, settings: Settings) -> N
     data = png(13)
     desc = FakeDescriber()
     await run(drop(settings, "h", data, caption="Mine"), p, settings, desc)
-    assert desc.calls == [{"description", "tags"}]
+    assert desc.calls == [{"description", "analysis", "tags"}]
     img = await image(p)
     t = await texts(p, img["id"])
     assert t["caption"]["source"] == "owner" and t["description"]["source"] == "model"
@@ -348,14 +395,19 @@ async def test_owner_caption_survives_reprocess(p: Any, settings: Settings) -> N
     assert img["slug"] == "mine"
 
 
-async def test_owner_description_change_reembeds(p: Any, settings: Settings) -> None:
+async def test_owner_analysis_change_reembeds(p: Any, settings: Settings) -> None:
     data = png(14)
     emb = FakeEmbedder()
     await run(drop(settings, "d", data), p, settings, embedder=emb)
     before = (await q(p, "select vec from embeddings"))[0]["vec"].to_numpy()
+
+    # The public description is not what the vector is made from.
     await run(drop(settings, "d", data, description="Something new."), p, settings, embedder=emb)
+    assert len(emb.calls) == 1
+
+    await run(drop(settings, "d", data, analysis="Subject: new."), p, settings, embedder=emb)
     after = (await q(p, "select vec from embeddings"))[0]["vec"].to_numpy()
-    assert emb.calls[-1] == ["Something new."] and not np.allclose(before, after)
+    assert emb.calls[-1] == ["Subject: new."] and not np.allclose(before, after)
     # A model caption never renames a live image.
     assert (await image(p))["slug"] == "a-lamp-in-moss"
 
@@ -374,7 +426,7 @@ async def test_haiku_job(p: Any, settings: Settings) -> None:
     await handle_haiku(job, pool=p, settings=settings, writer=writer)
     rows = await q(p, "select l1, source, image_id from haikus where image_id = %s", img["id"])
     assert rows == [{"l1": "moss holds the lamp", "source": "model", "image_id": img["id"]}]
-    assert seen[0].startswith("A brass lamp")
+    assert seen[0] == DESCRIPTION
 
     async def flaky(description: str, *, settings: Settings, pool: Any) -> tuple[str, str, str]:
         raise DescribeError("overloaded", retryable=True)
