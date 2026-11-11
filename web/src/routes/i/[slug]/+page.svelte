@@ -218,7 +218,11 @@
 		</p>
 	{/each}
 	{#if image.tags.length}
-		<p class="tags">{image.tags.map((t) => t.tag.toLowerCase()).join(' ')}</p>
+		<p class="tags">
+			{#each image.tags as t (t.tag)}
+				<a href="/t/{encodeURIComponent(t.tag)}">{t.tag.toLowerCase()}</a>{' '}
+			{/each}
+		</p>
 	{/if}
 	{#if image.prompt}
 		<div class="prompt">
@@ -287,6 +291,9 @@
 		margin: 1.5rem 0 0;
 		color: var(--muted-foreground);
 		overflow-wrap: anywhere;
+	}
+	.tags a {
+		color: inherit;
 	}
 	.prompt {
 		margin-top: 2rem;

@@ -12,6 +12,25 @@ router = APIRouter()
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _K = 8
 PUBLIC_TEXTS = ("caption", "description", "prompt")
+# The admin form's cap on one tag; nothing longer can be stored.
+TAG_MAX = 60
+_LIVE = "status = 'live' and published_at is not null"
+
+
+def grid_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rows of images (pub_sha, slug, width, height, blurhash, palette) as grid entries."""
+    variants = variants_for_many((r["pub_sha"], r["width"], r["height"]) for r in rows)
+    return [
+        {
+            "slug": r["slug"],
+            "width": r["width"],
+            "height": r["height"],
+            "blurhash": r["blurhash"],
+            "palette": r["palette"],
+            "variants": variants[r["pub_sha"]],
+        }
+        for r in rows
+    ]
 
 
 def _not_here() -> HTTPException:
@@ -36,13 +55,29 @@ async def list_images(
     request: Request,
     cursor: str | None = None,
     limit: int = Query(48, ge=1, le=100),
+    tag: str | None = Query(None, max_length=TAG_MAX),
 ) -> dict[str, Any]:
-    where, params = "", []
+    where = ""
+    params: list[Any] = []
+    count: int | None = None
+    if tag:
+        where = "and exists (select 1 from tags t where t.image_id = images.id and t.tag = %s)"
+        params = [tag]
     if cursor:
         micros, cid = _decode_cursor(cursor)
-        where = "and (published_at, id) < (timestamptz 'epoch' + %s * interval '1 microsecond', %s)"
-        params = [micros, cid]
+        where += (
+            " and (published_at, id) < (timestamptz 'epoch' + %s * interval '1 microsecond', %s)"
+        )
+        params += [micros, cid]
     async with request.app.state.pool.connection() as conn:
+        if tag and not cursor:
+            # Only the first page carries the total; later pages would just repeat it.
+            cur = await conn.execute(
+                f"select count(*) as n from images where {_LIVE} and exists"
+                " (select 1 from tags t where t.image_id = images.id and t.tag = %s)".encode(),
+                [tag],
+            )
+            count = (await cur.fetchone() or {"n": 0})["n"]
         cur = await conn.execute(
             f"""
             select id, pub_sha, slug, width, height, blurhash, palette, published_at
@@ -57,23 +92,11 @@ async def list_images(
     # One extra row tells us whether another page exists without a count query.
     more = len(rows) > limit
     rows = rows[:limit]
-    variants = variants_for_many((r["pub_sha"], r["width"], r["height"]) for r in rows)
-    items = [
-        {
-            "slug": r["slug"],
-            "width": r["width"],
-            "height": r["height"],
-            "blurhash": r["blurhash"],
-            "palette": r["palette"],
-            "variants": variants[r["pub_sha"]],
-        }
-        for r in rows
-    ]
     next_cursor = _encode_cursor(rows[-1]["published_at"], rows[-1]["id"]) if more else None
-    return {"items": items, "next_cursor": next_cursor}
-
-
-_LIVE = "status = 'live' and published_at is not null"
+    out: dict[str, Any] = {"items": grid_items(rows), "next_cursor": next_cursor}
+    if count is not None:
+        out["count"] = count
+    return out
 
 
 async def _adjacent(conn: Any, img: dict[str, Any]) -> tuple[str | None, str | None]:

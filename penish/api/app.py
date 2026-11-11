@@ -11,6 +11,7 @@ from penish.api import (
     media,
     routes_images,
     routes_meta,
+    routes_search,
     social,
 )
 from penish.config import get_settings
@@ -32,6 +33,7 @@ def create_app() -> FastAPI:
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.include_router(routes_meta.router)
     app.include_router(routes_images.router)
+    app.include_router(routes_search.router)
     app.include_router(media.router)
     app.include_router(admin.router)
     app.include_router(admin_ops.router)

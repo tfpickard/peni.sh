@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     # Below this the corpus mean is too noisy for centered similarity to help.
     centered_min_images: int = 30
     web_build_dir: Path = Path("web/build")
+    # The cloud is capped so it cannot grow with the corpus; raise the floor as it fills.
+    tag_cloud_limit: int = 60
+    # A tag on one picture leads nowhere but back to that picture.
+    tag_cloud_min: int = 2
 
     # All derived from data_dir so the inbox and processing dirs share a
     # filesystem, which keeps the move into processing/ an atomic rename.
