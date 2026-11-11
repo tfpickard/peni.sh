@@ -32,7 +32,7 @@ jobs:
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3  # no floating major tag upstream
       # Dev group only: the worker extra pulls torch and would dominate CI time.
       - run: uv sync --frozen
       - run: uv run ruff check .
