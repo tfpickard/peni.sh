@@ -28,7 +28,11 @@ MAX_BYTES = 50 * 1024 * 1024
 COOKIE = "penish_admin"
 SESSION_SECONDS = 30 * 24 * 3600
 LOGIN_FAILURES = 5
+# A global budget caps guessing from rotating IPs; a lockout only costs Tom 15 minutes.
+GLOBAL_LOGIN_FAILURES = 50
 LOGIN_WINDOW = 15 * 60
+# Short passwords would make the rate limit the only defense.
+MIN_PASSWORD_LEN = 16
 CHUNK = 1024 * 1024
 # Slack over MAX_BYTES for the multipart framing and the text fields.
 _BODY_SLACK = 1024 * 1024
@@ -38,7 +42,7 @@ _failures: dict[str, deque[float]] = defaultdict(deque)
 
 def _settings_or_404() -> Settings:
     s = get_settings()
-    if not s.admin_password:
+    if not s.admin_password or len(s.admin_password) < MIN_PASSWORD_LEN:
         raise HTTPException(status_code=404, detail="not here")
     return s
 
@@ -98,11 +102,19 @@ def _client_ip(request: Request) -> str:
 
 
 def _recent_failures(ip: str) -> deque[float]:
-    q = _failures[ip]
     cutoff = time.time() - LOGIN_WINDOW
-    while q and q[0] < cutoff:
-        q.popleft()
-    return q
+    # Prune every key so the map cannot grow without bound across many IPs.
+    for key in list(_failures):
+        q = _failures[key]
+        while q and q[0] < cutoff:
+            q.popleft()
+        if not q and key != ip:
+            del _failures[key]
+    return _failures[ip]
+
+
+def _global_failures() -> int:
+    return sum(len(q) for q in _failures.values())
 
 
 class Login(BaseModel):
@@ -115,7 +127,7 @@ async def login(body: Login, request: Request, response: Response) -> dict[str, 
     assert password
     ip = _client_ip(request)
     q = _recent_failures(ip)
-    if len(q) >= LOGIN_FAILURES:
+    if len(q) >= LOGIN_FAILURES or _global_failures() >= GLOBAL_LOGIN_FAILURES:
         raise HTTPException(status_code=429, detail="wait")
     ok = hmac.compare_digest(
         hashlib.sha256(body.password.encode()).digest(), hashlib.sha256(password.encode()).digest()

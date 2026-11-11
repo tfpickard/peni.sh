@@ -6,12 +6,13 @@ import httpx
 import psycopg
 import pytest
 import pyvips
+from fastapi import HTTPException
 
 from penish.api import admin
 from penish.api.app import create_app
 from penish.config import get_settings
 
-PW = "hunter2"
+PW = "hunter2-hunter2-hunter2"
 XHR = {"X-Requested-With": "penish"}
 
 
@@ -255,3 +256,21 @@ async def test_no_store_everywhere(client: httpx.AsyncClient) -> None:
 
 async def test_no_store_when_off(off_client: httpx.AsyncClient) -> None:
     assert (await off_client.get("/api/admin/me")).headers["cache-control"] == "no-store"
+
+
+async def test_global_failure_budget_locks_everyone(client: httpx.AsyncClient) -> None:
+    for i in range(admin.GLOBAL_LOGIN_FAILURES):
+        admin._failures[f"10.0.0.{i}"].append(time.time())
+    r = await client.post(
+        "/api/admin/login", json={"password": PW}, headers={**XHR, "cf-connecting-ip": "10.9.9.9"}
+    )
+    assert r.status_code == 429
+
+
+def test_short_password_disables_admin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "short")
+    get_settings.cache_clear()
+    with pytest.raises(HTTPException) as e:
+        admin._settings_or_404()
+    assert e.value.status_code == 404
+    get_settings.cache_clear()

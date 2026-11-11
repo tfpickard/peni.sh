@@ -58,7 +58,7 @@ The three packages `penish-api`, `penish-worker` and `penish-migrate` must be ma
 
 ## deploy
 
-`penish-deploy.timer` runs every 60 s. It reads the head sha of the latest successful `ci.yml` push run on `main` and compares it to `data/deployed_sha`. On a difference: set `IMAGE_TAG` in `.env`, `docker compose pull`, `up -d --remove-orphans`, then wait up to 120 s for `api` to be healthy. `deployed_sha` is written only on success. On failure the journal gets an error, `IMAGE_TAG` goes back to the previous sha, and the same sha is not retried for 10 minutes.
+`penish-deploy.timer` runs every 60 s. It reads the head sha of the latest successful `ci.yml` push run on `main` and compares it to `data/deployed_sha`. On a difference: fetch `compose.yaml` for that sha from raw.githubusercontent.com, validate it with `docker compose config -q` and overwrite the local copy (previous one kept as `compose.yaml.prev`, restored on rollback; a fetch or validation failure aborts the attempt), set `IMAGE_TAG` in `.env`, `docker compose pull`, `up -d --remove-orphans`, then wait up to 120 s for `api` to be healthy. `deployed_sha` is written only on success. On failure the journal gets an error, `IMAGE_TAG` goes back to the previous sha, and the same sha is not retried for 10 minutes.
 
 `GH_READ_TOKEN` in `.env`: GitHub, Settings, Developer settings, Fine-grained tokens. Repository access: only `tfpickard/peni.sh`. Permission: Actions, read-only. Until it is set the script does nothing, unless `data/pinned_sha` exists.
 

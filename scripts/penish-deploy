@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pull-based deploy poller. Run by penish-deploy.timer as the deploy user.
-# Env overrides (testing): APP_ROOT, API_URL, DRY_RUN=1, WAIT_SECS.
+# Env overrides (testing): APP_ROOT, API_URL, RAW_URL_BASE, DRY_RUN=1, WAIT_SECS.
 set -euo pipefail
 
 ROOT=${APP_ROOT:-/srv/peni.sh}
@@ -11,6 +11,10 @@ RETRY_AFTER_MIN=${RETRY_AFTER_MIN:-10}
 DRY_RUN=${DRY_RUN:-0}
 DEFAULT_API_URL='https://api.github.com/repos/tfpickard/peni.sh/actions/workflows/ci.yml/runs?branch=main&status=success&event=push&per_page=1'
 API_URL=${API_URL:-$DEFAULT_API_URL}
+RAW_URL_BASE=${RAW_URL_BASE:-https://raw.githubusercontent.com/tfpickard/peni.sh}
+COMPOSE=$ROOT/compose.yaml
+compose_prev=
+compose_swapped=0
 
 log() { printf 'penish-deploy: %s\n' "$*"; }
 err() { printf 'penish-deploy: ERROR: %s\n' "$*" >&2; }
@@ -54,6 +58,47 @@ set_image_tag() {
   else
     printf '\nIMAGE_TAG=%s\n' "$1" >>"$ENV_FILE"
   fi
+}
+
+# The app root is owned by another user, so the temp file lives in data/ and the file is
+# overwritten in place (keeps deploy's ownership; compose only reads it at deploy time).
+sync_compose() {
+  local sha=$1 tmp
+  tmp=$(mktemp "$DATA/compose.XXXXXX")
+  if ! curl -fsSL --max-time 30 -o "$tmp" "$RAW_URL_BASE/$sha/compose.yaml"; then
+    rm -f "$tmp"
+    err "could not fetch compose.yaml for $sha; aborting deploy"
+    return 1
+  fi
+  log "fetched compose.yaml for $sha"
+  # A broken file must never reach the box: validate with the real .env before touching anything.
+  if ! docker compose --project-directory "$ROOT" --env-file "$ENV_FILE" -f "$tmp" config -q; then
+    rm -f "$tmp"
+    err "compose.yaml for $sha failed validation; aborting deploy"
+    return 1
+  fi
+  log "compose.yaml for $sha validated"
+  if cmp -s "$tmp" "$COMPOSE" 2>/dev/null; then
+    rm -f "$tmp"
+    return 0
+  fi
+  compose_prev=$ROOT/compose.yaml.prev
+  [ -w "$ROOT" ] || compose_prev=$DATA/compose.yaml.prev
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '+ back up %s to %s, then replace it with the fetched compose.yaml\n' "$COMPOSE" "$compose_prev"
+  else
+    if [ -f "$COMPOSE" ]; then cat "$COMPOSE" >"$compose_prev"; else : >"$compose_prev"; fi
+    cat "$tmp" >"$COMPOSE"
+    compose_swapped=1
+  fi
+  rm -f "$tmp"
+}
+
+restore_compose() {
+  [ "$compose_swapped" = 1 ] || return 0
+  cat "$compose_prev" >"$COMPOSE"
+  compose_swapped=0
+  log "restored previous compose.yaml"
 }
 
 api_healthy() {
@@ -110,11 +155,13 @@ if [ -f "$DATA/failed_sha" ] && [ "$(cat "$DATA/failed_sha")" = "$target" ] \
 fi
 
 log "deploying $target (was ${deployed:-none})"
+sync_compose "$target" || exit 1
 set_image_tag "$target"
 
 if ! run docker compose pull; then
   err "pull failed for $target; running containers untouched"
   [ -z "$deployed" ] || set_image_tag "$deployed"
+  restore_compose
   exit 1
 fi
 
@@ -134,6 +181,7 @@ if [ "$failed" = 1 ]; then
   if [ -n "$deployed" ]; then
     err "rolling back to $deployed"
     set_image_tag "$deployed"
+    restore_compose
     run docker compose up -d --remove-orphans || err "rollback up failed; manual intervention needed"
   else
     err "no previous deploy to roll back to"
