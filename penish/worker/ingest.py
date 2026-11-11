@@ -482,7 +482,8 @@ async def _ingest_locked(
                 await _set_status(conn, image_id, "pending_enrichment")
                 raise SoftError(f"describe: {e}") from e
             await _set_status(conn, image_id, "failed")
-            log.error("describe failed permanently for %s; files kept in %s", sha, directory)
+            # Left in processing/ it would be re-enqueued and re-described on every restart.
+            _move_to_failed(directory, group.stem, settings, f"describe: {e}", group.unknown)
             raise HardError(f"describe: {e}") from e
         await _apply_model(conn, image_id, described)
 

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from penish.config import get_settings
+from penish.config import Settings, get_settings
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
@@ -17,28 +17,34 @@ _DEFAULT_THREADS = 3
 class Embedder:
     """Process-wide singleton; the model loads on first use, off the event loop."""
 
-    _instance: "Embedder | None" = None
+    # Keyed by model name so a differently configured Embedder never reuses a
+    # model loaded for another one.
+    _instances: "dict[str, Embedder]" = {}
     _instance_lock = threading.Lock()
 
-    def __new__(cls) -> "Embedder":
+    def __new__(cls, settings: Settings | None = None) -> "Embedder":
+        s = settings or get_settings()
         with cls._instance_lock:
-            if cls._instance is None:
+            inst = cls._instances.get(s.embed_model)
+            if inst is None:
                 inst = super().__new__(cls)
                 inst._model = None
                 inst._load_lock = threading.Lock()
-                cls._instance = inst
-            return cls._instance
+                cls._instances[s.embed_model] = inst
+            inst._settings = s
+            return inst
 
     _model: "SentenceTransformer | None"
     _load_lock: threading.Lock
+    _settings: Settings
 
     @property
     def model_name(self) -> str:
-        return get_settings().embed_model
+        return self._settings.embed_model
 
     @property
     def dim(self) -> int:
-        return get_settings().embed_dim
+        return self._settings.embed_dim
 
     def _load(self) -> "SentenceTransformer":
         with self._load_lock:

@@ -248,12 +248,15 @@ async def test_retryable_describe_error_then_success(p: Any, settings: Settings)
     assert not present(job)
 
 
-async def test_permanent_describe_error_keeps_files(p: Any, settings: Settings) -> None:
+async def test_permanent_describe_error_goes_to_failed(p: Any, settings: Settings) -> None:
     job = drop(settings, "nope", png(9))
     with pytest.raises(HardError):
         await run(job, p, settings, FakeDescriber(fail=DescribeError("400", retryable=False)))
     assert (await image(p))["status"] == "failed"
-    assert present(job)
+    assert not present(job)
+    dest = settings.failed / "nope"
+    assert (dest / "nope.png").is_file()
+    assert "describe: 400" in (dest / "nope.err").read_text()
 
 
 async def test_crash_mid_job_then_rerun(p: Any, settings: Settings) -> None:
