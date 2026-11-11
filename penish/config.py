@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://penish:penish@localhost:5432/penish"
     data_dir: Path = Path("/srv/penish/data")
     anthropic_api_key: str | None = None
+    # Unset turns the whole admin surface off (404), so a fresh deploy exposes nothing.
+    admin_password: str | None = None
 
     # Model ids are env vars so they can be swapped without a code change.
     describe_model: str = "claude-sonnet-5-5"

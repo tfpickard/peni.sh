@@ -34,19 +34,25 @@ services:
     environment:
       DATABASE_URL: *db-url
       DATA_DIR: /data
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
     ports:
       # Loopback only: Docker's published ports bypass ufw, so anything wider would be public.
       # The host cloudflared reaches it at http://localhost:8000.
       - "127.0.0.1:8000:8000"
     volumes:
-      # The api only serves published derivatives; it never needs the inbox or originals.
+      # Published derivatives only; originals stay out of reach.
       - ./data/media/pub:/data/media/pub:ro
+      # Admin uploads land here for the worker. Bind mounts stay writable under read_only.
+      - ./data/inbox:/data/inbox
+      # Read-only: the admin status call quotes the .err file of a failed group.
+      - ./data/failed:/data/failed:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
     read_only: true
     tmpfs:
-      - /tmp
+      # Multipart bodies spool here; the upload cap is 50 MB.
+      - /tmp:size=128m
     cap_drop: [ALL]
     restart: unless-stopped
 

@@ -83,3 +83,13 @@ The poller deploys that sha and nothing newer. Remove the file to resume followi
 3. Otherwise a warning, local dump only.
 
 Restore: `docker compose exec -T db pg_restore -U <user> -d <db> --clean < backups/<date>.dump`.
+
+## admin
+
+`/admin` is an upload form. It exists only when `ADMIN_PASSWORD` is set in `.env`; unset, every `/api/admin` route answers 404. Read the password with:
+
+```
+ssh root@100.80.26.40 grep ADMIN_PASSWORD /srv/peni.sh/.env
+```
+
+Changing it ends every session. Uploads go to `data/inbox` and take the same path as an rsync drop, including the 10 s settle.

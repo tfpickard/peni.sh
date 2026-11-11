@@ -15,6 +15,7 @@ dependencies = [
     "watchfiles",
     "numpy",
     "jsonschema",
+    "python-multipart>=0.0.33",
 ]
 
 [project.optional-dependencies]
