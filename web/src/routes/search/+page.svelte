@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
+	import { flushSync } from 'svelte';
+	import { goto, snapshot } from '$app/navigation';
 	import { page } from '$app/state';
 	import Grid from '../../lib/components/Grid.svelte';
 	import { ApiError, search, type SearchResult } from '../../lib/api';
@@ -10,9 +11,31 @@
 	let text = $state('');
 	let result = $state<SearchResult | null>(null);
 	let flat = $state('');
+	// The query the page holds. A restore sets it first, so the effect does not refetch.
+	let shown: string | null = null;
+
+	type Saved = { q: string; result: SearchResult | null; flat: string; y: number };
+
+	// Back from a picture remounts this page empty, and the router restores scroll before a
+	// refetch lands, so the offset clamps to the top. Putting back the results first keeps it.
+	snapshot<Saved>({
+		id: 'search',
+		capture: () => ({ q, result: $state.snapshot(result), flat, y: scrollY }),
+		restore: (s) => {
+			if (s.q !== q) return;
+			shown = s.q;
+			text = s.q;
+			result = s.result;
+			flat = s.flat;
+			flushSync();
+			scrollTo(0, s.y);
+		}
+	});
 
 	$effect(() => {
 		const asked = q;
+		if (shown === asked) return;
+		shown = asked;
 		text = asked;
 		result = null;
 		flat = '';

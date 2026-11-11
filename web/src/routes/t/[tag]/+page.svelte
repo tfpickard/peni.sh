@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { untrack } from 'svelte';
+	import { flushSync, untrack } from 'svelte';
+	import { snapshot } from '$app/navigation';
 	import { page } from '$app/state';
 	import Grid from '../../../lib/components/Grid.svelte';
 	import { getImages, type ImageItem } from '../../../lib/api';
@@ -13,11 +14,50 @@
 	let loading = false;
 	// One tag links to another without a remount, so late pages of the old one must be dropped.
 	let epoch = 0;
+	// The tag the grid holds. A restore sets it first, so the effect does not clear the grid.
+	let shown: string | null = null;
+
+	type Saved = {
+		tag: string;
+		items: ImageItem[];
+		count: number | null;
+		cursor: string | null;
+		done: boolean;
+		y: number;
+	};
+
+	// Back from a picture remounts this page empty, and the router restores scroll before a
+	// refill, so the offset clamps to the top. Putting back every loaded page first keeps it.
+	snapshot<Saved>({
+		id: 'tag',
+		capture: () => ({
+			tag,
+			items: $state.snapshot(items),
+			count,
+			cursor,
+			done,
+			y: scrollY
+		}),
+		restore: (s) => {
+			if (s.tag !== tag) return;
+			epoch++;
+			shown = s.tag;
+			loading = false;
+			items = s.items;
+			count = s.count;
+			cursor = s.cursor;
+			done = s.done;
+			flushSync();
+			scrollTo(0, s.y);
+		}
+	});
 
 	$effect(() => {
 		tag;
 		// more() reads the paging state it also writes; tracked, each page would restart the tag.
 		untrack(() => {
+			if (shown === tag) return;
+			shown = tag;
 			epoch++;
 			items = [];
 			count = null;
