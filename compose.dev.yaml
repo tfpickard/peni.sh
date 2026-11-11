@@ -11,7 +11,8 @@ services:
     build:
       context: .
       target: api
-    ports:
+    # !override so the merge replaces the prod loopback mapping instead of adding a second one.
+    ports: !override
       - "8000:8000"
     volumes: !override
       - ./data-dev/media/pub:/data/media/pub:ro
@@ -24,7 +25,3 @@ services:
     volumes: !override
       - ./data-dev:/data
       - models:/models
-
-  # Needs a real tunnel token; skipped unless --profile prod.
-  cloudflared:
-    profiles: [prod]

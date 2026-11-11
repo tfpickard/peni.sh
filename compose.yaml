@@ -34,6 +34,10 @@ services:
     environment:
       DATABASE_URL: *db-url
       DATA_DIR: /data
+    ports:
+      # Loopback only: Docker's published ports bypass ufw, so anything wider would be public.
+      # The host cloudflared reaches it at http://localhost:8000.
+      - "127.0.0.1:8000:8000"
     volumes:
       # The api only serves published derivatives; it never needs the inbox or originals.
       - ./data/media/pub:/data/media/pub:ro
@@ -62,16 +66,6 @@ services:
         condition: service_completed_successfully
     mem_limit: 6g
     cap_drop: [ALL]
-    restart: unless-stopped
-
-  cloudflared:
-    image: cloudflare/cloudflared:2026.10.7
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
-    depends_on:
-      api:
-        condition: service_healthy
     restart: unless-stopped
 
 volumes:

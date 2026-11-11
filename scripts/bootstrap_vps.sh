@@ -3,13 +3,14 @@
 #
 #   sudo ./scripts/bootstrap_vps.sh
 #
+# Firewall and sshd are owned by ops/harden.sh (ufw, sshd drop-in, sudo). This script never
+# touches them, nor cloudflared (the host connector is installed and managed by hand).
+#
 # Env flags:
 #   UPLOAD_PUBKEY="ssh-ed25519 AAAA..."  public key allowed to rsync into the inbox
-#   CLOSE_PUBLIC_SSH=1                   drop the public port 22 rule (needs working tailscale)
-#   CLOSE_WEB_PORTS=1                    also drop the 80/443 rules (leave unset while host Caddy serves)
 #   UPLOAD_UID=1002                      uid/gid of the upload user; the worker container runs as this
 #   APP_ROOT=/srv/peni.sh                app root holding compose.yaml, .env, data/, backups/
-#   SKIP_INSTALL=1                       skip apt/docker/tailscale/ufw/systemd (container testing)
+#   SKIP_INSTALL=1                       skip apt/docker/tailscale/systemd (container testing)
 set -euo pipefail
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
@@ -18,10 +19,7 @@ REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE=${APP_ROOT:-/srv/peni.sh}
 DATA=$BASE/data
 APP_UID=${UPLOAD_UID:-1002}
-SSH_PORT_UPLOAD=2222
 SKIP_INSTALL=${SKIP_INSTALL:-0}
-CLOSE_PUBLIC_SSH=${CLOSE_PUBLIC_SSH:-0}
-CLOSE_WEB_PORTS=${CLOSE_WEB_PORTS:-0}
 
 step() { printf '\n== %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -31,8 +29,15 @@ export DEBIAN_FRONTEND=noninteractive
 
 if [ "$SKIP_INSTALL" != 1 ]; then
   step "base packages"
-  apt-get update -qq
-  apt-get install -y -qq ca-certificates curl gnupg jq rsync ufw
+  # Only touch apt when something is missing; harden.sh already installed most of this.
+  missing=()
+  for pkg in ca-certificates curl gnupg jq rsync; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    apt-get update -qq
+    apt-get install -y -qq "${missing[@]}"
+  fi
 
   step "docker engine + compose plugin"
   if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; then
@@ -51,7 +56,7 @@ DOCKER
     apt-get update -qq
     apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   fi
-  systemctl enable --now docker
+  systemctl enable --now docker.service >/dev/null 2>&1 || true
 
   step "tailscale"
   command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
@@ -118,68 +123,6 @@ else
   fi
 fi
 
-# Tailscale SSH takes over port 22 on the tailnet address and ignores authorized_keys, so a
-# restricted rsync login there is impossible. A second sshd port, upload-only, avoids that.
-if [ "$SKIP_INSTALL" != 1 ] && have_systemd && [ -d /etc/ssh/sshd_config.d ]; then
-  step "sshd: upload-only listener on $SSH_PORT_UPLOAD"
-  cat >/etc/ssh/sshd_config.d/60-penish-upload.conf <<SSHD
-Match LocalPort $SSH_PORT_UPLOAD
-    AllowUsers upload
-    PasswordAuthentication no
-    AuthenticationMethods publickey
-SSHD
-  if sshd -t; then
-    if systemctl is-enabled ssh.socket >/dev/null 2>&1; then
-      # Ubuntu 24.04 uses socket activation, so the port must be added to the socket unit.
-      install -d /etc/systemd/system/ssh.socket.d
-      cat >/etc/systemd/system/ssh.socket.d/penish.conf <<SOCK
-[Socket]
-ListenStream=
-ListenStream=0.0.0.0:22
-ListenStream=[::]:22
-ListenStream=0.0.0.0:$SSH_PORT_UPLOAD
-ListenStream=[::]:$SSH_PORT_UPLOAD
-SOCK
-      systemctl daemon-reload
-      systemctl restart ssh.socket
-    else
-      grep -qE "^Port $SSH_PORT_UPLOAD\$" /etc/ssh/sshd_config.d/60-penish-upload.conf \
-        || sed -i "1i Port 22\nPort $SSH_PORT_UPLOAD" /etc/ssh/sshd_config.d/60-penish-upload.conf
-    fi
-    systemctl reload ssh 2>/dev/null || systemctl restart ssh
-  else
-    warn "sshd -t failed; removing penish sshd config"
-    rm -f /etc/ssh/sshd_config.d/60-penish-upload.conf
-  fi
-fi
-
-if [ "$SKIP_INSTALL" != 1 ]; then
-  step "firewall"
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw allow in on tailscale0
-  if [ "$CLOSE_PUBLIC_SSH" = 1 ]; then
-    # Refuse unless tailscale is actually up; otherwise this locks the operator out.
-    if ! tailscale ip -4 >/dev/null 2>&1; then
-      echo "CLOSE_PUBLIC_SSH=1 but tailscale is not up; run 'tailscale up --ssh' and retry" >&2
-      exit 1
-    fi
-    ufw --force delete allow 22/tcp >/dev/null 2>&1 || true
-    ufw --force delete allow OpenSSH >/dev/null 2>&1 || true
-    echo "public port 22 closed"
-  else
-    ufw allow 22/tcp
-  fi
-  # 80/443 are in use by host Caddy until the tunnel takes over, so they stay unless asked.
-  if [ "$CLOSE_WEB_PORTS" = 1 ]; then
-    for rule in 80/tcp 443/tcp "Nginx Full" "Nginx HTTP" "Nginx HTTPS"; do
-      ufw --force delete allow "$rule" >/dev/null 2>&1 || true
-    done
-    echo "public ports 80/443 closed"
-  fi
-  ufw --force enable
-fi
-
 if [ "$SKIP_INSTALL" != 1 ] && have_systemd; then
   step "systemd units"
   install -m 0755 "$REPO_DIR/scripts/penish-deploy" /usr/local/bin/penish-deploy
@@ -197,11 +140,8 @@ cat <<NEXT
 == done
 
 next:
-  1. tailscale up --ssh           (skip if already up; confirm ssh over the tailnet works)
-  2. CLOSE_PUBLIC_SSH=1 sudo -E ./scripts/bootstrap_vps.sh   (only after step 1 works)
-     CLOSE_WEB_PORTS=1 additionally drops 80/443 once the tunnel serves the site
-  3. fill $BASE/.env: POSTGRES_PASSWORD, ANTHROPIC_API_KEY, TUNNEL_TOKEN, GH_READ_TOKEN
+  1. fill $BASE/.env: POSTGRES_PASSWORD, ANTHROPIC_API_KEY, GH_READ_TOKEN
      backups: RESTIC_REPOSITORY + credentials, or BACKUP_TARGET=user@host:/path
-  4. watch the first deploy: journalctl -fu penish-deploy.service
-  5. uploads: rsync -av -e 'ssh -p $SSH_PORT_UPLOAD' x.png x_caption.txt upload@<tailnet-host>:
+  2. watch the first deploy: journalctl -fu penish-deploy.service
+  3. uploads: rsync -av x.png x_caption.txt upload@100.80.26.40:
 NEXT
