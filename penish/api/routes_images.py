@@ -73,6 +73,46 @@ async def list_images(
     return {"items": items, "next_cursor": next_cursor}
 
 
+_LIVE = "status = 'live' and published_at is not null"
+
+
+async def _adjacent(conn: Any, img: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Prev and next slugs in grid order, wrapping at both ends so a swipe never dead-ends."""
+    if img["published_at"] is None:
+        return None, None
+    key = (img["published_at"], img["id"])
+    # Grid order is (published_at, id) desc, so "next" is the largest key below this one.
+    # Past either end, each query falls back to the opposite end of the grid.
+    cur = await conn.execute(
+        f"""
+        (select slug from images where {_LIVE} and (published_at, id) > (%(p)s, %(i)s)
+         order by published_at, id limit 1)
+        union all
+        (select slug from images where {_LIVE} order by published_at, id limit 1)
+        limit 1
+        """.encode(),
+        {"p": key[0], "i": key[1]},
+    )
+    prev = await cur.fetchone()
+    cur = await conn.execute(
+        f"""
+        (select slug from images where {_LIVE} and (published_at, id) < (%(p)s, %(i)s)
+         order by published_at desc, id desc limit 1)
+        union all
+        (select slug from images where {_LIVE} order by published_at desc, id desc limit 1)
+        limit 1
+        """.encode(),
+        {"p": key[0], "i": key[1]},
+    )
+    nxt = await cur.fetchone()
+
+    def other(row: dict[str, Any] | None) -> str | None:
+        # A lone picture wraps onto itself.
+        return row["slug"] if row and row["slug"] != img["slug"] else None
+
+    return other(prev), other(nxt)
+
+
 async def resolve_live(conn: Any, slug: str) -> dict[str, Any] | None:
     """Live image by slug or by an old alias; None when neither is live."""
     cur = await conn.execute(
@@ -121,6 +161,7 @@ async def image_detail(
         tags = [{"tag": r["tag"], "source": r["source"]} for r in await cur.fetchall()]
         votes = await vote_summary(conn, img["id"], voter_for(request))
         comments = await approved_comments(conn, img["id"])
+        prev, nxt = await _adjacent(conn, img)
 
     mode: Mode = sim or "auto"
     nb = await neighbors(pool, img["id"], k=_K, mode=mode)
@@ -176,4 +217,6 @@ async def image_detail(
         "published_at": img["published_at"].isoformat() if img["published_at"] else None,
         "votes": votes,
         "comments": comments,
+        "prev": prev,
+        "next": nxt,
     }

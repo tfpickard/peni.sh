@@ -165,6 +165,31 @@ async def test_detail_with_neighbors(client: httpx.AsyncClient, clean_db: str) -
     assert (await client.get("/api/images/img-1", params={"sim": "bogus"})).status_code == 422
 
 
+async def test_detail_prev_next_follow_grid_and_wrap(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    for n in range(1, 4):
+        add_image(clean_db, n)
+    add_image(clean_db, 4, status="queued")
+
+    async def adj(slug: str) -> tuple[str | None, str | None]:
+        body = (await client.get(f"/api/images/{slug}")).json()
+        return body["prev"], body["next"]
+
+    # Grid order is img-3, img-2, img-1; the unpublished img-4 never appears.
+    assert await adj("img-3") == ("img-1", "img-2")
+    assert await adj("img-2") == ("img-3", "img-1")
+    assert await adj("img-1") == ("img-2", "img-3")
+
+
+async def test_detail_lone_picture_has_no_prev_next(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    add_image(clean_db, 1)
+    body = (await client.get("/api/images/img-1")).json()
+    assert body["prev"] is None and body["next"] is None
+
+
 async def test_alias_redirect(client: httpx.AsyncClient, clean_db: str) -> None:
     image_id = add_image(clean_db, 1)
     with psycopg.connect(clean_db) as conn:
