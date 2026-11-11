@@ -96,7 +96,8 @@ async def _image_page(request: Request, slug: str) -> HTMLResponse:
     return await render_index(request, "".join(tags), title=caption)
 
 
-@router.get("/{path:path}", include_in_schema=False)
+# HEAD too: link unfurlers and uptime checks probe with HEAD before GET.
+@router.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
 async def catch_all(path: str, request: Request) -> Response:
     if path == "api" or path.startswith(("api/", "media/")) or path == "media":
         raise HTTPException(status_code=404, detail="not here")

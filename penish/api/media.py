@@ -73,7 +73,7 @@ def variants_for(
     return variants_for_many([(sha, width, height)])[sha]
 
 
-@router.get("/media/pub/{name}", include_in_schema=False)
+@router.api_route("/media/pub/{name}", methods=["GET", "HEAD"], include_in_schema=False)
 async def pub(name: str) -> FileResponse:
     m = _NAME.match(name)
     if not m:

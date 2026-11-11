@@ -86,3 +86,8 @@ async def test_immutable_asset_headers(client: httpx.AsyncClient) -> None:
     r = await client.get("/_app/immutable/a.js")
     assert r.status_code == 200
     assert "immutable" in r.headers["cache-control"]
+
+
+async def test_head_on_pages_is_allowed(client: httpx.AsyncClient) -> None:
+    r = await client.head("/")
+    assert r.status_code == 200
