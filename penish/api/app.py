@@ -3,7 +3,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from penish.api import admin, index, media, routes_images, routes_meta
+from penish.api import (
+    admin,
+    admin_ops,
+    admin_pictures,
+    index,
+    media,
+    routes_images,
+    routes_meta,
+    social,
+)
 from penish.config import get_settings
 from penish.db import make_pool
 
@@ -25,6 +34,9 @@ def create_app() -> FastAPI:
     app.include_router(routes_images.router)
     app.include_router(media.router)
     app.include_router(admin.router)
+    app.include_router(admin_ops.router)
+    app.include_router(admin_pictures.router)
+    app.include_router(social.router)
     app.middleware("http")(admin.no_store)
     # Last: its catch-all must not shadow routes registered above it.
     app.include_router(index.router)

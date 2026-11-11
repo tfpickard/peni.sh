@@ -13,6 +13,7 @@ from pathlib import Path
 from penish.config import get_settings
 from penish.db import make_pool
 from penish.worker import jobs
+from penish.worker.admin_jobs import make_handlers
 from penish.worker.embed import Embedder
 from penish.worker.embed_server import serve as serve_embed
 from penish.worker.heartbeat import run_heartbeat
@@ -91,7 +92,12 @@ async def main() -> None:
         log.info("worker up; watching %s", settings.inbox)
         await asyncio.gather(
             watcher.run(stop),
-            jobs.run_loop(pool, {"ingest": ingest, "haiku": haiku}, stop=stop, concurrency=2),
+            jobs.run_loop(
+                pool,
+                {"ingest": ingest, "haiku": haiku, **make_handlers(pool, settings, embedder)},
+                stop=stop,
+                concurrency=2,
+            ),
             run_heartbeat(pool, stop, version=settings.git_sha),
             serve_embed(embedder, stop, port=settings.embed_server_port),
         )

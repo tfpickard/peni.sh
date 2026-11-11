@@ -1,6 +1,8 @@
 <script lang="ts">
 	import Picture from '../../../lib/components/Picture.svelte';
 	import Strip from '../../../lib/components/Strip.svelte';
+	import Votes from '../../../lib/components/Votes.svelte';
+	import Comments from '../../../lib/components/Comments.svelte';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -47,6 +49,7 @@
 		</div>
 	{/key}
 	{#if image.caption}<h1>{image.caption.body}</h1>{/if}
+	{#key image.slug}<Votes slug={image.slug} votes={image.votes} />{/key}
 	{#each paragraphs as p}
 		<p class="desc">
 			{#if p.label}<span class="k">{p.label}</span>{/if}
@@ -71,6 +74,7 @@
 			{/each}
 		</dl>
 	{/if}
+	{#key image.slug}<Comments slug={image.slug} comments={image.comments} />{/key}
 {/if}
 
 <style>

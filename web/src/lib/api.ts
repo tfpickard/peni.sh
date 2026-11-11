@@ -22,6 +22,8 @@ export type ImageItem = {
 export type ImagePage = { items: ImageItem[]; next_cursor: string | null };
 export type Text = { body: string; source: string; model: string | null };
 export type Neighbor = { slug: string; score: number; blurhash: string; src: string };
+export type Votes = { up: number; down: number; net: number; mine: -1 | 0 | 1 };
+export type Comment = { name: string | null; body: string; created_at: string };
 export type ImageDetail = ImageItem & {
 	caption: Text | null;
 	description: Text | null;
@@ -32,6 +34,8 @@ export type ImageDetail = ImageItem & {
 	mode: 'raw' | 'centered';
 	metrics: { loneliness: number | null; typicality: number | null; surprise: number | null };
 	published_at: string;
+	votes: Votes;
+	comments: Comment[];
 };
 export type ImageRedirect = { redirect: string };
 
@@ -43,3 +47,29 @@ export const getImages = (cursor: string | null, limit = 48, f: typeof fetch = f
 		return r.json() as Promise<ImagePage>;
 	});
 };
+
+export class ApiError extends Error {
+	constructor(public status: number) {
+		super(`${status}`);
+	}
+}
+
+async function post<T>(path: string, body: unknown): Promise<T> {
+	const res = await fetch(path, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'penish' },
+		body: JSON.stringify(body)
+	});
+	if (!res.ok) throw new ApiError(res.status);
+	return res.json();
+}
+
+export const postVote = (slug: string, value: -1 | 0 | 1) =>
+	post<Votes>(`/api/images/${encodeURIComponent(slug)}/vote`, { value });
+
+export const postComment = (
+	slug: string,
+	c: { name: string | null; body: string; turnstile: string | null }
+) => post<{ ok: true }>(`/api/images/${encodeURIComponent(slug)}/comments`, c);
+
+export const getConfig = () => get<{ turnstile_site_key: string | null }>('/api/config');

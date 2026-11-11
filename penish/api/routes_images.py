@@ -1,9 +1,10 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from penish.api.media import variants_for, variants_for_many
+from penish.api.social import approved_comments, vote_summary, voter_for
 from penish.similarity import Mode, image_metrics, neighbors
 
 router = APIRouter()
@@ -90,9 +91,12 @@ async def resolve_live(conn: Any, slug: str) -> dict[str, Any] | None:
 @router.get("/api/images/{slug}")
 async def image_detail(
     request: Request,
+    response: Response,
     slug: str,
     sim: Literal["raw", "centered"] | None = None,
 ) -> dict[str, Any]:
+    # votes.mine depends on the caller's cookie, so no cache may share this response.
+    response.headers["Cache-Control"] = "no-store"
     pool = request.app.state.pool
     async with pool.connection() as conn:
         img = await resolve_live(conn, slug)
@@ -112,6 +116,8 @@ async def image_detail(
             "select tag, source from tags where image_id = %s order by tag", (img["id"],)
         )
         tags = [{"tag": r["tag"], "source": r["source"]} for r in await cur.fetchall()]
+        votes = await vote_summary(conn, img["id"], voter_for(request))
+        comments = await approved_comments(conn, img["id"])
 
     mode: Mode = sim or "auto"
     nb = await neighbors(pool, img["id"], k=_K, mode=mode)
@@ -165,4 +171,6 @@ async def image_detail(
             "surprise": metrics.surprise,
         },
         "published_at": img["published_at"].isoformat() if img["published_at"] else None,
+        "votes": votes,
+        "comments": comments,
     }

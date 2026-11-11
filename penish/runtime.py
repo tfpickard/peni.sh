@@ -38,9 +38,10 @@ KEYS = (
     "describe.prompt",
     "haiku.model",
     "haiku.prompt",
+    "grow.model",
     "grow.prompt",
 )
-EFFORTS = ("low", "medium", "high", "max")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 PURPOSES = ("describe", "haiku", "grow")
 
 
@@ -53,7 +54,8 @@ def default(key: str, settings: Settings | None = None) -> Any:
     """The value a key has when no override row exists."""
     _check_key(key)
     s = settings or get_settings()
-    if key == "describe.model":
+    # Grow is describe-grade writing, so it follows describe until someone splits them.
+    if key in ("describe.model", "grow.model"):
         return s.describe_model
     if key == "haiku.model":
         return s.haiku_model

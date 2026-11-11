@@ -93,7 +93,7 @@ async def grow(
     get = get or runtime.getter(None, settings)
     template = await get("grow.prompt")
     if model is None:
-        model = await get("describe.model")
+        model = await get("grow.model")
     stats = Stats()
     seen = {normalize(h) for h in pool}
     # Row-stacked unit vectors of everything already in the deck plus this run's accepts.

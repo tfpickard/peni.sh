@@ -199,7 +199,7 @@ async def test_haiku_samples_six_active(p: Any) -> None:
 
 
 async def test_grow_into_uses_runtime_and_records_usage(p: Any) -> None:
-    await runtime.put(p, "describe.model", "claude-g")
+    await runtime.put(p, "grow.model", "claude-g")
     await runtime.put(p, "grow.prompt", "make {n}:\n{examples}")
     h = ["a gill on the wrist", "the dentist admires it", "twice a year, fine"]
     client = FakeClient(json.dumps({"haikus": [h]}))
@@ -289,3 +289,17 @@ async def test_embed_server_stops_on_event() -> None:
     await asyncio.sleep(0.3)
     stop.set()
     await asyncio.wait_for(task, timeout=5)
+
+
+async def test_xhigh_effort_and_grow_model(p: Any) -> None:
+    await runtime.put(p, "describe.effort", "xhigh")
+    assert await runtime.get(p, "describe.effort") == "xhigh"
+    assert await runtime.get(p, "grow.model") == runtime.default("describe.model")
+    await runtime.put(p, "grow.model", " claude-grow ")
+    assert await runtime.get(p, "grow.model") == "claude-grow"
+    # Splitting grow off leaves describe alone.
+    assert await runtime.get(p, "describe.model") == runtime.default("describe.model")
+    await runtime.reset(p, "grow.model")
+    assert await runtime.get(p, "grow.model") == runtime.default("describe.model")
+    with pytest.raises(ValueError):
+        runtime.validate("grow.model", "  ")
