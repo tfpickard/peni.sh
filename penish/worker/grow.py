@@ -107,7 +107,8 @@ async def grow(
         ask = min(batch, n - stats.accepted)
         examples = rng.sample(pool, min(N_EXAMPLES, len(pool)))
         kwargs: dict[str, Any] = {
-            "max_tokens": max(1024, ask * 150),
+            # Headroom for thinking, which shares max_tokens with the answer.
+            "max_tokens": 2048 + ask * 150,
             "system": build_prompt(template, examples, ask),
             "output_config": output_config(_SCHEMA, None),
             "messages": [{"role": "user", "content": f"Write {ask} haikus."}],

@@ -66,7 +66,9 @@ async def haiku_from(
     if examples is None:
         examples = await load_examples(pool) if pool is not None else []
     kwargs: dict[str, Any] = {
-        "max_tokens": 300,
+        # The budget covers thinking too: haiku-5-5 thinks by default, and at 300 it spent
+        # every token there and returned no text.
+        "max_tokens": 2048,
         "system": build_prompt(template, examples),
         "output_config": output_config(_SCHEMA, None),
         "messages": [{"role": "user", "content": description}],

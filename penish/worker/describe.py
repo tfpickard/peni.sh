@@ -197,7 +197,9 @@ async def describe(
     # temperature is not accepted for claude-sonnet-5-5 (the SDK no longer exposes
     # it), so determinism comes from the fixed analysis structure instead.
     kwargs: dict[str, Any] = {
-        "max_tokens": 2500,
+        # Thinking shares this budget; a higher effort set in admin would otherwise starve
+        # the JSON.
+        "max_tokens": 8000,
         "system": prompt,
         "output_config": output_config(build_schema(want), effort),
         "messages": [
