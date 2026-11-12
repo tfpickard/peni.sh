@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 from typing import Any, Literal
 
@@ -29,6 +30,8 @@ from penish.worker.derive import clamp_rect
 from penish.worker.ingest import EMBED_FIELD
 from penish.worker.jobs import enqueue
 from penish.worker.metrics import refresh_corpus_stats
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/admin/pictures",
@@ -513,7 +516,11 @@ async def _delete(pool: Any, image_id: int) -> tuple[str, list[str]] | None:
                 if not (shared and shared["shared"]):
                     remove_pub(settings.media_pub, gone["pub_sha"])
 
-            await asyncio.to_thread(unlink)
+            # The rows are already gone; a stuck file must not hide that from the caller.
+            try:
+                await asyncio.to_thread(unlink)
+            except OSError as e:
+                log.warning("delete: image %s files left behind: %s", image_id, e)
         finally:
             with contextlib.suppress(psycopg.Error):
                 await conn.execute("select pg_advisory_unlock(hashtextextended(%s, 0))", (sha,))
@@ -563,15 +570,18 @@ async def bulk(request: Request, body: BulkBody) -> dict[str, Any]:
     if body.action == "delete":
         done: list[int] = []
         live_models: set[str] = set()
-        for image_id in ids:
-            gone = await _delete(pool, image_id)
-            if gone is None:
-                continue
-            done.append(image_id)
-            if gone[0] == "live":
-                live_models.update(gone[1])
-        # Once for the batch: each refresh rescans every vector.
-        await _refresh(pool, live_models)
+        try:
+            for image_id in ids:
+                gone = await _delete(pool, image_id)
+                if gone is None:
+                    continue
+                done.append(image_id)
+                if gone[0] == "live":
+                    live_models.update(gone[1])
+        finally:
+            # Once for the batch, since each refresh rescans every vector; and also when
+            # a later delete fails, because the earlier ones are committed.
+            await _refresh(pool, live_models)
         return {"action": "delete", "done": done}
     fields = BULK_REGEN[body.action]
     async with pool.connection() as conn:

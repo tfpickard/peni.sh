@@ -513,6 +513,26 @@ async def test_bulk_delete(client: httpx.AsyncClient, clean_db: str) -> None:
     assert sql(clean_db, "select n from corpus_stats where model = %s", MODEL) == [(1,)]
 
 
+async def test_bulk_delete_measures_again_after_a_failure(
+    client: httpx.AsyncClient, clean_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    b = add(clean_db, 2, vec=[0, 1, 0, 0])
+    add(clean_db, 3, vec=[0, 0, 1, 0])
+    real = admin_pictures._delete
+
+    async def flaky(pool: Any, image_id: int) -> Any:
+        if image_id == b:
+            raise RuntimeError("disk")
+        return await real(pool, image_id)
+
+    monkeypatch.setattr(admin_pictures, "_delete", flaky)
+    with pytest.raises(RuntimeError):
+        await client.post(f"{URL}/bulk", headers=XHR, json={"action": "delete", "ids": [a, b]})
+    # The first delete committed, so the corpus is measured without it.
+    assert sql(clean_db, "select n from corpus_stats where model = %s", MODEL) == [(2,)]
+
+
 async def test_bulk_regen_leaves_owner_text_alone(client: httpx.AsyncClient, clean_db: str) -> None:
     a = add(clean_db, 1)
     b = add(clean_db, 2)

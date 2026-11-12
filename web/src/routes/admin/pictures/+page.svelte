@@ -162,7 +162,7 @@
 
 {#if items.length}
 	<div class="bar" class:on={picked.size > 0}>
-		<label class="box"><input type="checkbox" checked={all} onchange={pickAll} aria-label="all" /></label>
+		<label class="box"><input type="checkbox" checked={all} disabled={busy} onchange={pickAll} aria-label="all" /></label>
 		{#if picked.size}
 			<span class="dim">{picked.size} selected</span>
 			{#each Object.entries(LABEL) as [action, label] (action)}
@@ -192,6 +192,7 @@
 					<input
 						type="checkbox"
 						checked={picked.has(it.id)}
+						disabled={busy}
 						onclick={(e) => pick(it.id, e)}
 						aria-label="select {it.caption ?? it.slug ?? it.id}"
 					/>
