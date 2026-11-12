@@ -7,9 +7,10 @@
 
 	let { children }: LayoutProps = $props();
 
-	// A picture belongs to the grid it was opened from, and a tag's pictures to the cloud.
+	// A picture belongs to the grid it was opened from; a tag's or category's pictures to its index.
 	const sections = [
 		{ label: 'pictures', href: '/', under: ['/i/'] },
+		{ label: 'categories', href: '/categories', under: ['/c/'] },
 		{ label: 'tags', href: '/tags', under: ['/t/'] },
 		{ label: 'search', href: '/search', under: [] }
 	];

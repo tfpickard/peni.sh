@@ -14,6 +14,7 @@ from penish.config import get_settings
 from penish.db import make_pool
 from penish.worker import jobs
 from penish.worker.admin_jobs import make_handlers
+from penish.worker.categorize import enqueue_uncategorized, handle_categorize
 from penish.worker.embed import Embedder
 from penish.worker.embed_server import serve as serve_embed
 from penish.worker.heartbeat import run_heartbeat
@@ -87,6 +88,13 @@ async def main() -> None:
         async def haiku(job: Job) -> None:
             await handle_haiku(job, pool=pool, settings=settings)
 
+        async def categorize(job: Job) -> None:
+            await handle_categorize(job, pool=pool, settings=settings)
+
+        n = await enqueue_uncategorized(pool)
+        if n:
+            log.info("enqueued %d pictures to categorize", n)
+
         watcher = InboxWatcher(settings, enqueue, has_job=has_job)
         await watcher.recover()
         log.info("worker up; watching %s", settings.inbox)
@@ -94,7 +102,12 @@ async def main() -> None:
             watcher.run(stop),
             jobs.run_loop(
                 pool,
-                {"ingest": ingest, "haiku": haiku, **make_handlers(pool, settings, embedder)},
+                {
+                    "ingest": ingest,
+                    "haiku": haiku,
+                    "categorize": categorize,
+                    **make_handlers(pool, settings, embedder),
+                },
                 stop=stop,
                 concurrency=2,
             ),
