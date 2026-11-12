@@ -16,8 +16,8 @@ Pictures are rsynced into an inbox over the tailnet.
 
     rsync -av x.png x_caption.txt upload@peni:
 
-The `upload` user can run rsync and nothing else. It cannot see what is already
-there.
+The `upload` key can run rsync and nothing else, and only inside the inbox. Files
+still waiting there can be listed and fetched with it. Nothing outside can.
 
 Files sharing a stem are one picture. The worker waits until a stem has been
 quiet for 10 seconds, then takes it.
@@ -32,11 +32,17 @@ quiet for 10 seconds, then takes it.
 | `x_prompt.txt` | prompt |
 | `x_embedding.json` | embedding, if it names the current model and width |
 
-Anything not supplied is written by a model. Anything supplied is kept. A model
-never overwrites a field the owner wrote.
+A missing caption, description, analysis or tags are written by a model. A
+missing prompt stays missing. Anything supplied is kept. A model never
+overwrites a field the owner wrote.
 
-A picture that cannot be processed goes to `data/failed/<stem>/` with an `.err`
-file saying why.
+A picture that cannot become a picture, or that the model declines, goes to
+`data/failed/<stem>/` with an `.err` file saying why.
+
+A picture that could not be described or embedded for a passing reason stays in
+`data/processing/` as `pending_enrichment` and is tried again. If the tries run
+out, the job is marked failed in `/admin/queue` and the files stay where they
+are. A restart picks them up again.
 
 There is also an upload form at `/admin`. It puts files in the same inbox and
 they wait the same 10 seconds.
@@ -132,6 +138,7 @@ width. Every query filters on both. Changing the model needs no migration.
 
 On a Mac:
 
+    cp .env.example .env
     docker compose -f compose.yaml -f compose.dev.yaml up --build
 
 Python alone:
