@@ -110,6 +110,13 @@ export const crop = (id: number, rect: Rect | null) =>
 
 export const remove = (id: number) => call<unknown>(`/${id}`, { method: 'DELETE' });
 
+export type BulkAction = 'delete' | 'redescribe' | 'retag' | 'rehaiku' | 'reembed';
+export type BulkResult = { action: BulkAction; done: number[]; queued?: number[] };
+// The server takes at most this many ids per request.
+export const BULK_MAX = 500;
+export const bulk = (action: BulkAction, ids: number[]) =>
+	call<BulkResult>('/bulk', { method: 'POST', body: JSON.stringify({ action, ids }) });
+
 export const originalUrl = (id: number) => `/api/admin/pictures/${id}/original`;
 
 export const active = (jobs: Job[]) => jobs.some((j) => j.status === 'queued' || j.status === 'running');

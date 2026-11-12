@@ -12,6 +12,10 @@
 	let done = $state(false);
 	let note = $state('');
 	let sentinel = $state<HTMLElement>();
+	let picked = $state(new Set<number>());
+	let anchor: number | null = null;
+	let busy = $state(false);
+	let dialog = $state<HTMLDialogElement>();
 
 	// A newer query invalidates responses still in flight for an older one.
 	let gen = 0;
@@ -21,6 +25,8 @@
 		if (reset) {
 			gen++;
 			items = [];
+			picked = new Set();
+			anchor = null;
 			cursor = null;
 			done = false;
 			note = '';
@@ -61,6 +67,67 @@
 		};
 	});
 
+	// Shift-click picks the run of rows between the last click and this one.
+	function pick(id: number, e: MouseEvent) {
+		const next = new Set(picked);
+		const on = !picked.has(id);
+		const from = anchor === null ? -1 : items.findIndex((i) => i.id === anchor);
+		const to = items.findIndex((i) => i.id === id);
+		if (e.shiftKey && from >= 0 && to >= 0) {
+			for (const it of items.slice(Math.min(from, to), Math.max(from, to) + 1)) {
+				if (on) next.add(it.id);
+				else next.delete(it.id);
+			}
+		} else if (on) next.add(id);
+		else next.delete(id);
+		anchor = id;
+		picked = next;
+	}
+
+	const all = $derived(items.length > 0 && items.every((i) => picked.has(i.id)));
+	function pickAll() {
+		picked = all ? new Set() : new Set(items.map((i) => i.id));
+		anchor = null;
+	}
+
+	const LABEL: Record<Exclude<pics.BulkAction, 'delete'>, string> = {
+		redescribe: 'redescribe',
+		retag: 'retag',
+		rehaiku: 'rehaiku',
+		reembed: 're-embed'
+	};
+
+	async function run(action: pics.BulkAction) {
+		if (busy || !picked.size) return;
+		busy = true;
+		const ids = [...picked];
+		let done = 0;
+		let queued = 0;
+		try {
+			for (let i = 0; i < ids.length; i += pics.BULK_MAX) {
+				const r = await pics.bulk(action, ids.slice(i, i + pics.BULK_MAX));
+				done += r.done.length;
+				queued += r.queued?.length ?? 0;
+				if (action === 'delete') {
+					const gone = new Set(r.done);
+					items = items.filter((it) => !gone.has(it.id));
+				}
+			}
+			note = action === 'delete' ? `${done} deleted` : `${queued} queued`;
+			picked = new Set();
+			anchor = null;
+		} catch {
+			note = action === 'delete' ? `${done} deleted, then failed` : 'failed';
+		} finally {
+			busy = false;
+		}
+	}
+
+	function confirmDelete() {
+		dialog?.close();
+		run('delete');
+	}
+
 	const day = (s: string) => s.slice(0, 10);
 	const net = (n: number) => (n > 0 ? `+${n}` : String(n));
 </script>
@@ -91,10 +158,42 @@
 
 {#if note}<p class="dim">{note}</p>{/if}
 
+{#if items.length}
+	<div class="bar" class:on={picked.size > 0}>
+		<label class="box"><input type="checkbox" checked={all} onchange={pickAll} aria-label="all" /></label>
+		{#if picked.size}
+			<span class="dim">{picked.size} selected</span>
+			{#each Object.entries(LABEL) as [action, label] (action)}
+				<button disabled={busy} onclick={() => run(action as pics.BulkAction)}>{label}</button>
+			{/each}
+			<button disabled={busy} onclick={() => dialog?.showModal()}>delete</button>
+			<button class="dim" disabled={busy} onclick={() => ((picked = new Set()), (anchor = null))}
+				>clear</button
+			>
+		{/if}
+	</div>
+{/if}
+
+<dialog bind:this={dialog}>
+	<p>delete {picked.size} {picked.size === 1 ? 'picture' : 'pictures'}?</p>
+	<div class="acts">
+		<button onclick={confirmDelete}>delete</button>
+		<button class="dim" onclick={() => dialog?.close()}>cancel</button>
+	</div>
+</dialog>
+
 <table>
 	<tbody>
 		{#each items as it (it.id)}
-			<tr>
+			<tr class:sel={picked.has(it.id)}>
+				<td class="box">
+					<input
+						type="checkbox"
+						checked={picked.has(it.id)}
+						onclick={(e) => pick(it.id, e)}
+						aria-label="select {it.caption ?? it.slug ?? it.id}"
+					/>
+				</td>
 				<td class="th">
 					<a href="/admin/pictures/{it.id}" aria-label={it.caption ?? it.slug ?? String(it.id)}>
 						{#if it.thumb}<img src={it.thumb} alt="" loading="lazy" />{:else}<span class="blank"></span>{/if}
@@ -191,5 +290,54 @@
 	}
 	.end {
 		height: 1px;
+	}
+	.bar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem 1.25rem;
+		padding: 0.6rem 0;
+		font-size: 0.875rem;
+	}
+	/* Stays in reach while picking far down a long list. */
+	.bar.on {
+		position: sticky;
+		top: 0;
+		z-index: 1;
+		background: var(--background);
+		border-bottom: 1px solid var(--ink-700);
+	}
+	.box {
+		width: 1.5rem;
+		line-height: 0;
+	}
+	input[type='checkbox'] {
+		width: 1.1rem;
+		height: 1.1rem;
+		margin: 0;
+		accent-color: var(--primary);
+		cursor: pointer;
+	}
+	tr.sel td {
+		background: var(--ink-900);
+	}
+	button.dim {
+		color: var(--muted-foreground);
+	}
+	dialog {
+		background: var(--background);
+		color: var(--foreground);
+		border: 1px solid var(--ink-700);
+		padding: 1.5rem 2rem;
+	}
+	dialog::backdrop {
+		background: rgb(0 0 0 / 0.6);
+	}
+	dialog p {
+		margin: 0 0 1.25rem;
+	}
+	.acts {
+		display: flex;
+		gap: 1.5rem;
 	}
 </style>

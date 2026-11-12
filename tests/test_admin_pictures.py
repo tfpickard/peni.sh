@@ -494,6 +494,65 @@ async def test_delete_keeps_shared_pub_files(client: httpx.AsyncClient, clean_db
     assert sql(clean_db, "select count(*) from corpus_stats_history") == [(0,)]
 
 
+async def test_bulk_delete(client: httpx.AsyncClient, clean_db: str) -> None:
+    s = get_settings()
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    b = add(clean_db, 2, vec=[0, 1, 0, 0])
+    c = add(clean_db, 3, status="failed")
+    d = add(clean_db, 4, vec=[0, 0, 1, 0])
+    before = sql(clean_db, "select count(*) from corpus_stats_history")[0][0]
+    r = await client.post(
+        f"{URL}/bulk", headers=XHR, json={"action": "delete", "ids": [a, c, a, 999999, b]}
+    )
+    assert r.status_code == 200
+    assert r.json() == {"action": "delete", "done": [a, c, b]}
+    assert [x[0] for x in sql(clean_db, "select id from images")] == [d]
+    assert sorted(p.name for p in s.media_orig.iterdir()) == [f"{sha(4)}.png"]
+    # Two live pictures went, and the corpus was measured again once, not twice.
+    assert sql(clean_db, "select count(*) from corpus_stats_history")[0][0] == before + 1
+    assert sql(clean_db, "select n from corpus_stats where model = %s", MODEL) == [(1,)]
+
+
+async def test_bulk_regen_leaves_owner_text_alone(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1)
+    b = add(clean_db, 2)
+    for action, fields in admin_pictures.BULK_REGEN.items():
+        r = await client.post(
+            f"{URL}/bulk", headers=XHR, json={"action": action, "ids": [a, b, 999999]}
+        )
+        assert r.status_code == 200
+        assert r.json() == {"action": action, "done": [a, b], "queued": [a, b]}
+        rows = sql(
+            clean_db,
+            "select payload, dedupe_key from jobs where type = 'regen'"
+            " and payload->'fields' = %s order by id",
+            Jsonb(fields),
+        )
+        assert [p for p, _ in rows] == [
+            {"image_id": a, "fields": fields},
+            {"image_id": b, "fields": fields},
+        ]
+        assert not any(k.endswith(":owner") for _, k in rows)
+    # Asked again while queued: nothing new.
+    r = await client.post(f"{URL}/bulk", headers=XHR, json={"action": "retag", "ids": [a]})
+    assert r.json()["queued"] == []
+
+
+async def test_bulk_rejects_bad_requests(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1)
+    for body in (
+        {"action": "explode", "ids": [a]},
+        {"action": "delete", "ids": []},
+        {"action": "delete", "ids": list(range(admin_pictures.BULK_MAX + 1))},
+        {"action": "delete"},
+    ):
+        assert (await client.post(f"{URL}/bulk", headers=XHR, json=body)).status_code == 422
+    client.cookies.clear()
+    r = await client.post(f"{URL}/bulk", headers=XHR, json={"action": "delete", "ids": [a]})
+    assert r.status_code == 401
+    assert len(sql(clean_db, "select id from images")) == 1
+
+
 async def test_original_streams_clean_file(client: httpx.AsyncClient, clean_db: str) -> None:
     a = add(clean_db, 1)
     r = await client.get(f"{URL}/{a}/original")
