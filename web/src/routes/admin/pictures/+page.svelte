@@ -103,24 +103,26 @@
 		const ids = [...picked];
 		let done = 0;
 		let queued = 0;
+		let failed = false;
 		try {
 			for (let i = 0; i < ids.length; i += pics.BULK_MAX) {
 				const r = await pics.bulk(action, ids.slice(i, i + pics.BULK_MAX));
 				done += r.done.length;
 				queued += r.queued?.length ?? 0;
-				if (action === 'delete') {
-					const gone = new Set(r.done);
-					items = items.filter((it) => !gone.has(it.id));
-				}
 			}
-			note = action === 'delete' ? `${done} deleted` : `${queued} queued`;
 			picked = new Set();
 			anchor = null;
 		} catch {
-			note = action === 'delete' ? `${done} deleted, then failed` : 'failed';
+			failed = true;
+		}
+		try {
+			// The list pages by offset, and deleted rows shift every later one; start over.
+			if (action === 'delete' && done) await more(true);
 		} finally {
 			busy = false;
 		}
+		if (action === 'delete') note = failed ? `${done} deleted, then failed` : `${done} deleted`;
+		else note = failed ? 'failed' : `${queued} queued`;
 	}
 
 	function confirmDelete() {
