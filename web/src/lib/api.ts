@@ -79,7 +79,7 @@ export const getImages = (
 	if (sort !== 'newest') q.set('sort', sort);
 	if (seed) q.set('seed', seed);
 	return f(`/api/images?${q}`).then((r) => {
-		if (!r.ok) throw new Error(`images ${r.status}`);
+		if (!r.ok) throw new ApiError(r.status);
 		return r.json() as Promise<ImagePage>;
 	});
 };

@@ -1,3 +1,4 @@
+# ruff: noqa: F811  -- the shared `client` fixture is imported, then named as a parameter.
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -114,14 +115,17 @@ def test_small_inputs() -> None:
     assert order("clumped", [], {}) == []
 
 
-async def test_api_pages_a_computed_order(client: httpx.AsyncClient, clean_db: str) -> None:  # noqa: F811
+async def test_api_pages_a_computed_order(client: httpx.AsyncClient, clean_db: str) -> None:
     for n in range(1, 8):
         add_image(clean_db, n, vec=unit(n % 2))
     r = await client.get("/api/images", params={"sort": "oldest", "limit": 3})
     body = r.json()
     assert [i["slug"] for i in body["items"]] == ["img-1", "img-2", "img-3"]
-    assert body["next_cursor"] == "3"
-    r = await client.get("/api/images", params={"sort": "oldest", "limit": 3, "cursor": "6"})
+    token, _, off = body["next_cursor"].partition(".")
+    assert off == "3"
+    r = await client.get(
+        "/api/images", params={"sort": "oldest", "limit": 3, "cursor": f"{token}.6"}
+    )
     assert [i["slug"] for i in r.json()["items"]] == ["img-7"]
     assert r.json()["next_cursor"] is None
 
@@ -139,7 +143,7 @@ async def test_api_pages_a_computed_order(client: httpx.AsyncClient, clean_db: s
     assert sorted(seen) == sorted(f"img-{n}" for n in range(1, 8))
 
 
-async def test_api_order_follows_changes(client: httpx.AsyncClient, clean_db: str) -> None:  # noqa: F811
+async def test_api_order_follows_changes(client: httpx.AsyncClient, clean_db: str) -> None:
     for n in range(1, 4):
         add_image(clean_db, n)
     r = await client.get("/api/images", params={"sort": "oldest"})
@@ -152,7 +156,7 @@ async def test_api_order_follows_changes(client: httpx.AsyncClient, clean_db: st
     assert [i["slug"] for i in r.json()["items"]] == ["img-1", "img-3", "img-4"]
 
 
-async def test_api_sort_with_tag_and_bad_input(client: httpx.AsyncClient, clean_db: str) -> None:  # noqa: F811
+async def test_api_sort_with_tag_and_bad_input(client: httpx.AsyncClient, clean_db: str) -> None:
     for n in range(1, 4):
         add_image(clean_db, n)
     with psycopg.connect(clean_db) as conn:
@@ -165,5 +169,70 @@ async def test_api_sort_with_tag_and_bad_input(client: httpx.AsyncClient, clean_
     assert [i["slug"] for i in r.json()["items"]] == ["img-1", "img-3"]
     assert r.json()["count"] == 2
     assert (await client.get("/api/images", params={"sort": "sideways"})).status_code == 400
-    bad = await client.get("/api/images", params={"sort": "oldest", "cursor": "x"})
-    assert bad.status_code == 400
+    for c in ("x", "abc.x", ".3", "abc.-1"):
+        bad = await client.get("/api/images", params={"sort": "oldest", "cursor": c})
+        assert bad.status_code == 400, c
+    gone = await client.get("/api/images", params={"sort": "oldest", "cursor": "feedface.48"})
+    assert gone.status_code == 410
+
+
+async def test_api_pages_keep_their_snapshot(client: httpx.AsyncClient, clean_db: str) -> None:
+    for n in range(1, 5):
+        add_image(clean_db, n)
+    first = await client.get("/api/images", params={"sort": "newest-ish", "limit": 2})
+    assert first.status_code == 400
+    p1 = (await client.get("/api/images", params={"sort": "tidal", "limit": 2})).json()
+    assert [i["slug"] for i in p1["items"]] == ["img-4", "img-1"]
+    # A publish between pages would shift a recomputed tidal order by one.
+    add_image(clean_db, 5)
+    p2 = (
+        await client.get(
+            "/api/images", params={"sort": "tidal", "limit": 2, "cursor": p1["next_cursor"]}
+        )
+    ).json()
+    assert [i["slug"] for i in p2["items"]] == ["img-3", "img-2"]
+    fresh = (await client.get("/api/images", params={"sort": "tidal", "limit": 2})).json()
+    assert [i["slug"] for i in fresh["items"]] == ["img-5", "img-1"]
+
+
+async def test_api_tag_edit_moves_a_sorted_tag_listing(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    for n in range(1, 4):
+        add_image(clean_db, n)
+    q = {"sort": "oldest", "tag": "x"}
+    with psycopg.connect(clean_db) as conn:
+        conn.execute(
+            "insert into tags (image_id, tag, source) select id, 'x', 'owner' from images "
+            "where slug = 'img-1'"
+        )
+        conn.commit()
+    assert (await client.get("/api/images", params=q)).json()["count"] == 1
+    # The admin edit touches only tag rows, not the image's timestamps.
+    with psycopg.connect(clean_db) as conn:
+        conn.execute(
+            "insert into tags (image_id, tag, source) select id, 'x', 'owner' from images "
+            "where slug = 'img-3'"
+        )
+        conn.commit()
+    r = (await client.get("/api/images", params=q)).json()
+    assert [i["slug"] for i in r["items"]] == ["img-1", "img-3"]
+    assert r["count"] == 2
+
+
+async def test_api_plain_orders_skip_vectors(
+    client: httpx.AsyncClient, clean_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    add_image(clean_db, 1, vec=unit(0))
+    add_image(clean_db, 2, vec=unit(1))
+    seen: list[dict[int, object]] = []
+    real = routes_images.order
+
+    def spy(sort, rows, vecs, **kw):  # type: ignore[no-untyped-def]
+        seen.append(vecs)
+        return real(sort, rows, vecs, **kw)
+
+    monkeypatch.setattr(routes_images, "order", spy)
+    await client.get("/api/images", params={"sort": "random", "seed": "a"})
+    await client.get("/api/images", params={"sort": "drifting"})
+    assert [len(v) for v in seen] == [0, 2]

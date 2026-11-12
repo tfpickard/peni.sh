@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { flushSync, onMount, untrack } from 'svelte';
-	import { goto, snapshot } from '$app/navigation';
+	import { afterNavigate, goto, snapshot } from '$app/navigation';
 	import { page } from '$app/state';
 	import FungalHaiku from '../lib/haiku/FungalHaiku.svelte';
 	import { randomSeed } from '../lib/haiku/rng';
 	import Grid from '../lib/components/Grid.svelte';
 	import {
+		ApiError,
 		getHaiku,
 		getImages,
 		isSort,
@@ -81,6 +82,15 @@
 		}
 	});
 
+	function restart() {
+		epoch++;
+		loading = false;
+		items = [];
+		cursor = null;
+		done = false;
+		more();
+	}
+
 	async function more() {
 		if (loading || done) return;
 		loading = true;
@@ -88,12 +98,21 @@
 		try {
 			const p = await getImages(cursor, 48, fetch, null, sort, seed);
 			if (e !== epoch) return;
-			items.push(...p.items);
+			// The grid is keyed by slug; one repeated picture would break it.
+			const have = new Set(items.map((i) => i.slug));
+			items.push(...p.items.filter((i) => !have.has(i.slug)));
 			cursor = p.next_cursor;
 			if (!cursor) done = true;
-		} catch {
+		} catch (err) {
+			if (e !== epoch) return;
+			// The order this grid was paging through has expired; a fresh first page cannot.
+			if (err instanceof ApiError && err.status === 410 && cursor) {
+				loading = false;
+				restart();
+				return;
+			}
 			// Stop rather than retry in a tight loop against a failing API.
-			if (e === epoch) done = true;
+			done = true;
 		} finally {
 			if (e === epoch) loading = false;
 		}
@@ -105,12 +124,7 @@
 		untrack(() => {
 			if (shown === order) return;
 			shown = order;
-			epoch++;
-			loading = false;
-			items = [];
-			cursor = null;
-			done = false;
-			more();
+			restart();
 		});
 	});
 
@@ -133,19 +147,26 @@
 		goto(qs ? `/?${qs}` : '/', { replace: true, reset: false });
 	}
 
+	let arrived = false;
+	afterNavigate((nav) => {
+		if (arrived) return;
+		arrived = true;
+		// Back to an entry that was showing newest must show newest again, not the order
+		// chosen since; only a fresh arrival takes the remembered one.
+		if (nav.type === 'popstate' || page.url.searchParams.has('sort')) return;
+		let kept: string | null = null;
+		try {
+			kept = localStorage.getItem(LS_SORT);
+		} catch {
+			kept = null;
+		}
+		if (isSort(kept) && kept !== 'newest') choose(kept);
+	});
+
 	onMount(async () => {
 		// The component has just drawn the same seeded markup; dropping the server copy in the same
 		// task means no frame shows both and none shows neither.
 		document.querySelector('body > .haiku')?.remove();
-		if (!page.url.searchParams.has('sort')) {
-			let kept: string | null = null;
-			try {
-				kept = localStorage.getItem(LS_SORT);
-			} catch {
-				kept = null;
-			}
-			if (isSort(kept) && kept !== 'newest') choose(kept);
-		}
 		if (injected) return;
 		try {
 			const h = await getHaiku();

@@ -38,6 +38,10 @@ Sort = Literal[
 ]
 SORTS: tuple[str, ...] = get_args(Sort)
 SEEDED = frozenset({"random", "drunkards-walk"})
+# Orders that read vectors; the rest never need them loaded.
+EMBEDDED = frozenset(
+    {"drifting", "oldest-drifting", "clumped", "anti-clumped", "lonely", "drunkards-walk"}
+)
 
 Vecs = NDArray[np.float64]
 
@@ -237,7 +241,7 @@ def order(
 class OrderCache:
     """The last few orders, keyed by everything that could change them."""
 
-    def __init__(self, size: int = 32) -> None:
+    def __init__(self, size: int = 256) -> None:
         self._size = size
         self._items: OrderedDict[tuple[Any, ...], list[int]] = OrderedDict()
 
