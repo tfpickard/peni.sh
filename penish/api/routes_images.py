@@ -1,11 +1,14 @@
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
+import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from penish.api.media import variants_for, variants_for_many
 from penish.api.social import approved_comments, vote_summary, voter_for
+from penish.config import get_settings
 from penish.similarity import Mode, image_metrics, neighbors
+from penish.sort import SORTS, OrderCache, Row, Sort, order
 
 router = APIRouter()
 
@@ -55,7 +58,13 @@ async def list_images(
     limit: int = Query(48, ge=1, le=100),
     # No length cap: owner sidecars store tags of any length, and every stored tag is linked.
     tag: str | None = None,
+    sort: str = "newest",
+    seed: str = Query("", max_length=32),
 ) -> dict[str, Any]:
+    if sort not in SORTS:
+        raise HTTPException(status_code=400, detail="bad sort")
+    if sort != "newest":
+        return await _sorted_page(request, sort, seed, tag, cursor, limit)
     where = ""
     params: list[Any] = []
     count: int | None = None
@@ -95,6 +104,107 @@ async def list_images(
     out: dict[str, Any] = {"items": grid_items(rows), "next_cursor": next_cursor}
     if count is not None:
         out["count"] = count
+    return out
+
+
+_orders = OrderCache()
+
+
+async def _sorted_page(
+    request: Request, sort: str, seed: str, tag: str | None, cursor: str | None, limit: int
+) -> dict[str, Any]:
+    """A page of a computed order. The cursor is an offset into the cached order."""
+    try:
+        offset = int(cursor) if cursor else 0
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad cursor") from None
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="bad cursor")
+    settings = get_settings()
+    tag_where = (
+        " and exists (select 1 from tags t where t.image_id = images.id and t.tag = %(tag)s)"
+        if tag
+        else ""
+    )
+    vp = {"tag": tag, "model": settings.embed_model, "dim": settings.embed_dim}
+    async with request.app.state.pool.connection() as conn:
+        # Anything that could move a picture in any order: a publish, a hide, a recrop,
+        # a re-embed. Cheap next to recomputing the order.
+        cur = await conn.execute(
+            f"""
+            select
+              (select row(count(*), max(updated_at), max(published_at))::text
+                 from images where {_LIVE}) as images,
+              (select row(count(*), max(created_at))::text from embeddings
+                where kind = 'description' and model = %(model)s) as vecs,
+              (select updated_at::text from corpus_stats
+                where kind = 'description' and model = %(model)s) as mean
+            """.encode(),
+            vp,
+        )
+        version = tuple((await cur.fetchone() or {}).values())
+        key = (sort, seed if sort in ("random", "drunkards-walk") else "", tag, version)
+        ids = _orders.get(key)
+        if ids is None:
+            cur = await conn.execute(
+                f"""
+                select id, published_at, palette, surprise from images
+                where {_LIVE} {tag_where}
+                order by published_at desc, id desc
+                """.encode(),
+                vp,
+            )
+            rows = [
+                Row(r["id"], r["published_at"], r["palette"], r["surprise"])
+                for r in await cur.fetchall()
+            ]
+            cur = await conn.execute(
+                f"""
+                select e.image_id, e.vec::real[] as vec from embeddings e
+                join images on images.id = e.image_id
+                where e.kind = 'description' and e.model = %(model)s and e.dim = %(dim)s
+                  and {_LIVE} {tag_where}
+                """.encode(),
+                vp,
+            )
+            vecs = {
+                r["image_id"]: np.asarray(r["vec"], dtype=np.float64) for r in await cur.fetchall()
+            }
+            cur = await conn.execute(
+                """
+                select mean::real[] as mean from corpus_stats
+                where kind = 'description' and model = %(model)s and vector_dims(mean) = %(dim)s
+                """,
+                vp,
+            )
+            m = await cur.fetchone()
+            # Same rule as the similar lists: below the threshold the mean is mostly one
+            # picture, and subtracting it would erase that picture.
+            mean = (
+                np.asarray(m["mean"], dtype=np.float64)
+                if m and len(vecs) >= settings.centered_min_images
+                else None
+            )
+            ids = order(cast(Sort, sort), rows, vecs, seed=seed, centered=mean)
+            _orders.put(key, ids)
+        page = ids[offset : offset + limit]
+        cur = await conn.execute(
+            f"""
+            select id, pub_sha, slug, width, height, blurhash, palette from images
+            where {_LIVE} and id = any(%s)
+            """.encode(),
+            [page],
+        )
+        found = {r["id"]: r for r in await cur.fetchall()}
+    # A picture hidden since the order was cached is skipped, not returned as a hole.
+    rows_out = [found[i] for i in page if i in found]
+    nxt = offset + limit
+    out: dict[str, Any] = {
+        "items": grid_items(rows_out),
+        "next_cursor": str(nxt) if nxt < len(ids) else None,
+    }
+    if tag and not cursor:
+        out["count"] = len(ids)
     return out
 
 
