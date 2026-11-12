@@ -45,17 +45,41 @@ export type ImageDetail = ImageItem & {
 };
 export type ImageRedirect = { redirect: string };
 
+// Mirrors penish/sort.py. The labels are what the picker shows.
+export const SORTS = [
+	['newest', 'newest'],
+	['oldest', 'oldest'],
+	['random', 'random'],
+	['drifting', 'drifting'],
+	['oldest-drifting', 'oldest, drifting'],
+	['clumped', 'clumped'],
+	['anti-clumped', 'anti-clumped'],
+	['rainbow', 'rainbow'],
+	['time-of-day', 'time of day'],
+	['lonely', 'lonely'],
+	['surprising', 'surprising'],
+	['drunkards-walk', "drunkard's walk"],
+	['tidal', 'tidal']
+] as const;
+export type Sort = (typeof SORTS)[number][0];
+export const SEEDED: readonly Sort[] = ['random', 'drunkards-walk'];
+export const isSort = (s: string | null): s is Sort => SORTS.some(([id]) => id === s);
+
 export const getImages = (
 	cursor: string | null,
 	limit = 48,
 	f: typeof fetch = fetch,
-	tag: string | null = null
+	tag: string | null = null,
+	sort: Sort = 'newest',
+	seed = ''
 ) => {
 	const q = new URLSearchParams({ limit: String(limit) });
 	if (cursor) q.set('cursor', cursor);
 	if (tag) q.set('tag', tag);
+	if (sort !== 'newest') q.set('sort', sort);
+	if (seed) q.set('seed', seed);
 	return f(`/api/images?${q}`).then((r) => {
-		if (!r.ok) throw new Error(`images ${r.status}`);
+		if (!r.ok) throw new ApiError(r.status);
 		return r.json() as Promise<ImagePage>;
 	});
 };

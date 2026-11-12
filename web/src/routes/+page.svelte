@@ -1,16 +1,20 @@
 <script lang="ts">
-	import { flushSync, onMount } from 'svelte';
-	import { snapshot } from '$app/navigation';
+	import { flushSync, onMount, untrack } from 'svelte';
+	import { afterNavigate, goto, snapshot } from '$app/navigation';
+	import { page } from '$app/state';
 	import FungalHaiku from '../lib/haiku/FungalHaiku.svelte';
 	import { randomSeed } from '../lib/haiku/rng';
 	import Grid from '../lib/components/Grid.svelte';
 	import {
+		ApiError,
 		getHaiku,
 		getImages,
-		getStats,
+		isSort,
+		SEEDED,
+		SORTS,
 		type Haiku,
 		type ImageItem,
-		type Stats
+		type Sort
 	} from '../lib/api';
 
 	// Not in app.d.ts because that file is outside this step's scope.
@@ -21,22 +25,29 @@
 	const injected = (window as W).__HAIKU__ ?? null;
 	delete (window as W).__HAIKU__;
 
+	const LS_SORT = 'sort';
+
+	const sort = $derived.by((): Sort => {
+		const s = page.url.searchParams.get('sort');
+		return isSort(s) ? s : 'newest';
+	});
+	const seed = $derived(page.url.searchParams.get('seed') ?? '');
+
 	let haiku = $state<Haiku | null>(injected);
-	let pictures = $state<number | null>(null);
-	let temperature = $state<number | null>(null);
 	let items = $state<ImageItem[]>([]);
 	let cursor = $state<string | null>(null);
 	let done = $state(false);
 	let loading = false;
-	// Bumped by a restore so fetches started by the fresh mount cannot append to or replace
-	// the restored state when they land.
+	// Bumped by a restore or a new order so fetches already in flight cannot append to or
+	// replace what replaced them.
 	let epoch = 0;
 	let restored = false;
+	// The order the grid holds. A restore sets it first, so the effect does not clear the grid.
+	let shown: string | null = null;
 
 	type Saved = {
+		order: string;
 		haiku: Haiku | null;
-		pictures: number | null;
-		temperature: number | null;
 		items: ImageItem[];
 		cursor: string | null;
 		done: boolean;
@@ -49,21 +60,20 @@
 	snapshot<Saved>({
 		id: 'home',
 		capture: () => ({
+			order: `${sort}:${seed}`,
 			haiku: $state.snapshot(haiku),
-			pictures,
-			temperature,
 			items: $state.snapshot(items),
 			cursor,
 			done,
 			y: scrollY
 		}),
 		restore: (s) => {
+			if (s.order !== `${sort}:${seed}`) return;
 			epoch++;
 			restored = true;
+			shown = s.order;
 			loading = false;
 			haiku = s.haiku;
-			pictures = s.pictures;
-			temperature = s.temperature;
 			items = s.items;
 			cursor = s.cursor;
 			done = s.done;
@@ -72,35 +82,91 @@
 		}
 	});
 
+	function restart() {
+		epoch++;
+		loading = false;
+		items = [];
+		cursor = null;
+		done = false;
+		more();
+	}
+
 	async function more() {
 		if (loading || done) return;
 		loading = true;
 		const e = epoch;
 		try {
-			const page = await getImages(cursor);
+			const p = await getImages(cursor, 48, fetch, null, sort, seed);
 			if (e !== epoch) return;
-			items.push(...page.items);
-			cursor = page.next_cursor;
+			// The grid is keyed by slug; one repeated picture would break it.
+			const have = new Set(items.map((i) => i.slug));
+			items.push(...p.items.filter((i) => !have.has(i.slug)));
+			cursor = p.next_cursor;
 			if (!cursor) done = true;
-		} catch {
+		} catch (err) {
+			if (e !== epoch) return;
+			// The order this grid was paging through has expired; a fresh first page cannot.
+			if (err instanceof ApiError && err.status === 410 && cursor) {
+				loading = false;
+				restart();
+				return;
+			}
 			// Stop rather than retry in a tight loop against a failing API.
-			if (e === epoch) done = true;
+			done = true;
 		} finally {
 			if (e === epoch) loading = false;
 		}
 	}
 
+	$effect(() => {
+		const order = `${sort}:${seed}`;
+		// more() reads the paging state it also writes; tracked, each page would restart the order.
+		untrack(() => {
+			if (shown === order) return;
+			shown = order;
+			restart();
+		});
+	});
+
+	function store(s: Sort) {
+		try {
+			if (s === 'newest') localStorage.removeItem(LS_SORT);
+			else localStorage.setItem(LS_SORT, s);
+		} catch {
+			// Private mode: the choice lasts as long as the URL does.
+		}
+	}
+
+	function choose(s: Sort) {
+		store(s);
+		const q = new URLSearchParams();
+		if (s !== 'newest') q.set('sort', s);
+		// A seeded order gets a fresh seed each time it is chosen, so choosing it is a reshuffle.
+		if (SEEDED.includes(s)) q.set('seed', randomSeed().toString(36));
+		const qs = q.toString();
+		goto(qs ? `/?${qs}` : '/', { replace: true, reset: false });
+	}
+
+	let arrived = false;
+	afterNavigate((nav) => {
+		if (arrived) return;
+		arrived = true;
+		// Back to an entry that was showing newest must show newest again, not the order
+		// chosen since; only a fresh arrival takes the remembered one.
+		if (nav.type === 'popstate' || page.url.searchParams.has('sort')) return;
+		let kept: string | null = null;
+		try {
+			kept = localStorage.getItem(LS_SORT);
+		} catch {
+			kept = null;
+		}
+		if (isSort(kept) && kept !== 'newest') choose(kept);
+	});
+
 	onMount(async () => {
 		// The component has just drawn the same seeded markup; dropping the server copy in the same
 		// task means no frame shows both and none shows neither.
 		document.querySelector('body > .haiku')?.remove();
-		getStats().then(
-			(s: Stats) => {
-				pictures = s.pictures;
-				temperature = s.temperature ?? null;
-			},
-			() => {}
-		);
 		if (injected) return;
 		try {
 			const h = await getHaiku();
@@ -112,31 +178,61 @@
 	});
 </script>
 
-<p class="label">peni.sh</p>
 {#if haiku}
 	{#key haiku.id}
 		<FungalHaiku lines={haiku.lines} seed={haiku.seed} gen={haiku.gen} />
 	{/key}
 {/if}
-{#if pictures !== null}
-	<p class="count">
-		{pictures} pictures{#if temperature !== null}<span class="temp">temperature {temperature.toFixed(2)}</span>{/if}
-	</p>
-{/if}
+<div class="order">
+	<label>
+		<span class="hidden">order</span>
+		<select value={sort} onchange={(e) => choose(e.currentTarget.value as Sort)}>
+			{#each SORTS as [id, label] (id)}
+				<option value={id}>{label}</option>
+			{/each}
+		</select>
+	</label>
+	{#if SEEDED.includes(sort)}
+		<button type="button" onclick={() => choose(sort)}>again</button>
+	{/if}
+</div>
 <Grid {items} {done} {more} />
 
 <style>
-	.label {
-		margin: 0;
+	.order {
+		/* The grid keeps its own top margin for other pages; the order belongs to it. */
+		margin: 2.5rem 0 -1.75rem;
+		display: flex;
+		gap: 1rem;
+		align-items: baseline;
 		font-size: 0.8rem;
-		color: var(--muted-foreground);
 	}
-	.count {
-		margin: 2rem 0 0;
-		color: var(--muted-foreground);
+	.hidden {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip-path: inset(50%);
 	}
-	.temp {
-		margin-left: 1rem;
-		font-size: 0.8rem;
+	select,
+	button {
+		font: inherit;
+		color: var(--muted-foreground);
+		background: none;
+		border: 0;
+		padding: 0;
+		cursor: pointer;
+	}
+	select {
+		/* The native control is a box; the order is a word. */
+		appearance: none;
+	}
+	select:hover,
+	button:hover {
+		color: var(--foreground);
+	}
+	option {
+		background: var(--background);
+		color: var(--foreground);
 	}
 </style>
