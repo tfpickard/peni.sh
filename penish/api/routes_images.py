@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from penish.api.media import variants_for, variants_for_many
 from penish.api.social import approved_comments, vote_summary, voter_for
+from penish.categories import LABELS, SLUGS
 from penish.config import get_settings
 from penish.similarity import Mode, image_metrics, neighbors
 from penish.sort import EMBEDDED, SEEDED, SORTS, OrderCache, Row, Sort, order
@@ -52,6 +53,19 @@ def _decode_cursor(cursor: str) -> tuple[int, int]:
         raise HTTPException(status_code=400, detail="bad cursor") from None
 
 
+def _scope(tag: str | None, category: str | None) -> str:
+    """Filters for a tag or category listing, against %(tag)s and %(cat)s."""
+    out = ""
+    if tag:
+        out += " and exists (select 1 from tags t where t.image_id = images.id and t.tag = %(tag)s)"
+    if category:
+        out += (
+            " and exists (select 1 from image_categories c"
+            " where c.image_id = images.id and c.category = %(cat)s)"
+        )
+    return out
+
+
 @router.get("/api/images")
 async def list_images(
     request: Request,
@@ -59,32 +73,32 @@ async def list_images(
     limit: int = Query(48, ge=1, le=100),
     # No length cap: owner sidecars store tags of any length, and every stored tag is linked.
     tag: str | None = None,
+    category: str | None = None,
     sort: str = "newest",
     seed: str = Query("", max_length=32),
 ) -> dict[str, Any]:
     if sort not in SORTS:
         raise HTTPException(status_code=400, detail="bad sort")
+    if category is not None and category not in SLUGS:
+        raise _not_here()
     if sort != "newest":
-        return await _sorted_page(request, sort, seed, tag, cursor, limit)
-    where = ""
-    params: list[Any] = []
+        return await _sorted_page(request, sort, seed, tag, category, cursor, limit)
+    scope = _scope(tag, category)
+    params: dict[str, Any] = {"tag": tag, "cat": category, "limit": limit + 1}
+    where = scope
     count: int | None = None
-    if tag:
-        where = "and exists (select 1 from tags t where t.image_id = images.id and t.tag = %s)"
-        params = [tag]
     if cursor:
         micros, cid = _decode_cursor(cursor)
         where += (
-            " and (published_at, id) < (timestamptz 'epoch' + %s * interval '1 microsecond', %s)"
+            " and (published_at, id)"
+            " < (timestamptz 'epoch' + %(micros)s * interval '1 microsecond', %(cid)s)"
         )
-        params += [micros, cid]
+        params |= {"micros": micros, "cid": cid}
     async with request.app.state.pool.connection() as conn:
-        if tag and not cursor:
+        if scope and not cursor:
             # Only the first page carries the total; later pages would just repeat it.
             cur = await conn.execute(
-                f"select count(*) as n from images where {_LIVE} and exists"
-                " (select 1 from tags t where t.image_id = images.id and t.tag = %s)".encode(),
-                [tag],
+                f"select count(*) as n from images where {_LIVE} {scope}".encode(), params
             )
             count = (await cur.fetchone() or {"n": 0})["n"]
         cur = await conn.execute(
@@ -93,9 +107,9 @@ async def list_images(
             from images
             where status = 'live' and published_at is not null {where}
             order by published_at desc, id desc
-            limit %s
+            limit %(limit)s
             """.encode(),
-            [*params, limit + 1],
+            params,
         )
         rows = await cur.fetchall()
     # One extra row tells us whether another page exists without a count query.
@@ -112,7 +126,13 @@ _orders = OrderCache()
 
 
 async def _sorted_page(
-    request: Request, sort: str, seed: str, tag: str | None, cursor: str | None, limit: int
+    request: Request,
+    sort: str,
+    seed: str,
+    tag: str | None,
+    category: str | None,
+    cursor: str | None,
+    limit: int,
 ) -> dict[str, Any]:
     """A page of a computed order.
 
@@ -131,24 +151,20 @@ async def _sorted_page(
         if not token or offset < 0:
             raise HTTPException(status_code=400, detail="bad cursor")
     settings = get_settings()
-    tag_where = (
-        " and exists (select 1 from tags t where t.image_id = images.id and t.tag = %(tag)s)"
-        if tag
-        else ""
-    )
-    vp = {"tag": tag, "model": settings.embed_model, "dim": settings.embed_dim}
+    scope_where = _scope(tag, category)
+    vp = {"tag": tag, "cat": category, "model": settings.embed_model, "dim": settings.embed_dim}
     async with request.app.state.pool.connection() as conn:
         if token is not None:
             ids = _orders.get((token,))
             if ids is None:
                 raise HTTPException(status_code=410, detail="gone")
         else:
-            token, ids = await _snapshot(conn, sort, seed, tag, tag_where, vp)
+            token, ids = await _snapshot(conn, sort, seed, (tag, category), scope_where, vp)
         page = ids[offset : offset + limit]
         cur = await conn.execute(
             f"""
             select id, pub_sha, slug, width, height, blurhash, palette from images
-            where {_LIVE} {tag_where} and id = any(%(ids)s)
+            where {_LIVE} {scope_where} and id = any(%(ids)s)
             """.encode(),
             {**vp, "ids": page},
         )
@@ -160,13 +176,18 @@ async def _sorted_page(
         "items": grid_items(rows_out),
         "next_cursor": f"{token}.{nxt}" if nxt < len(ids) else None,
     }
-    if tag and not cursor:
+    if scope_where and not cursor:
         out["count"] = len(ids)
     return out
 
 
 async def _snapshot(
-    conn: Any, sort: str, seed: str, tag: str | None, tag_where: str, vp: dict[str, Any]
+    conn: Any,
+    sort: str,
+    seed: str,
+    scope: tuple[str | None, str | None],
+    scope_where: str,
+    vp: dict[str, Any],
 ) -> tuple[str, list[int]]:
     """The current order and its token, computed only when something it depends on moved."""
     # Anything that could move a picture in any order: a publish, a hide, a recrop, a
@@ -181,12 +202,14 @@ async def _snapshot(
           (select updated_at::text from corpus_stats
             where kind = 'description' and model = %(model)s) as mean,
           (select md5(string_agg(image_id::text, ',' order by image_id))
-             from tags where tag = %(tag)s) as members
+             from tags where tag = %(tag)s) as members,
+          (select md5(string_agg(image_id::text, ',' order by image_id))
+             from image_categories where category = %(cat)s) as filed
         """.encode(),
         vp,
     )
     version = tuple((await cur.fetchone() or {}).values())
-    key = repr((sort, seed if sort in SEEDED else "", tag, version))
+    key = repr((sort, seed if sort in SEEDED else "", scope, version))
     token = hashlib.sha256(key.encode()).hexdigest()[:16]
     ids = _orders.get((token,))
     if ids is not None:
@@ -194,7 +217,7 @@ async def _snapshot(
     cur = await conn.execute(
         f"""
         select id, published_at, palette, surprise from images
-        where {_LIVE} {tag_where}
+        where {_LIVE} {scope_where}
         order by published_at desc, id desc
         """.encode(),
         vp,
@@ -211,7 +234,7 @@ async def _snapshot(
             select e.image_id, e.vec::real[] as vec from embeddings e
             join images on images.id = e.image_id
             where e.kind = 'description' and e.model = %(model)s and e.dim = %(dim)s
-              and {_LIVE} {tag_where}
+              and {_LIVE} {scope_where}
             """.encode(),
             vp,
         )
@@ -316,6 +339,11 @@ async def image_detail(
             "select tag, source from tags where image_id = %s order by tag", (img["id"],)
         )
         tags = [{"tag": r["tag"], "source": r["source"]} for r in await cur.fetchall()]
+        cur = await conn.execute(
+            "select category from image_categories where image_id = %s", (img["id"],)
+        )
+        filed = {r["category"] for r in await cur.fetchall()}
+        categories = [{"slug": c, "label": LABELS[c]} for c in SLUGS if c in filed]
         votes = await vote_summary(conn, img["id"], voter_for(request))
         comments = await approved_comments(conn, img["id"])
         prev, nxt = await _adjacent(conn, img)
@@ -363,6 +391,7 @@ async def image_detail(
         "description": texts.get("description"),
         "prompt": texts.get("prompt"),
         "tags": tags,
+        "categories": categories,
         "similar": strip(nb.similar),
         "dissimilar": strip(nb.dissimilar),
         "mode": nb.mode,

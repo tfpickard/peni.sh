@@ -160,9 +160,14 @@ async def test_lone_png_goes_live(p: Any, settings: Settings) -> None:
     assert f"{img['sha256']}-480.webp" in pub_files(settings, img["sha256"])
     assert (settings.media_orig / f"{img['sha256']}.png").is_file()
     assert not present(job)
-    jobs = await q(p, "select type, payload, dedupe_key from jobs")
+    jobs = await q(p, "select type, payload, dedupe_key from jobs order by type")
     assert jobs == [
-        {"type": "haiku", "payload": {"image_id": img["id"]}, "dedupe_key": f"haiku:{img['id']}"}
+        {
+            "type": kind,
+            "payload": {"image_id": img["id"]},
+            "dedupe_key": f"{kind}:{img['id']}",
+        }
+        for kind in ("categorize", "haiku")
     ]
     stats = await q(p, "select n from corpus_stats where kind = 'description'")
     assert stats == [{"n": 1}]
@@ -356,7 +361,8 @@ async def test_crash_mid_job_then_rerun(p: Any, settings: Settings) -> None:
 
     # Re-running a finished job (dir gone) is a no-op.
     await run(job, p, settings)
-    assert len(await q(p, "select 1 from jobs")) == 1
+    # One haiku and one categorize job, not two of each.
+    assert len(await q(p, "select 1 from jobs")) == 2
 
 
 async def test_embedding_sidecar_wrong_model_ignored(p: Any, settings: Settings) -> None:

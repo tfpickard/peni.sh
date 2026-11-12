@@ -32,6 +32,7 @@ export type ImageDetail = ImageItem & {
 	description: Text | null;
 	prompt: Text | null;
 	tags: { tag: string; source: string }[];
+	categories: { slug: string; label: string }[];
 	similar: Neighbor[];
 	dissimilar: Neighbor[];
 	mode: 'raw' | 'centered';
@@ -71,13 +72,15 @@ export const getImages = (
 	f: typeof fetch = fetch,
 	tag: string | null = null,
 	sort: Sort = 'newest',
-	seed = ''
+	seed = '',
+	category: string | null = null
 ) => {
 	const q = new URLSearchParams({ limit: String(limit) });
 	if (cursor) q.set('cursor', cursor);
 	if (tag) q.set('tag', tag);
 	if (sort !== 'newest') q.set('sort', sort);
 	if (seed) q.set('seed', seed);
+	if (category) q.set('category', category);
 	return f(`/api/images?${q}`).then((r) => {
 		if (!r.ok) throw new ApiError(r.status);
 		return r.json() as Promise<ImagePage>;
@@ -91,6 +94,8 @@ export class ApiError extends Error {
 }
 
 export const getTags = () => get<{ tags: TagCount[] }>('/api/tags');
+export type Category = { slug: string; label: string; n: number; cover: ImageItem | null };
+export const getCategories = () => get<{ categories: Category[] }>('/api/categories');
 
 export const search = async (q: string): Promise<SearchResult> => {
 	const res = await fetch(`/api/search?${new URLSearchParams({ q })}`);

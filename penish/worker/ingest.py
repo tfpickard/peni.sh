@@ -357,11 +357,12 @@ async def _go_live(conn: Conn, image_id: int, base: str, surprise: float | None)
                 if went_live:
                     # Same transaction as the status flip: jobs.enqueue would use its own
                     # connection, and a crash between the two would lose the haiku forever.
-                    await conn.execute(
-                        "insert into jobs (type, payload, dedupe_key) values ('haiku', %s, %s)"
-                        " on conflict do nothing",
-                        (Jsonb({"image_id": image_id}), f"haiku:{image_id}"),
-                    )
+                    for kind in ("haiku", "categorize"):
+                        await conn.execute(
+                            "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s)"
+                            " on conflict do nothing",
+                            (kind, Jsonb({"image_id": image_id}), f"{kind}:{image_id}"),
+                        )
             return went_live
         except psycopg.errors.UniqueViolation:
             # Another image claimed the same slug between our check and the update.

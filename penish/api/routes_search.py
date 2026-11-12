@@ -1,4 +1,5 @@
-"""The tag cloud and public search: tag matches first, then nearest by embedding."""
+"""The tag cloud, the categories and public search: tag matches first, then nearest by
+embedding."""
 
 from collections import OrderedDict
 from typing import Any
@@ -8,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from penish.api import embed_client
 from penish.api.routes_images import grid_items
 from penish.api.social import RateLimit, ip_hash
+from penish.categories import CATEGORIES
 from penish.config import get_settings
 from penish.text import slugify
 
@@ -46,6 +48,37 @@ async def tag_cloud(request: Request) -> dict[str, Any]:
         )
         rows = await cur.fetchall()
     return {"tags": [{"tag": r["tag"], "n": r["n"]} for r in rows]}
+
+
+@router.get("/api/categories")
+async def categories(request: Request) -> dict[str, Any]:
+    """Every category in gallery order, empty ones too, each with its newest picture."""
+    async with request.app.state.pool.connection() as conn:
+        cur = await conn.execute(
+            f"""
+            select c.category, count(*) over (partition by c.category)::int as n,
+                   i.pub_sha, i.slug, i.width, i.height, i.blurhash, i.palette
+              from image_categories c join images i on i.id = c.image_id
+             where {_LIVE}
+             order by c.category, i.published_at desc, i.id desc
+            """.encode()
+        )
+        rows = await cur.fetchall()
+    first: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        first.setdefault(r["category"], r)
+    covers = dict(zip(first, grid_items(list(first.values())), strict=True))
+    return {
+        "categories": [
+            {
+                "slug": slug,
+                "label": label,
+                "n": first[slug]["n"] if slug in first else 0,
+                "cover": covers.get(slug),
+            }
+            for slug, label, _ in CATEGORIES
+        ]
+    }
 
 
 async def _query_vector(request: Request, q: str) -> dict[str, Any] | None:
