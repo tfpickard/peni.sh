@@ -1,4 +1,5 @@
-"""One tick of the organism: walkers, traffic, strength, budget, latch, wither.
+"""One tick of the organism: walkers, traffic, strength, budget, latch, wither, and
+the need layer's satisfaction.
 
 Pure: numpy and the standard library. The same inputs give the same state and
 the same `state_hash` on every run, which is what lets genesis replay the live
@@ -7,6 +8,10 @@ tick and the harness stand in for both.
 Edge state is keyed by directed `(src, dst)`. An edge with no state has strength
 zero; state appears the first tick an edge carries flow and goes away when it
 withers or loses a live endpoint.
+
+Satisfaction is keyed by need id (offers_needs.id), 0 unsatisfied to 1 satisfied. It
+damps a need edge's affinity at step time and is fed by the flow on the need's edges
+after every layer has stepped (`feed_needs`).
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from penish.mycelium.graph import Edge
+from penish.mycelium.graph import NEED, Edge
 from penish.mycelium.tunables import LAYERS, Tunables
 
 Pair = tuple[int, int]
@@ -68,6 +73,8 @@ class TickResult:
     states: Mapping[str, LayerState]
     reports: Mapping[str, LayerReport]
     neighbor_level: Mapping[int, float]
+    # Every need given to the tick, after feeding and drift; empty when none was.
+    satisfaction: Mapping[int, float] = field(default_factory=dict)
 
 
 def layer_key(layer: str) -> int:
@@ -126,6 +133,11 @@ def _walk(
     return flow
 
 
+def damped(affinity: float, satisfaction: float, tunables: Tunables) -> float:
+    """A need edge's affinity as the walkers see it: less the more its need is met."""
+    return affinity * (1.0 - satisfaction * tunables.need_damp)
+
+
 def step(
     state: LayerState,
     graph: Sequence[Edge],
@@ -135,8 +147,13 @@ def step(
     seed: int,
     tick: int,
     layer: str,
+    satisfaction: Mapping[int, float] | None = None,
 ) -> tuple[LayerState, LayerReport]:
-    """One layer, one tick, in the order of docs/mycelium.md."""
+    """One layer, one tick, in the order of docs/mycelium.md.
+
+    An edge that serves a need has its affinity damped by that need's `satisfaction`
+    (missing is 0). Edges without a need are untouched, bit for bit.
+    """
     t = tunables
     if state.layer != layer:
         raise ValueError(f"state is for {state.layer}, not {layer}")
@@ -164,7 +181,10 @@ def step(
         if (e.src, e.dst) in candidates:
             continue
         candidates.add((e.src, e.dst))
-        out.setdefault(e.src, []).append((e.dst, e.affinity**t.beta))
+        a = e.affinity
+        if e.need is not None:
+            a = damped(a, (satisfaction or {}).get(e.need, 0.0), t)
+        out.setdefault(e.src, []).append((e.dst, a**t.beta))
 
     # 2. Walkers.
     strength = {p: s.strength for p, s in edges.items()}
@@ -302,6 +322,45 @@ def neighbor_levels(
     return out
 
 
+def feed_needs(
+    satisfaction: Mapping[int, float],
+    graph: Sequence[Edge],
+    flow: Mapping[Pair, float],
+    tunables: Tunables,
+) -> dict[int, float]:
+    """Step 7 of the brief, "feed needs", for one tick. Pure.
+
+    A need's flow is the sum of this tick's flow (walkers and clicks) over the edges
+    that serve it. Fed first, then drift, every need given:
+
+        s += need_feed * (1 - s) * min(1, flow)
+        s -= need_drift * s
+
+    clamped to 0..1. Only needs in `satisfaction` come out; an edge naming a need not
+    given (no row to write it to) feeds nothing.
+    """
+    t = tunables
+    fed: dict[int, float] = {}
+    seen: set[Pair] = set()
+    for e in sorted(graph, key=lambda e: (e.src, e.dst)):
+        pair = (e.src, e.dst)
+        if e.need is None or pair in seen:
+            continue
+        seen.add(pair)
+        f = flow.get(pair, 0.0)
+        if f > 0.0:
+            fed[e.need] = fed.get(e.need, 0.0) + f
+    out: dict[int, float] = {}
+    for nid in sorted(satisfaction):
+        s = float(satisfaction[nid])
+        f = fed.get(nid, 0.0)
+        if f > 0.0:
+            s = s + t.need_feed * (1.0 - s) * min(1.0, f)
+        s = s - t.need_drift * s
+        out[nid] = min(1.0, max(0.0, s))
+    return out
+
+
 def run_tick(
     states: Mapping[str, LayerState],
     graphs: Mapping[str, Sequence[Edge]],
@@ -311,18 +370,29 @@ def run_tick(
     tunables: Tunables,
     seed: int,
     tick: int,
+    satisfaction: Mapping[int, float] | None = None,
 ) -> TickResult:
-    """Every layer that has state or a graph, then the neighbor level across all of them."""
+    """Every layer that has state or a graph, then the needs, then the neighbor level
+    across all layers.
+
+    Damping reads `satisfaction` as it was at the start of the tick; feeding writes the
+    result, so the order of layers never matters to it.
+    """
     live = sorted(set(live_ids))
+    sat = dict(satisfaction or {})
     new_states: dict[str, LayerState] = {}
     reports: dict[str, LayerReport] = {}
     for name in layer_order(set(states) | set(graphs)):
         prev = states.get(name) or LayerState.empty(name)
         new_states[name], reports[name] = step(
-            prev, graphs.get(name, ()), traffic, live, tunables, seed, tick, name
+            prev, graphs.get(name, ()), traffic, live, tunables, seed, tick, name, sat
         )
+    fed: dict[int, float] = {}
+    if sat:
+        flow = reports[NEED].flow if NEED in reports else {}
+        fed = feed_needs(sat, graphs.get(NEED, ()), flow, tunables)
     levels = neighbor_levels(new_states.values(), base, live, tunables)
-    return TickResult(tick, new_states, reports, levels)
+    return TickResult(tick, new_states, reports, levels, fed)
 
 
 def latched_edges(state: LayerState) -> list[tuple[int, int, float]]:
@@ -351,12 +421,27 @@ def _encode(state: LayerState) -> bytes:
     return ("\n".join(lines) + "\n").encode()
 
 
-def state_hash(state: LayerState | Mapping[str, LayerState]) -> str:
-    """sha256 over the sorted edge state, floats written exactly with float.hex.
+def _encode_satisfaction(satisfaction: Mapping[int, float]) -> bytes:
+    lines = [
+        f"need {nid} {float(satisfaction[nid]).hex()}"
+        for nid in sorted(satisfaction)
+        if satisfaction[nid] != 0.0
+    ]
+    return ("\n".join(lines) + "\n").encode() if lines else b""
+
+
+def state_hash(
+    state: LayerState | Mapping[str, LayerState],
+    satisfaction: Mapping[int, float] | None = None,
+) -> str:
+    """sha256 over the sorted edge state, floats written exactly with float.hex, then
+    every need's satisfaction that is not zero.
 
     In a mapping a layer with no edges is skipped: an empty layer and an absent one
     step the same, and a reload from edge_state, which has no rows to name an empty
-    layer by, must hash as the state that was saved.
+    layer by, must hash as the state that was saved. A zero satisfaction is skipped
+    for the same reason: it is what a new phrase starts at, and missing means zero,
+    so a run with no needs hashes as it did before needs existed.
     """
     h = hashlib.sha256()
     if isinstance(state, LayerState):
@@ -365,4 +450,6 @@ def state_hash(state: LayerState | Mapping[str, LayerState]) -> str:
         for name in layer_order(state):
             if state[name].edges:
                 h.update(_encode(state[name]))
+    if satisfaction:
+        h.update(_encode_satisfaction(satisfaction))
     return h.hexdigest()

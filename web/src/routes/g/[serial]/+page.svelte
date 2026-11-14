@@ -65,6 +65,7 @@
 		const el = wrap;
 		const c = canvas;
 		const edges = g?.edges ?? [];
+		const layer = g?.layer ?? 'whole';
 		if (!el || !c) return;
 		const draw = () => {
 			const base = el.getBoundingClientRect();
@@ -76,7 +77,7 @@
 					y: r.top - base.top + r.height / 2
 				});
 			}
-			drawThreads(c, nodes, edges);
+			drawThreads(c, nodes, edges, layer);
 		};
 		let frame = requestAnimationFrame(draw);
 		const ro = new ResizeObserver(() => {

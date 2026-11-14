@@ -26,6 +26,7 @@ POSTS = (
     "genesis",
     "extract_all",
     "facet_source",
+    "embed_phrases",
 )
 KEYS = {
     "running",
@@ -45,6 +46,8 @@ KEYS = {
     "colonies",
     "events",
     "facets",
+    "phrases",
+    "needs",
 }
 
 
@@ -140,6 +143,8 @@ async def test_fresh_payload(client: httpx.AsyncClient) -> None:
     assert body["genesis_refused"] is None
     assert body["history"] == [] and body["series"] == [] and body["events"] == []
     assert body["colonies"] == {"forming": [], "living": []}
+    assert body["needs"] == []
+    assert body["phrases"] == {"pictures": 0, "extracted": 0, "needs": 0, "offers": 0, "queued": 0}
     names = [t["name"] for t in body["tunables"]]
     assert names == list(DEFAULTS.as_dict())
     assert set(names) == set(SPECS)
@@ -405,3 +410,127 @@ async def test_genesis_shows_in_the_payload(
     assert body["running"] is False and body["behind"] == 0
     assert body["series"] and all(s["simulated"] for s in body["series"])
     assert all(e["simulated"] for e in body["events"])
+
+
+# -- needs ------------------------------------------------------------------
+
+
+async def test_needs_in_the_payload(app: Any, client: httpx.AsyncClient, clean_db: str) -> None:
+    from tests.test_mycelium_needs import phrased
+
+    ids, needs = phrased(clean_db)
+    await running(app)
+    await run_ticks(app, 1)
+    body = (await client.get(URL)).json()
+    # Phrases with no stored extract behind them (as after a crop) still count as needs
+    # and offers, but not as phrased pictures.
+    assert body["phrases"] == {
+        "pictures": 0,
+        "extracted": 0,
+        "needs": len(ids),
+        "offers": len(ids),
+        "queued": 0,
+    }
+    listed = body["needs"]
+    assert len(listed) == len(needs)
+    assert all(set(n) == {"slug", "phrase", "satisfaction", "pull", "edges"} for n in listed)
+    # Pull desc, then slug.
+    assert [(-n["pull"], n["slug"]) for n in listed] == sorted(
+        (-n["pull"], n["slug"]) for n in listed
+    )
+    withedges = next(n for n in listed if n["edges"])
+    assert set(withedges["edges"][0]) == {"to", "offer", "affinity", "strength"}
+    assert withedges["phrase"].startswith("need ")
+    assert withedges["edges"][0]["offer"].startswith("offer ")
+
+
+async def test_a_satisfied_need_pulls_less_in_the_payload(
+    app: Any, client: httpx.AsyncClient, clean_db: str
+) -> None:
+    from tests.test_mycelium_needs import phrased
+
+    ids, needs = phrased(clean_db)
+    await running(app)
+    await run_ticks(app, 1)
+    # The tick fed some needs already; compare from unsatisfied.
+    sql(clean_db, "update offers_needs set satisfaction = 0")
+    before = {(n["slug"], n["phrase"]): n for n in (await client.get(URL)).json()["needs"]}
+    key = next(k for k, n in before.items() if n["edges"])
+    sql(
+        clean_db,
+        "update offers_needs o set satisfaction = 1 from images i"
+        " where i.id = o.image_id and i.slug = %s and o.phrase = %s",
+        *key,
+    )
+    after = {(n["slug"], n["phrase"]): n for n in (await client.get(URL)).json()["needs"]}
+    assert after[key]["satisfaction"] == 1.0
+    assert after[key]["pull"] < before[key]["pull"]
+    assert after[key]["pull"] == pytest.approx(before[key]["pull"] * (1 - DEFAULTS.need_damp))
+    for b, a in zip(before[key]["edges"], after[key]["edges"], strict=True):
+        assert a["to"] == b["to"]
+        assert a["affinity"] == pytest.approx(b["affinity"] * (1 - DEFAULTS.need_damp))
+    # The others pull as they did.
+    for k, n in before.items():
+        if k != key:
+            assert after[k]["pull"] == pytest.approx(n["pull"])
+
+
+async def test_needs_cap_at_two_hundred(app: Any, client: httpx.AsyncClient, clean_db: str) -> None:
+    from tests.test_mycelium_needs import AXES, phrase
+
+    pid = corpus(clean_db, 1)[0]
+    for k in range(store.NEEDS_MAX + 5):
+        phrase(clean_db, pid, "need", f"need {k:03d}", AXES[k % DIM])
+    listed = (await client.get(URL)).json()["needs"]
+    assert len(listed) == store.NEEDS_MAX == 200
+    # No edges, no pull: slug then phrase.
+    assert [n["phrase"] for n in listed] == [f"need {k:03d}" for k in range(200)]
+
+
+async def test_embed_phrases_queues_the_backfill(
+    app: Any, client: httpx.AsyncClient, clean_db: str
+) -> None:
+    from psycopg.types.json import Jsonb
+
+    extract = {
+        "subject": "a cup",
+        "setting": "a table",
+        "style": "flat light",
+        "mood": "quiet",
+        "offers": ["a handle"],
+        "needs": ["a saucer"],
+    }
+    ids = corpus(clean_db, 3)
+    for i in ids[:2]:
+        sql(
+            clean_db,
+            "insert into image_extracts (image_id, model, body) values (%s, 'm', %s)",
+            i,
+            Jsonb(extract),
+        )
+    body = (await post(client, "embed_phrases")).json()
+    assert body["phrases"]["queued"] == 2 and body["phrases"]["extracted"] == 2
+    jobs = sql(clean_db, "select payload->>'image_id' from jobs where type = 'mycelium_phrases'")
+    assert sorted(int(j) for (j,) in jobs) == ids[:2]
+    # Deduped: a second press adds nothing.
+    assert (await post(client, "embed_phrases")).json()["phrases"]["queued"] == 2
+
+
+async def test_phrased_never_exceeds_extracted(client: httpx.AsyncClient, clean_db: str) -> None:
+    from psycopg.types.json import Jsonb
+
+    from tests.test_mycelium_needs import phrased
+
+    ids, _ = phrased(clean_db, 4)
+    for i in ids[:3]:
+        sql(
+            clean_db,
+            "insert into image_extracts (image_id, model, body) values (%s, 'm', %s)",
+            i,
+            Jsonb({"subject": "a cup"}),
+        )
+    assert (await client.get(URL)).json()["phrases"]["pictures"] == 3
+    # A crop drops the extract and keeps the phrases until the re-extraction lands.
+    sql(clean_db, "delete from image_extracts where image_id = %s", ids[0])
+    got = (await client.get(URL)).json()["phrases"]
+    assert got == {"pictures": 2, "extracted": 2, "needs": 4, "offers": 4, "queued": 0}

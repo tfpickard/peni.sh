@@ -1,5 +1,7 @@
 """Admin for the organism: start and pause, tunables, regrow, reset, genesis, the facet
-source, and what it has grown.
+source, the phrase backfill, and what it has grown.
+
+Need and offer phrases appear here and nowhere public.
 
 Every route answers with the whole page state, so the client never has to guess
 what an action changed. State changes are POSTs, which `_gate` checks for the
@@ -20,7 +22,7 @@ from penish.config import get_settings
 from penish.mycelium import genesis, store
 from penish.mycelium.tunables import DEFAULTS, SPECS, TunableError, Tunables
 from penish.text import no_em_dash
-from penish.worker import facet_jobs
+from penish.worker import facet_jobs, phrase_jobs
 from penish.worker.jobs import Pool, enqueue
 
 router = APIRouter(
@@ -98,7 +100,50 @@ async def _facets(pool: Pool, conn: store.Conn, active: str) -> dict[str, Any]:
     }
 
 
+async def _phrases(conn: store.Conn) -> dict[str, Any]:
+    """How far the phrases have got: live pictures holding any under today's embed model
+    and dim, of those with a stored extract to take them from, and the jobs waiting.
+
+    A crop deletes the extract but keeps the phrases, so `pictures` counts only pictures
+    that still have an extract; otherwise the page could read `phrased 10 of 9 extracted`
+    until the re-extraction lands. `needs` and `offers` count every live phrase, since
+    those are what the walkers see."""
+    s = get_settings()
+    cur = await conn.execute(
+        """
+        select count(distinct o.image_id) filter (
+                 where exists (select 1 from image_extracts x where x.image_id = o.image_id)
+               )::int as pictures,
+               count(*) filter (where o.role = 'need')::int as needs,
+               count(*) filter (where o.role = 'offer')::int as offers
+          from offers_needs o
+          join images i on i.id = o.image_id and i.status = 'live'
+         where o.model = %(model)s and o.dim = %(dim)s and o.recipe = %(recipe)s
+        """,
+        {"model": s.embed_model, "dim": s.embed_dim, "recipe": store.PHRASE_RECIPE},
+    )
+    have = await cur.fetchone()
+    cur = await conn.execute(
+        "select count(*)::int as n from image_extracts x"
+        " join images i on i.id = x.image_id and i.status = 'live'"
+    )
+    extracted = await cur.fetchone()
+    cur = await conn.execute(
+        "select count(*)::int as n from jobs where type = %s and status in ('queued', 'running')",
+        (phrase_jobs.JOB,),
+    )
+    queued = await cur.fetchone()
+    return {
+        "pictures": have["pictures"] if have else 0,
+        "extracted": extracted["n"] if extracted else 0,
+        "needs": have["needs"] if have else 0,
+        "offers": have["offers"] if have else 0,
+        "queued": queued["n"] if queued else 0,
+    }
+
+
 async def _payload(pool: Pool, conn: store.Conn) -> dict[str, Any]:
+    settings = get_settings()
     st = await store.read_state(conn)
     current, version, _ = await store.current_tunables(conn)
     return {
@@ -121,6 +166,10 @@ async def _payload(pool: Pool, conn: store.Conn) -> dict[str, Any]:
         "colonies": await store.colonies_listing(conn),
         "events": await store.recent_events(conn, EVENTS),
         "facets": await _facets(pool, conn, st.facet_recipe),
+        "phrases": await _phrases(conn),
+        "needs": await store.needs_listing(
+            conn, model=settings.embed_model, dim=settings.embed_dim, tunables=current
+        ),
     }
 
 
@@ -211,6 +260,16 @@ async def extract_all(request: Request) -> dict[str, Any]:
     pool = _pool(request)
     # Staggered and deduped in the sweep itself; jobs over the daily cap wait for midnight.
     await facet_jobs.enqueue_unextracted(pool, get_settings())
+    async with pool.connection() as conn:
+        return await _payload(pool, conn)
+
+
+@router.post("/embed_phrases")
+async def embed_phrases(request: Request) -> dict[str, Any]:
+    pool = _pool(request)
+    # No model call: phrases are embedded from extracts already stored. Pictures with no
+    # extract are `extract all`'s. Deduped and spaced in the sweep itself.
+    await phrase_jobs.enqueue_unphrased(pool, get_settings())
     async with pool.connection() as conn:
         return await _payload(pool, conn)
 

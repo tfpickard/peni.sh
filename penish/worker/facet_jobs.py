@@ -3,7 +3,8 @@
 
 Both embed each body under its own kind (`facet:<name>/<recipe>`) with the local
 embedder. Split is free and runs for everyone from a startup sweep; extract is paid,
-capped per day, and runs at go-live and from the admin `extract all` button.
+capped per day, and runs at go-live and from the admin `extract all` button. Whatever
+writes an extract also stores its offers and needs (phrase_jobs) in the same transaction.
 
 Imports stay light (no ingest, no admin_jobs at module level): ingest and the api call
 the invalidation helpers here, and admin_jobs registers the handlers.
@@ -32,7 +33,7 @@ from penish.config import Settings
 from penish.mycelium import facets
 from penish.mycelium import store as mycelium
 from penish.text import no_em_dash
-from penish.worker import providers
+from penish.worker import phrase_jobs, providers
 from penish.worker.describe import DescribeError, call_text, output_config, parse_json
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 from penish.worker.metrics import refresh_facet_stats
@@ -213,6 +214,10 @@ async def invalidate_extract(conn: Conn, image_id: int) -> None:
     analysis. Split rows with a model set go too: they are the fallback extract call's
     reading of the same old pixels, not a cut of the analysis, and an owner-written
     analysis survives the crop's redescribe, so nothing else would replace them.
+
+    Offers and needs stay until the new extract replaces them: a need that comes back
+    with the same words keeps its satisfaction, which a delete here would throw away.
+    With the raw extract gone, the phrases backfill has nothing to rebuild them from.
     """
     await conn.execute("delete from image_extracts where image_id = %s", (image_id,))
     await conn.execute(
@@ -460,6 +465,19 @@ async def _call(
         ) from e
 
 
+async def _phrase_vectors(
+    pool: Pool, image_id: int, got: Extracted, settings: Settings, embedder: DocumentEmbedder
+) -> dict[phrase_jobs.Pair, np.ndarray] | None:
+    """Vectors for the extract's offers and needs, or None when the stored ones already
+    are exactly these under today's embed model (a re-embed of the facets alone, or a
+    re-extraction that came back with the same phrases)."""
+    want = phrase_jobs.pairs(got.offers, got.needs)
+    async with pool.connection() as conn:
+        if await phrase_jobs.current(conn, image_id, want, settings):
+            return None
+    return await phrase_jobs.embed(embedder, want, settings)
+
+
 @dataclass
 class _Write:
     recipe: str
@@ -477,11 +495,12 @@ async def _write(
     analysis: str | None = None,
     pub_sha: str | None = None,
     extracted: Extracted | None = None,
+    phrases: Mapping[phrase_jobs.Pair, np.ndarray] | None = None,
 ) -> bool:
-    """Store facets and vectors, and the raw extract when given; False if the picture is
-    gone. SoftError when the analysis (split) or the pixels (extract) changed since they
-    were read: the invalidation that came with the change may have collapsed into this
-    very job, so nothing else would replace what it is about to write.
+    """Store facets and vectors, the raw extract and the phrases when given; False if the
+    picture is gone. SoftError when the analysis (split) or the pixels (extract) changed
+    since they were read: the invalidation that came with the change may have collapsed
+    into this very job, so nothing else would replace what it is about to write.
 
     The state row is taken first, as every other embedding write takes it: a genesis
     holds it for its whole replay and checks the replay against a fresh read of these
@@ -522,6 +541,10 @@ async def _write(
                     """,
                     (image_id, extracted.model, Jsonb(extracted.raw)),
                 )
+            if phrases is not None:
+                # With the extract they were read from, so a crop (which waits on the
+                # state row and the image row) either sees both or neither.
+                await phrase_jobs.replace(conn, image_id, phrases, settings)
             for w in writes:
                 await conn.execute(
                     "delete from image_facets where image_id = %s and recipe = %s",
@@ -637,6 +660,7 @@ async def handle_split(
         waiting = await _extract_waiting(conn, image_id)
 
     extracted: Extracted | None = None
+    phrases: dict[phrase_jobs.Pair, np.ndarray] | None = None
     writes: list[_Write] = []
     if stored is not None:
         bodies, model = stored
@@ -663,6 +687,7 @@ async def handle_split(
                 await _embed(embedder, extracted.facets, settings),
             )
         )
+        phrases = await _phrase_vectors(pool, image_id, extracted, settings, embedder)
 
     vectors = await _embed(embedder, bodies, settings)
     writes.insert(0, _Write(facets.SPLIT, bodies, model, vectors))
@@ -676,6 +701,7 @@ async def handle_split(
         # stored or borrowed one), so a crop since they were read makes them stale.
         pub_sha=row["pub_sha"] if model is not None else None,
         extracted=extracted,
+        phrases=phrases,
     )
     if not done:
         return
@@ -701,9 +727,13 @@ async def handle_extract(
         if row is None or row["status"] != "live":
             log.info("extract: image %s is not live; skipping", image_id)
             return
-        if await _complete(conn, image_id, facets.EXTRACT, settings):
-            return
-        stored = await _stored_extract(conn, image_id)
+        complete = await _complete(conn, image_id, facets.EXTRACT, settings)
+        stored = None if complete else await _stored_extract(conn, image_id)
+    if complete:
+        # Facets done. An extract stored before phrases were kept, or phrases under an
+        # older embed model, are made good here without a call.
+        await phrase_jobs.backfill(pool, image_id, settings=settings, embedder=embedder)
+        return
 
     extracted: Extracted | None = None
     if stored is None:
@@ -713,6 +743,9 @@ async def handle_extract(
         # Paid for already; only the vectors are missing (a new embed model).
         got = stored
     vectors = await _embed(embedder, got.facets, settings)
+    # A re-extraction replaces the picture's phrases; those that came back unchanged keep
+    # their rows and so a need's satisfaction.
+    phrases = await _phrase_vectors(pool, image_id, got, settings, embedder)
     done = await _write(
         pool,
         image_id,
@@ -720,6 +753,7 @@ async def handle_extract(
         settings=settings,
         pub_sha=row["pub_sha"],
         extracted=extracted,
+        phrases=phrases,
     )
     if not done:
         return

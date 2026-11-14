@@ -25,8 +25,8 @@ from psycopg.types.json import Jsonb
 
 from penish.mycelium import colonies as colony
 from penish.mycelium import facets, overgrowth
-from penish.mycelium.engine import EdgeState, LayerState, Pair, layer_order
-from penish.mycelium.graph import Edge
+from penish.mycelium.engine import EdgeState, LayerState, Pair, damped, layer_order
+from penish.mycelium.graph import NEED, Edge, Phrase
 from penish.mycelium.tunables import (
     DEFAULTS,
     LAYERS,
@@ -411,6 +411,156 @@ async def set_facet_recipe(conn: Conn, recipe: str, *, model: str, dim: int) -> 
     return await read_state(conn)
 
 
+# -- offers and needs ---------------------------------------------------------
+
+# Phrases come from the extract call only (a split fallback call is stored as an
+# extract too), so this is the one recipe the need layer reads.
+PHRASE_RECIPE = facets.EXTRACT
+NEEDS_MAX = 200
+
+
+@dataclass(frozen=True, slots=True)
+class PhraseInputs:
+    """Live pictures' offer and need phrases in one (model, dim) space, by id."""
+
+    offers: list[Phrase]
+    needs: list[Phrase]
+
+
+async def load_phrases(conn: Conn, *, model: str, dim: int) -> PhraseInputs:
+    """Every phrase of a live picture under today's embed model and dim, id order.
+
+    float32 widened to float64, as for the other layers, so every reader of the same
+    rows builds the same need graph."""
+    cur = await conn.execute(
+        """
+        select o.id, o.image_id, o.role, o.vec::real[] as vec
+          from offers_needs o
+          join images i on i.id = o.image_id
+         where i.status = 'live' and o.model = %(model)s and o.dim = %(dim)s
+           and o.recipe = %(recipe)s
+         order by o.id
+        """,
+        {"model": model, "dim": dim, "recipe": PHRASE_RECIPE},
+    )
+    offers: list[Phrase] = []
+    needs: list[Phrase] = []
+    for r in await cur.fetchall():
+        p = Phrase(int(r["id"]), int(r["image_id"]), np.asarray(r["vec"], dtype=np.float64))
+        (needs if r["role"] == "need" else offers).append(p)
+    return PhraseInputs(offers, needs)
+
+
+async def load_satisfaction(conn: Conn, *, model: str, dim: int) -> dict[int, float]:
+    """Satisfaction of every need the need layer can hold: live picture, today's embed
+    model and dim, the phrase recipe. A need outside that set keeps its value untouched
+    until its picture is live again."""
+    cur = await conn.execute(
+        """
+        select o.id, o.satisfaction
+          from offers_needs o
+          join images i on i.id = o.image_id
+         where o.role = 'need' and i.status = 'live' and o.model = %(model)s
+           and o.dim = %(dim)s and o.recipe = %(recipe)s
+         order by o.id
+        """,
+        {"model": model, "dim": dim, "recipe": PHRASE_RECIPE},
+    )
+    return {int(r["id"]): float(r["satisfaction"]) for r in await cur.fetchall()}
+
+
+async def write_satisfaction(
+    conn: Conn, values: Mapping[int, float], before: Mapping[int, float] | None = None
+) -> None:
+    """Persist the tick's satisfaction. Only values that differ from `before` are sent.
+
+    The tick holds the state row, and every other writer of offers_needs takes it
+    first, so these row locks never wait on a phrase write."""
+    prev = before or {}
+    ids = sorted(i for i, v in values.items() if prev.get(i) != v)
+    if not ids:
+        return
+    await conn.execute(
+        """
+        update offers_needs o set satisfaction = v.s
+          from unnest(%(ids)s::bigint[], %(vals)s::float8[]) as v(id, s)
+         where o.id = v.id and o.role = 'need'
+        """,
+        {"ids": ids, "vals": [float(values[i]) for i in ids]},
+    )
+
+
+async def clear_satisfaction(conn: Conn) -> None:
+    """Every need back to unsatisfied. The caller holds the state row."""
+    await conn.execute("update offers_needs set satisfaction = 0 where satisfaction <> 0")
+
+
+async def needs_listing(
+    conn: Conn, *, model: str, dim: int, tunables: Tunables | None = None, limit: int = NEEDS_MAX
+) -> list[dict[str, Any]]:
+    """Admin only. `[{slug, phrase, satisfaction, pull, edges: [{to, offer, affinity,
+    strength}]}]`, by pull desc, then slug and phrase, at most `limit`.
+
+    `affinity` is what the walkers see now: the stored affinity damped by the need's
+    current satisfaction (`engine.damped`). `pull` is its sum over the need's edges, so
+    a satisfied need pulls measurably less. `strength` is the edge's in the need layer,
+    0 with no state. Live pictures only, at both ends.
+    """
+    t = await load_tunables(conn) if tunables is None else tunables
+    cur = await conn.execute(
+        """
+        select o.id, o.phrase, o.satisfaction, i.slug, i.id as image_id
+          from offers_needs o
+          join images i on i.id = o.image_id and i.status = 'live'
+         where o.role = 'need' and o.model = %(model)s and o.dim = %(dim)s
+           and o.recipe = %(recipe)s
+        """,
+        {"model": model, "dim": dim, "recipe": PHRASE_RECIPE},
+    )
+    needs = {int(r["id"]): r for r in await cur.fetchall()}
+    cur = await conn.execute(
+        """
+        select c.need_id, c.affinity, d.slug as to_slug, d.id as dst, f.phrase as offer,
+               coalesce(s.strength, 0) as strength
+          from candidate_edges c
+          join images d on d.id = c.dst and d.status = 'live'
+          join offers_needs f on f.id = c.offer_id
+          left join edge_state s on s.layer = c.layer and s.src = c.src and s.dst = c.dst
+         where c.layer = %(layer)s and c.need_id is not null
+         order by c.src, c.dst
+        """,
+        {"layer": NEED},
+    )
+    edges: dict[int, list[dict[str, Any]]] = {}
+    for r in await cur.fetchall():
+        nid = int(r["need_id"])
+        if nid not in needs:
+            continue
+        sat = float(needs[nid]["satisfaction"])
+        edges.setdefault(nid, []).append(
+            {
+                "to": str(r["to_slug"] or r["dst"]),
+                "offer": r["offer"],
+                "affinity": damped(float(r["affinity"]), sat, t),
+                "strength": float(r["strength"]),
+            }
+        )
+    out: list[dict[str, Any]] = []
+    for nid, r in needs.items():
+        mine = sorted(edges.get(nid, []), key=lambda e: (-e["affinity"], e["to"]))
+        out.append(
+            {
+                "slug": str(r["slug"] or r["image_id"]),
+                "phrase": r["phrase"],
+                "satisfaction": float(r["satisfaction"]),
+                "pull": math.fsum(e["affinity"] for e in mine),
+                "edges": mine,
+            }
+        )
+    out.sort(key=lambda n: (-n["pull"], n["slug"], n["phrase"]))
+    return out[:limit]
+
+
 async def live_slugs(conn: Conn) -> dict[int, str]:
     """Every live picture, id to slug, in id order."""
     cur = await conn.execute("select id, slug from images where status = 'live' order by id")
@@ -434,23 +584,36 @@ async def replace_candidate_edges(conn: Conn, layer: str, edges: Sequence[Edge])
         return
     async with (
         conn.cursor() as cur,
-        cur.copy("copy candidate_edges (layer, src, dst, raw, affinity) from stdin") as cp,
+        cur.copy(
+            "copy candidate_edges (layer, src, dst, raw, affinity, need_id, offer_id) from stdin"
+        ) as cp,
     ):
         for e in edges:
             if e.layer != layer:
                 raise ValueError(f"edge for {e.layer} in {layer}")
-            await cp.write_row((layer, e.src, e.dst, float(e.raw), float(e.affinity)))
+            await cp.write_row(
+                (layer, e.src, e.dst, float(e.raw), float(e.affinity), e.need, e.offer)
+            )
 
 
 async def load_candidate_edges(conn: Conn) -> dict[str, list[Edge]]:
     """Every layer's candidates, sorted by (src, dst) as graph.candidate_edges returns them."""
     cur = await conn.execute(
-        "select layer, src, dst, raw, affinity from candidate_edges order by layer, src, dst"
+        "select layer, src, dst, raw, affinity, need_id, offer_id"
+        " from candidate_edges order by layer, src, dst"
     )
     out: dict[str, list[Edge]] = {}
     for r in await cur.fetchall():
         out.setdefault(r["layer"], []).append(
-            Edge(r["layer"], int(r["src"]), int(r["dst"]), float(r["raw"]), float(r["affinity"]))
+            Edge(
+                r["layer"],
+                int(r["src"]),
+                int(r["dst"]),
+                float(r["raw"]),
+                float(r["affinity"]),
+                None if r["need_id"] is None else int(r["need_id"]),
+                None if r["offer_id"] is None else int(r["offer_id"]),
+            )
         )
     return out
 
@@ -1011,6 +1174,8 @@ async def wipe_network(conn: Conn, *, levels: bool = True) -> None:
     """
     for table in NETWORK_TABLES:
         await conn.execute(f"delete from {table}".encode())
+    # Satisfaction is the need layer's state, so it goes with the edges.
+    await clear_satisfaction(conn)
     if levels:
         await clear_neighbor_levels(conn)
     await save_state(conn, last_tick=None, colonies=None, simulated_through=None, graph_dirty=True)
@@ -1069,6 +1234,7 @@ async def reset(conn: Conn) -> str:
             return "full"
         await conn.execute("delete from edge_state")
         await conn.execute("delete from mycelium_traffic")
+        await clear_satisfaction(conn)
         await clear_neighbor_levels(conn)
         prev = st.colonies_state()
         new = copy.deepcopy(prev)

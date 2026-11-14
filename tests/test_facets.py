@@ -369,7 +369,8 @@ async def test_extract_stores_raw_facets_and_vectors(p: Any, settings: Settings)
     assert set(schema["required"]) == set(schema["properties"])
     assert schema["additionalProperties"] is False
     assert call["messages"][0]["content"][0]["source"]["media_type"] == "image/webp"
-    assert emb.calls == [[CLEAN[f] for f in facets.FACETS]]
+    # The facets, then the offers and needs (test_mycelium_phrases.py).
+    assert emb.calls == [[CLEAN[f] for f in facets.FACETS], clean(REPLY)[1] + clean(REPLY)[2]]
 
     raw = await q(p, "select model, body from image_extracts where image_id = %s", a)
     assert raw == [{"model": call["model"], "body": REPLY}]

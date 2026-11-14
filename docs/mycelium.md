@@ -55,6 +55,9 @@ defaults.
 | `candidates` | 8 | Nearest neighbors per picture per layer |
 | `affinity_floor` | 0.05 | Lowest affinity after rescale |
 | `facet_bonus` | 0.15 | Score bonus in a facet layer for a pair close in that facet and far apart in another (Increment 3) |
+| `need_damp` | 0.8 | How much a fully satisfied need's edges pull less: affinity times `1 - satisfaction * need_damp` (Increment 5) |
+| `need_feed` | 0.05 | Share of the way to satisfied a need moves in a tick whose edges carried flow 1 or more |
+| `need_drift` | 0.002 | Share of its satisfaction every need loses each tick |
 | `walkers` | 1 | Walkers released per picture per layer per tick |
 | `steps` | 3 | Steps per walker |
 | `alpha` | 1.0 | Weight on existing strength |
@@ -1258,3 +1261,256 @@ open list never continues into the next column.
 Under the tags: `in` and the galleries the picture is in now, then `was in`
 and the ones it was in, plain links in the API's order. Either line is left out
 when empty.
+
+## Increment 5
+
+Needs and offers: the `need` layer. Each picture's extract carries a few short
+phrases of what it offers and what it needs; a need of A close to an offer of B
+grows a directed edge A to B. A need whose edges carry flow moves toward
+satisfied, and a satisfied need pulls less, which is the layer's negative
+feedback. Phrases are admin-only: no public payload names one.
+
+### Tables (`migrations/012_offers_needs.sql`)
+
+| Table or column | Shape | Notes |
+|---|---|---|
+| `offers_needs` | `id bigserial` pk, `image_id` (cascade), `role` in (offer, need), `phrase text`, `vec vector`, `model`, `dim`, `recipe` default `extract` (check split, extract), `satisfaction double precision` default 0 in 0..1, `created_at`; unique `(image_id, role, phrase, recipe)`; `vector_dims(vec) = dim`; an offer's satisfaction is always 0 | Indexed on `(role, model, dim)`. In the `tests/conftest.py` truncate list |
+| `candidate_edges.need_id`, `offer_id` | `bigint null references offers_needs on delete cascade`, partial indexes | Set on need edges only: the need of `src` the edge serves and the offer of `dst` that answers it. A phrase that goes takes its edges with it |
+
+Down drops both columns, the need layer's candidates and edge state, then the
+table.
+
+Writers: the worker's phrase jobs write phrases and vectors; only the tick
+writes `satisfaction` (plus `store.wipe_network` and `store.reset`, which set it
+back to 0 under the state row). Every write to `offers_needs` other than the
+tick's takes the `mycelium_state` row first (`store.mark_dirty`), as every
+embedding write does: the tick holds that row while it reads phrases and updates
+satisfaction, the cascade into `candidate_edges` touches rows the tick writes,
+and a genesis compares nothing about the need layer but holds the row for its
+whole run. The mark also tells the next tick to rebuild the need candidates.
+
+### Need edges (`graph.need_edges`)
+
+Pure. Input: the need and offer phrases (`graph.Phrase(id, image, vec)`) of live
+pictures under today's embed model and dim, recipe `extract`
+(`store.load_phrases`, float32 widened to float64).
+
+- Closeness is the raw cosine of a need vector and an offer vector. Nothing in
+  the repo centers phrase vectors, and a mean over needs or offers would move
+  one side of the comparison only, so the layer is never centered.
+- For each pair (A, B), B != A, the best (need of A, offer of B) stands for the
+  pair: highest cosine, ties to the lower need id, then the lower offer id.
+- Each A keeps its `candidates` best B, ties to the lower B id. A picture with
+  offers and no needs has no outgoing need edge.
+- `Edge(layer='need', src=A, dst=B, raw=cosine, affinity, need, offer)`;
+  affinity is the quantile of `raw` among all the layer's edges floored at
+  `affinity_floor`, exactly as on the other layers. Sorted by (src, dst).
+- Fewer than `min_size` pictures holding any phrase: no edges.
+- Exact, one picture's needs at a time against every offer, so memory stays at
+  needs of one picture times all offers.
+
+`Edge` gains `need: int | None = None` and `offer: int | None = None`, None on
+every other layer, so their edges compare and hash as before.
+
+`tick.GRAPH_LAYERS = (*ACTIVE_LAYERS, 'need')`: a rebuild writes all six;
+`tick.build_need_graph(store.PhraseInputs, tunables)`. `ACTIVE_LAYERS` stays the
+five layers genesis replays. The need tunables are not in `GRAPH_TUNABLES`:
+`candidates`, `affinity_floor` and `min_size` already are, and nothing else
+changes who may grow toward whom.
+
+### Damping (`engine.damped`, engine step 2)
+
+At step time, an edge with a need sees
+
+```
+affinity * (1 - satisfaction[need] * need_damp)
+```
+
+with the need's satisfaction as it was at the start of the tick (missing is 0).
+The floor is applied before the damping, as pinned, so a satisfied need's edges
+can sit below `affinity_floor`. Damping lives in the engine rather than the
+stored graph so a change of satisfaction or of `need_damp` needs no rebuild.
+Edges without a need are untouched bit for bit: the golden hashes are unchanged.
+
+### Feeding and drift (`engine.feed_needs`, step 7 "feed needs")
+
+After every layer has stepped, for each need given to the tick, in id order:
+
+```
+flow = sum over the need's edges (deduped by pair) of this tick's flow, walkers and clicks
+if flow > 0: s += need_feed * (1 - s) * min(1, flow)
+s -= need_drift * s
+clamp 0..1
+```
+
+Feed first, then drift. A need on no edge only drifts. An edge naming a need
+not given to the tick feeds nothing (there is no row to write). Pure and
+ordered, so the same inputs give the same floats.
+
+`engine.run_tick(..., satisfaction=None)` and `tick.step(..., layers=None,
+satisfaction=None)` take every need's satisfaction at the start of the tick;
+`TickResult.satisfaction` is the result, empty when none was given.
+
+### State hash
+
+`engine.state_hash(states, satisfaction=None)` appends, after the edge state,
+one line per need whose satisfaction is not 0: `need <id> <float.hex>`, in id
+order. A zero is skipped for the reason an empty layer is: missing means zero,
+a new phrase starts there, and a run with no needs hashes exactly as before. The
+tick stores `state_hash(states, satisfaction)`; a reload of `edge_state` and
+`store.load_satisfaction` hashes the same (double precision round trips).
+
+### The tick (`tick.py`, `store.py`)
+
+Inside the one tick transaction, after the state row is locked:
+
+- On a rebuild, `store.load_phrases` and `build_need_graph`, written with the
+  other layers (`replace_candidate_edges` now stores `need_id`, `offer_id`;
+  `load_candidate_edges` reads them back). A stored need edge with an endpoint
+  that is no longer live makes the graph stale as on any layer.
+- `store.load_satisfaction(model=, dim=)`: needs of live pictures under the
+  embed model and dim, recipe `extract`. A need outside that set (its picture
+  unpublished) keeps its value untouched and is not in the hash until it is back.
+- After stepping, `store.write_satisfaction(new, before)` updates only the values
+  that changed.
+- The need layer steps once it has candidates (`tick.stepping`), like a facet
+  layer. Its tick stats add `needs` (count given) and `mean_satisfaction`.
+
+Unpublished and other non-live pictures never hold a need edge: phrases are read
+for live pictures only and the engine drops edges whose ends are not live.
+
+### Colonies on the need layer
+
+Nothing new: need edges are directed in the engine (no reverse edge, so a need
+edge is fused only when both pictures need what the other offers), and colonies
+group latched edges as undirected pairs, strength the larger direction, as on
+every layer. Need galleries are `layer = 'need'`, kind word `need`.
+
+### No simulated past
+
+Genesis never replays the need layer. Satisfaction is a history of walkers on
+need edges, and phrases are recent while publish dates are not, so a replay
+would invent it. A full genesis wipes the need layer with the rest of the
+network (`wipe_network` also sets every satisfaction back to 0), replays the
+five active layers as before, and at the end writes today's need candidates with
+no edge state, so the layer starts from zero on the first live tick and the
+graph stays clean. A scoped genesis leaves the need layer alone; `scope(['need'])`
+is refused as `unknown layer need`. A reset (full or public) also sets every
+satisfaction back to 0, since it clears the edge state it belongs with.
+
+### Admin read (`store.needs_listing`)
+
+`needs_listing(conn, model=, dim=, tunables=None, limit=200)` returns
+`[{slug, phrase, satisfaction, pull, edges: [{to, offer, affinity, strength}]}]`:
+needs of live pictures, `affinity` damped by the need's current satisfaction
+(`engine.damped`), `pull` its sum over the need's edges, `strength` the need
+layer's edge state (0 with none), edges to live pictures only, by affinity desc
+then slug; needs by pull desc, then slug, then phrase. A satisfied need's pull is
+its unsatisfied pull times `1 - need_damp`.
+
+### Phrases (`penish/worker/phrase_jobs.py`)
+
+Offers and needs come from the extract, cleaned by `facet_jobs.clean`
+(lowercased, deduped, five at most per role), and are embedded with the local
+embedder as documents, with no query prompt, as every other short text is
+(facets, haikus): a need is compared with an offer, both are the same kind of
+text, so they share one space. One `embed_documents` batch per picture, offers
+then needs. Recipe always `extract`.
+
+Writers, each in a transaction that takes the state row first (`mark_dirty`),
+then `images`, then extracts and phrases:
+
+1. `mycelium_extract`, with the extract it read them from (a split's fallback
+   call too).
+2. `mycelium_extract` on a picture whose facets are complete: backfills the
+   phrases without a model call and returns.
+3. Job `mycelium_phrases` (payload `{image_id}`, dedupe key
+   `mycelium_phrases:<id>`, no model call ever): rebuilds them from the stored
+   `image_extracts` row. Quiet no-op when the picture is gone or not live, has
+   no extract or one that does not parse, or already has current phrases; it
+   yields when the extract is deleted or replaced during the embed.
+
+Every writer first checks whether the stored rows already hold exactly these
+phrases under today's embed model and dim; if so nothing is written. Otherwise
+`replace` deletes the picture's rows whose (role, phrase) is gone (their need
+edges cascade) and upserts the rest, so a phrase that comes back keeps its row
+id and its satisfaction and a new one starts at 0.
+
+A crop deletes the extract, facets and their vectors but leaves the phrases;
+the re-extraction it queues replaces them. Until then the picture's need edges
+come from its old reading.
+
+`enqueue_unphrased(pool, settings)` queues a job for every live picture with a
+stored extract whose phrases are missing, different or under an older embed
+model, spaced one second apart in id order and deduped. It runs at worker start
+beside the split sweep and from the admin button below. Pictures with no
+extract are `extract all`'s.
+
+### Admin (`penish/api/admin_mycelium.py`)
+
+`GET` (and every POST) gains:
+
+```
+phrases: {pictures: int,     live pictures holding any phrase under today's embed model and dim
+                             and a stored extract
+          extracted: int,    live pictures with a stored extract
+          needs: int, offers: int,
+          queued: int}       mycelium_phrases jobs queued or running
+needs: [{slug, phrase, satisfaction, pull,
+         edges: [{to, offer, affinity, strength}]}]    store.needs_listing, at most 200
+```
+
+`pictures` counts phrases taken from a stored extract, so it never exceeds
+`extracted`: a cropped picture keeps its phrases but drops out of both counts
+until its re-extraction lands. `needs` and `offers` still count its phrases,
+since its need edges still stand.
+
+`needs` is `store.needs_listing` with today's embed model and dim and the
+tunables the payload shows, so `affinity` and `pull` are what the walkers see
+now. Floats are sent unrounded. This payload is the only place a need or offer
+phrase is ever sent.
+
+| Path | Body | Does | Errors |
+|---|---|---|---|
+| `/embed_phrases` | none | `phrase_jobs.enqueue_unphrased`: one `mycelium_phrases` per live picture whose stored extract's phrases are not current; no model call | |
+
+### Admin web (`/admin/mycelium`)
+
+Under the facet links, a line `phrased 120 of 130 extracted`, `340 needs`,
+`310 offers`, `n queued` while jobs wait, and the link `embed phrases`. At the
+bottom, `needs`: a plain table of picture (a link), need, `satisfied`, `pull`
+(three decimals) and `offers`, one line per edge: the picture it reaches (a
+link), the offer that answers, then its damped affinity and strength, dim.
+`0 needs` when empty. Types `Need`, `NeedEdge`, `Phrases` in
+`web/src/lib/api.ts`; `MyceliumAction` gains `embed_phrases`.
+
+### Public
+
+Need edges are a layer like any other in public, and never carry a phrase.
+
+- `hyphae` on the image detail reads `edge_state` only, so a need edge appears
+  as `layer: 'need'` with its strength and nothing else.
+- Need galleries list and show `layer: 'need'` (`store.public_kind`); their
+  `edges` are the need layer's, undirected, the stronger direction.
+- The reaching strip already draws `need` as its own kind (`Reach.svelte`: dots
+  of radius 1.7 every 8, against whole at 1.1 every 4.5).
+- Gallery hyphae (`galleries.drawThreads(canvas, nodes, edges, layer)`, the
+  gallery's kind word): on a need gallery every dot is 1.55 times the radius and
+  1.8 times the spacing of a whole thread, the reaching strip's ratios, so a
+  need gallery's threads read coarser and sparser. Colour and opacity are as on
+  every gallery. Facet galleries keep the whole style: a gallery page only ever
+  shows its own layer.
+
+`tests/test_public_payloads_no_phrases.py` seeds pictures with distinctive
+phrases (in `offers_needs` and in their raw extract, one with characters HTML
+and JSON escape), runs real ticks to grow need edges, makes some visible, adds a
+living and a dead need gallery with events and sparkline rows, and opens the
+public gate. It then takes every GET route from `app.routes` outside
+`/api/admin` (failing on a path parameter it cannot fill), fills `slug`,
+`serial`, `name` and the catch-all's `path` from the seeded rows (aliases,
+unknowns, `i/<slug>`, `g/<n>` included), calls each bare and once per known
+query value, and scans every JSON body (keys too), the HTML shell (each `meta`
+content, the inline haiku, the unescaped text) and every header. No phrase or
+phrase word may appear; every route must answer 200 at least once; search's
+echo of the visitor's own `q` is the one thing left out. As a control, the same
+scan of the admin payload must find them.

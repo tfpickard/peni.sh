@@ -38,6 +38,9 @@ class Tunables:
     candidates: int = 8
     affinity_floor: float = 0.05
     facet_bonus: float = 0.15
+    need_damp: float = 0.8
+    need_feed: float = 0.05
+    need_drift: float = 0.002
     walkers: int = 1
     steps: int = 3
     alpha: float = 1.0
@@ -77,6 +80,9 @@ SPECS: dict[str, Spec] = {
     "candidates": Spec(2, 32, "nearest neighbors per picture per layer"),
     "affinity_floor": Spec(0.0, 0.5, "lowest affinity after rescale"),
     "facet_bonus": Spec(0.0, 1.0, "bonus for close in one facet and far in another"),
+    "need_damp": Spec(0.0, 1.0, "how much a satisfied need pulls less"),
+    "need_feed": Spec(0.0, 1.0, "share of the way to satisfied per tick of flow"),
+    "need_drift": Spec(0.0, 0.5, "share of satisfaction lost per tick"),
     "walkers": Spec(0, 8, "walkers per picture per layer per tick"),
     "steps": Spec(1, 12, "steps per walker"),
     "alpha": Spec(0.0, 4.0, "weight on existing strength"),

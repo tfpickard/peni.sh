@@ -197,6 +197,15 @@
 			>genesis facets</button
 		>
 	</div>
+	<div class="row">
+		<span class="dim">phrased {m.phrases.pictures} of {m.phrases.extracted} extracted</span>
+		<span class="dim">{m.phrases.needs} needs</span>
+		<span class="dim">{m.phrases.offers} offers</span>
+		{#if m.phrases.queued}<span class="dim">{m.phrases.queued} queued</span>{/if}
+	</div>
+	<div class="row acts">
+		<button class="link" disabled={busy} onclick={() => act('embed_phrases')}>embed phrases</button>
+	</div>
 
 	<h2>ticks</h2>
 	{#if m.series.length > 1}
@@ -318,6 +327,34 @@
 	{:else}
 		<p class="dim">0 events</p>
 	{/if}
+
+	<h2>needs</h2>
+	{#if m.needs.length}
+		<table class="needs">
+			<thead><tr><th>picture</th><th>need</th><th>satisfied</th><th>pull</th><th>offers</th></tr></thead>
+			<tbody>
+				{#each m.needs as n (`${n.slug} ${n.phrase}`)}
+					<tr>
+						<td><a href="/i/{n.slug}">{n.slug}</a></td>
+						<td>{n.phrase}</td>
+						<td class="num">{n.satisfaction.toFixed(3)}</td>
+						<td class="num">{n.pull.toFixed(3)}</td>
+						<td>
+							{#each n.edges as e (e.to)}
+								<div>
+									<a href="/i/{e.to}">{e.to}</a>
+									{e.offer}
+									<span class="dim">{e.affinity.toFixed(3)} {e.strength.toFixed(3)}</span>
+								</div>
+							{/each}
+						</td>
+					</tr>
+				{/each}
+			</tbody>
+		</table>
+	{:else}
+		<p class="dim">0 needs</p>
+	{/if}
 {:else if note}
 	<p class="dim">{note}</p>
 {/if}
@@ -372,6 +409,12 @@
 		margin-top: 1rem;
 	}
 	.nowrap {
+		white-space: nowrap;
+	}
+	.needs td {
+		vertical-align: top;
+	}
+	.needs td div {
 		white-space: nowrap;
 	}
 	/* Tables carry more columns than a phone has; they scroll on their own. */

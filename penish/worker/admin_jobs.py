@@ -1,6 +1,6 @@
 """Jobs the admin panel enqueues: per-image regen, crop, unpublish and republish, bulk
-re-embed and re-describe, haiku growth and mycelium genesis, plus the facet jobs
-(registered here for the embedder).
+re-embed and re-describe, haiku growth and mycelium genesis, plus the facet and phrase
+jobs (registered here for the embedder).
 
 Same contract as ingest: SoftError retries, HardError fails, and an image deleted while its
 job waited is a quiet no-op rather than an error.
@@ -24,7 +24,7 @@ from penish.config import Settings
 from penish.mycelium import genesis
 from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
-from penish.worker import facet_jobs, unpublish
+from penish.worker import facet_jobs, phrase_jobs, unpublish
 from penish.worker.derive import (
     Public,
     UndecodableImage,
@@ -629,6 +629,13 @@ def _extract_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder)
     return go
 
 
+def _phrases_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await phrase_jobs.handle_phrases(job, pool=pool, settings=settings, embedder=embedder)
+
+    return go
+
+
 def _unpublish_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
     async def go(job: Job) -> None:
         await unpublish.handle_unpublish(job, pool=pool, settings=settings)
@@ -659,6 +666,7 @@ HANDLERS: dict[str, HandlerFactory] = {
     genesis.JOB: _genesis_handler,
     facet_jobs.SPLIT_JOB: _split_handler,
     facet_jobs.EXTRACT_JOB: _extract_handler,
+    phrase_jobs.JOB: _phrases_handler,
     unpublish.UNPUBLISH: _unpublish_handler,
     unpublish.REPUBLISH: _republish_handler,
     unpublish.SETTLE: _settle_handler,

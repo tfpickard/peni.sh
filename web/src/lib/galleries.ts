@@ -58,14 +58,25 @@ const dot = (a: number) => `rgba(247, 232, 217, ${a.toFixed(3)})`;
 
 type Dot = { x: number; y: number; r: number };
 
+// A need edge reaches from a picture to what answers it, and is drawn as on the
+// reaching strip: bigger dots, further apart (Reach.svelte draws need at 1.7 every 8
+// against whole at 1.1 every 4.5). Dot size and spacing, never colour.
+const KIND: Record<string, { r: number; gap: number }> = {
+	need: { r: 1.55, gap: 1.8 }
+};
+const PLAIN = { r: 1, gap: 1 };
+
 // Hyphae between member tiles: dotted, bowed a little, with the occasional knot as in
 // the Fungal letters. A stronger edge has bigger, closer, brighter dots. Each pair is
-// seeded by its slugs, so a thread keeps its shape across visits and resizes.
+// seeded by its slugs, so a thread keeps its shape across visits and resizes. `layer` is
+// the gallery's public kind word.
 export function drawThreads(
 	canvas: HTMLCanvasElement,
 	nodes: Map<string, Point>,
-	edges: GalleryEdge[]
+	edges: GalleryEdge[],
+	layer = 'whole'
 ): void {
+	const kind = KIND[layer] ?? PLAIN;
 	const w = canvas.clientWidth;
 	const h = canvas.clientHeight;
 	if (!w || !h) return;
@@ -95,8 +106,8 @@ export function drawThreads(
 		const bow = (rnd() - 0.5) * 0.3 * len;
 		const cx = (a.x + b.x) / 2 + nx * bow;
 		const cy = (a.y + b.y) / 2 + ny * bow;
-		const gap = 10 - 5.5 * s;
-		const r = 0.6 + 1.1 * s;
+		const gap = (10 - 5.5 * s) * kind.gap;
+		const r = (0.6 + 1.1 * s) * kind.r;
 		const steps = Math.max(2, Math.ceil(len / gap));
 		const dots: Dot[] = [];
 		for (let i = 0; i <= steps; i++) {

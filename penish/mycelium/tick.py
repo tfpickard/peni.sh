@@ -27,7 +27,7 @@ from psycopg_pool import AsyncConnectionPool
 from penish.config import Settings, get_settings
 from penish.mycelium import colonies as colony
 from penish.mycelium import engine, facets, store
-from penish.mycelium.graph import Edge, candidate_edges, facet_graphs
+from penish.mycelium.graph import NEED, Edge, candidate_edges, facet_graphs, need_edges
 from penish.mycelium.tunables import LAYERS, Tunables
 
 log = logging.getLogger(__name__)
@@ -37,8 +37,11 @@ Pool = AsyncConnectionPool[AsyncConnection[DictRow]]
 Latched = dict[str, list[tuple[int, int, float]]]
 
 WHOLE = "whole"
-# Every layer that has vectors today; `need` arrives with its phrases.
+# Every layer genesis replays: the whole layer and the four facets.
 ACTIVE_LAYERS: tuple[str, ...] = (WHOLE, *facets.LAYERS)
+# Every layer a rebuild writes. The need layer grows from its phrases like the others
+# but has no simulated past: genesis never replays it (docs/mycelium.md, Increment 5).
+GRAPH_LAYERS: tuple[str, ...] = (*ACTIVE_LAYERS, NEED)
 # A day of ticks; more than that behind and the clock jumps instead of replaying.
 CATCH_UP_MAX = 144
 WAKE_SECONDS = 30.0
@@ -82,6 +85,11 @@ def build_graphs(
     return {name: out.get(name, []) for name in ACTIVE_LAYERS}
 
 
+def build_need_graph(phrases: store.PhraseInputs, tunables: Tunables) -> list[Edge]:
+    """The need layer's candidates from live pictures' phrases. Never centered."""
+    return need_edges(phrases.needs, phrases.offers, tunables)
+
+
 def stepping(graphs: Mapping[str, Sequence[Edge]]) -> dict[str, Sequence[Edge]]:
     """The graphs a tick steps: the whole layer always, a facet layer once it has
     edges. A layer with no edges but old state still steps, since the engine runs
@@ -108,13 +116,17 @@ def step(
     tick: int,
     prev: colony.ColoniesState,
     layers: Collection[str] | None = None,
+    satisfaction: Mapping[int, float] | None = None,
 ) -> Stepped:
     """Engine then colonies for one tick. Pure; genesis calls it too.
 
     `layers` limits the colonies to those layers (a layer-scoped genesis); the
-    engine steps whatever it is given.
+    engine steps whatever it is given. `satisfaction` is every need's at the start of
+    the tick; genesis passes none, since the need layer has no past.
     """
-    result = engine.run_tick(states, graphs, traffic, live, base, tunables, seed, tick)
+    result = engine.run_tick(
+        states, graphs, traffic, live, base, tunables, seed, tick, satisfaction
+    )
     latched = {
         n: engine.latched_edges(s)
         for n, s in result.states.items()
@@ -148,6 +160,10 @@ def stats(
             "traffic": rep.traffic,
             "clicks": sum(traffic[p] for p in rep.traffic_flow),
         }
+        if name == NEED:
+            sat = s.result.satisfaction
+            out[name]["needs"] = len(sat)
+            out[name]["mean_satisfaction"] = math.fsum(sat.values()) / len(sat) if sat else 0.0
     return out
 
 
@@ -196,6 +212,7 @@ async def run_one(
             facet_inputs = await store.load_facet_inputs(
                 conn, recipe=st.facet_recipe, model=cfg.embed_model, dim=cfg.embed_dim
             )
+            phrases = await store.load_phrases(conn, model=cfg.embed_model, dim=cfg.embed_dim)
             built = await asyncio.to_thread(
                 build_graphs,
                 inputs,
@@ -203,7 +220,8 @@ async def run_one(
                 tunables,
                 centered_min=cfg.centered_min_images,
             )
-            for name in ACTIVE_LAYERS:
+            built[NEED] = await asyncio.to_thread(build_need_graph, phrases, tunables)
+            for name in GRAPH_LAYERS:
                 await store.replace_candidate_edges(conn, name, built[name])
             graph_version += 1
             graphs = stepping(built)
@@ -215,12 +233,25 @@ async def run_one(
         states = await store.load_edge_states(conn)
         prev = st.colonies_state()
         base = await store.base_overgrowth(conn, live, scheduled_at, tunables)
+        satisfaction = await store.load_satisfaction(conn, model=cfg.embed_model, dim=cfg.embed_dim)
 
         s = await asyncio.to_thread(
-            step, states, graphs, traffic, live, base, tunables, st.seed, tick, prev
+            step,
+            states,
+            graphs,
+            traffic,
+            live,
+            base,
+            tunables,
+            st.seed,
+            tick,
+            prev,
+            None,
+            satisfaction,
         )
 
         await store.replace_edge_states(conn, s.result.states)
+        await store.write_satisfaction(conn, s.result.satisfaction, satisfaction)
         await store.write_neighbor_levels(conn, s.result.neighbor_level)
         await store.apply_colonies(
             conn,
@@ -237,7 +268,7 @@ async def run_one(
             tick=tick,
             scheduled_at=scheduled_at,
             simulated=False,
-            state_hash=engine.state_hash(s.result.states),
+            state_hash=engine.state_hash(s.result.states, s.result.satisfaction),
             colonies_hash=colony.state_hash(s.colonies),
             stats=stats(s, live, traffic),
             tunables_version=tversion,

@@ -17,6 +17,13 @@ A genesis of some facet layers (`layers`) replays only them over the ticks alrea
 stored, at their recorded times, and is allowed after galleries are public as long
 as no colony in those layers ever had a serial. See `run_layers`.
 
+The need layer is never replayed. Satisfaction is a history of walkers crossing need
+edges, and a replay would invent one from phrases that did not exist then (extracts
+are recent, publish dates are not). A full genesis wipes it with the rest of the
+network, sets every need back to unsatisfied, and writes only today's need candidates
+at the end, so the layer starts from zero on the first live tick. A scoped genesis
+leaves it alone.
+
 One transaction holds the state row from the refusal checks to the commit: the
 wipe and the whole replay land together or not at all, and a failed run leaves
 the network as it was. Publishes, deletes and embedding writes wait on the state
@@ -38,7 +45,7 @@ from datetime import datetime
 from penish.config import Settings, get_settings
 from penish.mycelium import colonies as colony
 from penish.mycelium import engine, store, tick
-from penish.mycelium.graph import Edge
+from penish.mycelium.graph import NEED, Edge
 from penish.mycelium.tunables import TICK_SECONDS
 from penish.worker.jobs import HardError, Job, Pool
 
@@ -108,6 +115,7 @@ def scope(layers: Iterable[str] | None) -> tuple[str, ...] | None:
     if layers is None:
         return None
     chosen = set(layers)
+    # `need` is not an active layer here, so it is refused as unknown: it never replays.
     unknown = sorted(chosen - set(tick.ACTIVE_LAYERS))
     if unknown:
         raise GenesisRefused(f"unknown layer {unknown[0]}")
@@ -290,6 +298,12 @@ async def run(
 
         for name in tick.ACTIVE_LAYERS:
             await store.replace_candidate_edges(conn, name, graphs[name])
+        # Today's need candidates with no state behind them: the first live tick grows
+        # the layer from zero, and leaving them out would keep it empty until the next
+        # dirty mark, since the graph is left clean.
+        phrases = await store.load_phrases(conn, model=cfg.embed_model, dim=cfg.embed_dim)
+        need_graph = await asyncio.to_thread(tick.build_need_graph, phrases, tunables)
+        await store.replace_candidate_edges(conn, NEED, need_graph)
         await store.replace_edge_states(conn, states)
         await store.clear_neighbor_levels(conn, keep=sorted(last.result.neighbor_level))
         await store.write_neighbor_levels(conn, last.result.neighbor_level)

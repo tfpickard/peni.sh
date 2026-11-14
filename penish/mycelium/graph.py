@@ -2,7 +2,7 @@
 
 Pure: numpy and the standard library. The engine never looks at vectors, only at
 the edges built here, so a layer can be fed any id-keyed vectors (whole-picture
-embeddings, facet embeddings, or later the need layer's phrase vectors).
+embeddings, facet embeddings, or the need layer's phrase vectors).
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ from numpy.typing import NDArray
 from penish.mycelium.tunables import Tunables
 
 FloatArray = NDArray[np.float64]
+
+NEED = "need"
 
 
 class BonusMatrix:
@@ -63,6 +65,11 @@ class Edge:
     dst: int
     raw: float
     affinity: float
+    # Need layer only: the need of `src` this edge serves and the offer of `dst` that
+    # answers it (offers_needs ids). The engine damps by that need's satisfaction at
+    # step time, so a satisfied need pulls less without a rebuild.
+    need: int | None = None
+    offer: int | None = None
 
 
 def _unit_rows(x: FloatArray) -> tuple[FloatArray, NDArray[np.bool_]]:
@@ -231,3 +238,96 @@ def facet_graphs(
         )
         for name in sorted(vectors)
     }
+
+
+@dataclass(frozen=True, slots=True)
+class Phrase:
+    """One offer or need phrase: its offers_needs id, its picture and its vector."""
+
+    id: int
+    image: int
+    vec: FloatArray
+
+
+def _unit(phrases: Sequence[Phrase], dim: int) -> FloatArray:
+    if not phrases:
+        return np.zeros((0, dim), dtype=np.float64)
+    x = np.stack([np.asarray(p.vec, dtype=np.float64) for p in phrases])
+    unit, _ = _unit_rows(x)
+    return unit
+
+
+def need_edges(needs: Sequence[Phrase], offers: Sequence[Phrase], tunables: Tunables) -> list[Edge]:
+    """Directed need edges: A points to B when one of A's needs is close to one of B's
+    offers. Sorted by (src, dst).
+
+    Closeness is the raw cosine of the two phrase vectors. Nothing centers phrase
+    vectors anywhere in the repo, and a need and an offer are different kinds of
+    sentence, so a mean of either would move one side only.
+
+    For each pair (A, B), B != A, the best (need, offer) match stands for the pair:
+    highest cosine, ties to the lower need id, then the lower offer id. Each A keeps
+    its `candidates` best B, ties to the lower B id. Affinity is the quantile of that
+    cosine among all the layer's edges, floored, exactly as on the other layers;
+    damping by satisfaction is the engine's, at step time. Fewer than `min_size`
+    pictures holding any phrase: no edges.
+
+    Exact: every need against every offer, one picture's needs at a time, so memory
+    stays at (needs of one picture) x (all offers). About 5 x 5n cosines per picture.
+    """
+    pictures = {p.image for p in needs} | {p.image for p in offers}
+    if len(pictures) < tunables.min_size or len(pictures) < 2 or not needs or not offers:
+        return []
+    need_list = sorted(needs, key=lambda p: (p.image, p.id))
+    offer_list = sorted(offers, key=lambda p: (p.image, p.id))
+    dim = int(np.asarray(offer_list[0].vec).shape[0])
+    n_unit = _unit(need_list, dim)
+    o_unit = _unit(offer_list, dim)
+    o_ids = np.asarray([p.id for p in offer_list], dtype=np.int64)
+    o_img = np.asarray([p.image for p in offer_list], dtype=np.int64)
+    # Offers are grouped by picture; each group is one candidate B.
+    starts = np.flatnonzero(np.r_[True, o_img[1:] != o_img[:-1]])
+    seg_img = o_img[starts]
+    seg_of = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(o_img)]))
+    m = len(offer_list)
+    k = tunables.candidates
+
+    pairs: list[tuple[int, int, float, int, int]] = []
+    i = 0
+    while i < len(need_list):
+        a = need_list[i].image
+        j = i
+        while j < len(need_list) and need_list[j].image == a:
+            j += 1
+        mine = need_list[i:j]
+        sims: FloatArray = n_unit[i:j] @ o_unit.T
+        # Per offer: its best need, the first (lowest id) of equal ones.
+        col_need = np.argmax(sims, axis=0)
+        col_best = sims[col_need, np.arange(m)]
+        seg_best = np.maximum.reduceat(col_best, starts)
+        # Per picture B: among offers at that best, lowest need rank then lowest offer.
+        tied = col_best == seg_best[seg_of]
+        key = np.where(tied, col_need.astype(np.int64) * m + np.arange(m), np.iinfo(np.int64).max)
+        seg_key = np.minimum.reduceat(key, starts)
+        keep = seg_img != a
+        order = np.lexsort((seg_img, -seg_best))
+        picked = 0
+        for b in order:
+            if not keep[b]:
+                continue
+            col = int(seg_key[b] % m)
+            need = mine[int(seg_key[b] // m)].id
+            pairs.append((a, int(seg_img[b]), float(seg_best[b]), need, int(o_ids[col])))
+            picked += 1
+            if picked == k:
+                break
+        i = j
+    pairs.sort(key=lambda p: (p[0], p[1]))
+    if not pairs:
+        return []
+    q = quantiles(np.asarray([p[2] for p in pairs], dtype=np.float64))
+    floor = float(tunables.affinity_floor)
+    return [
+        Edge(NEED, src, dst, raw, max(floor, float(qq)), need, offer)
+        for (src, dst, raw, need, offer), qq in zip(pairs, q, strict=True)
+    ]

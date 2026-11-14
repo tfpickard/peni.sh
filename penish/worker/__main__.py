@@ -22,6 +22,7 @@ from penish.worker.facet_jobs import enqueue_unsplit
 from penish.worker.heartbeat import run_heartbeat
 from penish.worker.ingest import handle_haiku, handle_ingest
 from penish.worker.jobs import Job
+from penish.worker.phrase_jobs import enqueue_unphrased
 from penish.worker.watcher import InboxWatcher
 
 log = logging.getLogger("penish.worker")
@@ -100,6 +101,9 @@ async def main() -> None:
         n = await enqueue_unsplit(pool, settings)
         if n:
             log.info("enqueued %d pictures to split into facets", n)
+        n = await enqueue_unphrased(pool, settings)
+        if n:
+            log.info("enqueued %d pictures to embed offers and needs", n)
 
         watcher = InboxWatcher(settings, enqueue, has_job=has_job)
         await watcher.recover()

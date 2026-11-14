@@ -221,6 +221,27 @@ export type Mycelium = {
 	colonies: { forming: ColonyRow[]; living: ColonyRow[] };
 	events: ColonyEvent[];
 	facets: Facets;
+	phrases: Phrases;
+	// At most 200, by pull desc. The only place a need or offer phrase is ever sent.
+	needs: Need[];
+};
+// Live pictures holding phrases under today's embed model, of those with a stored extract.
+export type Phrases = {
+	pictures: number;
+	extracted: number;
+	needs: number;
+	offers: number;
+	queued: number;
+};
+// affinity is what the walkers see now, damped by the need's satisfaction; pull is its
+// sum over the need's edges.
+export type NeedEdge = { to: string; offer: string; affinity: number; strength: number };
+export type Need = {
+	slug: string;
+	phrase: string;
+	satisfaction: number;
+	pull: number;
+	edges: NeedEdge[];
 };
 export type FacetRecipe = 'split' | 'extract';
 export type Facets = {
@@ -230,7 +251,14 @@ export type Facets = {
 	queued: { split: number; extract: number };
 	cap: { used_today: number; daily_calls: number };
 };
-export type MyceliumAction = 'start' | 'pause' | 'regrow' | 'reset' | 'genesis' | 'extract_all';
+export type MyceliumAction =
+	| 'start'
+	| 'pause'
+	| 'regrow'
+	| 'reset'
+	| 'genesis'
+	| 'extract_all'
+	| 'embed_phrases';
 
 async function mycelium(path: string, body?: unknown): Promise<Mycelium> {
 	const res = await fetch(`/api/admin/mycelium${path}`, {
