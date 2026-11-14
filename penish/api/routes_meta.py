@@ -8,10 +8,12 @@ router = APIRouter()
 
 
 async def random_haiku(request: Request) -> dict[str, Any] | None:
-    # random() over a full scan is fine while the deck is a few hundred rows.
+    # random() over a full scan is fine while the deck is a few hundred rows. A gallery's
+    # haiku is shown on its gallery and nowhere else.
     async with request.app.state.pool.connection() as conn:
         cur = await conn.execute(
-            "select id, l1, l2, l3 from haikus where active order by random() limit 1"
+            "select id, l1, l2, l3 from haikus where active and colony_id is null"
+            " order by random() limit 1"
         )
         row = await cur.fetchone()
     if row is None:

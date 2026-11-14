@@ -27,6 +27,7 @@ POSTS = (
     "extract_all",
     "facet_source",
     "embed_phrases",
+    "naming",
 )
 KEYS = {
     "running",
@@ -48,6 +49,7 @@ KEYS = {
     "facets",
     "phrases",
     "needs",
+    "naming",
 }
 
 

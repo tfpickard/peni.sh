@@ -161,6 +161,14 @@ def _clean_lines(lines: list[str]) -> list[str]:
     return out
 
 
+# A gallery's haiku sits in the same table as the deck but is shown only on its gallery,
+# so the list labels it with the gallery's serial (null for the deck).
+_HAIKU_COLS = (
+    "id, l1, l2, l3, source::text as source, active, image_id, created_at,"
+    " (select c.serial from colonies c where c.id = haikus.colony_id) as gallery"
+)
+
+
 def _haiku(r: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": r["id"],
@@ -168,6 +176,7 @@ def _haiku(r: dict[str, Any]) -> dict[str, Any]:
         "source": r["source"],
         "active": r["active"],
         "image_id": r["image_id"],
+        "gallery": r["gallery"],
         "created_at": _iso(r["created_at"]),
     }
 
@@ -193,8 +202,8 @@ async def list_haikus(
         cur = await conn.execute(f"select count(*) as n from haikus {clause}", args)  # noqa: S608
         total = (await cur.fetchone())["n"]
         cur = await conn.execute(
-            f"select id, l1, l2, l3, source::text as source, active, image_id, created_at"  # noqa: S608
-            f" from haikus {clause} order by id desc limit %s offset %s",
+            f"select {_HAIKU_COLS} from haikus {clause}"  # noqa: S608
+            " order by id desc limit %s offset %s",
             [*args, limit, offset],
         )
         rows = await cur.fetchall()
@@ -212,7 +221,7 @@ async def create_haiku(body: HaikuIn, request: Request) -> dict[str, Any]:
         async with _pool(request).connection() as conn:
             cur = await conn.execute(
                 "insert into haikus (l1, l2, l3, source) values (%s, %s, %s, 'owner')"
-                " returning id, l1, l2, l3, source::text as source, active, image_id, created_at",
+                " returning " + _HAIKU_COLS,
                 (l1, l2, l3),
             )
             row = await cur.fetchone()
@@ -244,7 +253,7 @@ async def patch_haiku(haiku_id: int, body: HaikuPatch, request: Request) -> dict
         async with _pool(request).connection() as conn:
             cur = await conn.execute(
                 f"update haikus set {', '.join(sets)} where id = %s"  # noqa: S608
-                " returning id, l1, l2, l3, source::text as source, active, image_id, created_at",
+                " returning " + _HAIKU_COLS,
                 [*args, haiku_id],
             )
             row = await cur.fetchone()

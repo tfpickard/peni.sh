@@ -1172,6 +1172,9 @@ async def wipe_network(conn: Conn, *, levels: bool = True) -> None:
     `levels=False` leaves neighbor levels to the caller, so a long transaction does
     not hold attention rows that every view of those pictures writes.
     """
+    # A gallery haiku's colony_id is set null when the colony goes, which would turn it
+    # into a deck haiku; it goes with its gallery instead.
+    await conn.execute("delete from haikus where colony_id is not null")
     for table in NETWORK_TABLES:
         await conn.execute(f"delete from {table}".encode())
     # Satisfaction is the need layer's state, so it goes with the edges.
@@ -1189,6 +1192,12 @@ async def wipe_layers(conn: Conn, layers: Collection[str]) -> None:
     names = sorted(layers)
     await conn.execute("delete from candidate_edges where layer = any(%s)", (names,))
     await conn.execute("delete from edge_state where layer = any(%s)", (names,))
+    # None of these ever had a serial, so none was named; this only keeps a stray haiku
+    # from outliving its colony as a deck haiku, as in wipe_network.
+    await conn.execute(
+        "delete from haikus where colony_id in (select id from colonies where layer = any(%s))",
+        (names,),
+    )
     await conn.execute("delete from colonies where layer = any(%s)", (names,))
 
 

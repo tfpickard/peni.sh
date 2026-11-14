@@ -5,12 +5,16 @@
 		facetGenesis,
 		getMycelium,
 		myceliumAction,
+		regenerateName,
 		setFacetSource,
+		setGalleryTitle,
+		setNaming,
 		setTunables,
 		type ColonyRow,
 		type FacetRecipe,
 		type Mycelium,
 		type MyceliumAction,
+		type NamingGallery,
 		type TickPoint
 	} from '../../../lib/api';
 	import { sparkPoints } from '../../../lib/spark';
@@ -152,6 +156,18 @@
 		m ? !m.running && m.genesis.status !== 'queued' && m.genesis.status !== 'running' : false
 	);
 	const name = (c: ColonyRow) => c.title ?? (c.serial !== null ? `gallery ${c.serial}` : `colony ${c.id}`);
+
+	// Title edits, by serial, kept across the periodic refresh until saved.
+	let titles = $state<Record<number, string>>({});
+	const titleOf = (g: NamingGallery) => titles[g.serial] ?? g.title ?? '';
+	async function saveTitle(g: NamingGallery) {
+		const t = titleOf(g).trim();
+		await run(() => setGalleryTitle(g.serial, t));
+		if (!note) {
+			const { [g.serial]: _, ...rest } = titles;
+			titles = rest;
+		}
+	}
 </script>
 
 {#if m}
@@ -206,6 +222,48 @@
 	<div class="row acts">
 		<button class="link" disabled={busy} onclick={() => act('embed_phrases')}>embed phrases</button>
 	</div>
+
+	<h2>naming</h2>
+	<div class="row">
+		<span class:hot={m.naming.on}>{m.naming.on ? 'on' : 'off'}</span>
+		<span class="dim">{m.naming.named_today} named today</span>
+		{#if m.naming.queued}<span class="dim">{m.naming.queued} queued</span>{/if}
+	</div>
+	<div class="row acts">
+		<button disabled={busy || m.naming.on} onclick={() => run(() => setNaming(true))}>on</button>
+		<button disabled={busy || !m.naming.on} onclick={() => run(() => setNaming(false))}>off</button>
+	</div>
+	{#if m.naming.galleries.length}
+		<ul class="plain naming">
+			{#each m.naming.galleries as g (g.serial)}
+				<li>
+					<div class="row">
+						<a href="/g/{g.serial}">{g.serial}</a>
+						<input
+							value={titleOf(g)}
+							oninput={(e) => (titles[g.serial] = e.currentTarget.value)}
+							placeholder="gallery {g.serial}"
+							maxlength="60"
+							aria-label="title of gallery {g.serial}"
+						/>
+						<button class="link" disabled={busy || titleOf(g).trim() === (g.title ?? '')} onclick={() => saveTitle(g)}
+							>save</button
+						>
+						<button class="link" disabled={busy || !m.naming.on || g.queued} onclick={() => run(() => regenerateName(g.serial))}
+							>regenerate</button
+						>
+						<span class="dim">{g.state}</span>
+						<span class="dim">{g.layer}</span>
+						{#if g.title_source}<span class="dim">{g.title_source}</span>{/if}
+						{#if g.queued}<span class="dim">queued</span>{/if}
+					</div>
+					{#if g.haiku}<p class="members dim">{g.haiku.join(' / ')}</p>{/if}
+				</li>
+			{/each}
+		</ul>
+	{:else}
+		<p class="dim">0 galleries</p>
+	{/if}
 
 	<h2>ticks</h2>
 	{#if m.series.length > 1}
@@ -394,6 +452,13 @@
 	}
 	.members a {
 		margin-right: 0.75rem;
+	}
+	.naming input {
+		width: 16rem;
+		max-width: 100%;
+	}
+	.naming li + li {
+		margin-top: 0.5rem;
 	}
 	.tun input {
 		width: 6rem;

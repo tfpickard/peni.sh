@@ -440,6 +440,7 @@ async def test_make_handlers(p: Any, settings: Settings) -> None:
             "mycelium_split",
             "mycelium_extract",
             "mycelium_phrases",
+            "mycelium_name",
             "unpublish",
             "republish",
             "settle_media",

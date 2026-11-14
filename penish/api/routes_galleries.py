@@ -381,6 +381,19 @@ async def _events(conn: store.Conn, colony_id: int) -> list[dict[str, Any]]:
     ]
 
 
+async def _haiku(conn: store.Conn, colony_id: int) -> dict[str, Any] | None:
+    """The haiku filed for the gallery, `{id, lines}` as /api/haiku has it: the newest
+    active one, so a regenerate replaces what the page shows and the owner can hide one
+    by deactivating it."""
+    cur = await conn.execute(
+        "select id, l1, l2, l3 from haikus where colony_id = %s and active"
+        " order by created_at desc, id desc limit 1",
+        (colony_id,),
+    )
+    r = await cur.fetchone()
+    return None if r is None else {"id": r["id"], "lines": [r["l1"], r["l2"], r["l3"]]}
+
+
 @router.get("/api/galleries/{serial}")
 async def gallery_detail(request: Request, serial: str) -> dict[str, Any]:
     n = parse_serial(serial)
@@ -413,6 +426,7 @@ async def gallery_detail(request: Request, serial: str) -> dict[str, Any]:
         out = {
             "serial": n,
             "title": gallery_title(n, r["title"]),
+            "haiku": await _haiku(conn, cid),
             "state": PUBLIC_STATES[r["state"]],
             "layer": public_kind(r["layer"]),
             "size": len(members) if not dead else _size(r),

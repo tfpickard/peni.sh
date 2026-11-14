@@ -24,7 +24,7 @@ from penish.config import Settings
 from penish.mycelium import genesis
 from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
-from penish.worker import facet_jobs, phrase_jobs, unpublish
+from penish.worker import facet_jobs, name_jobs, phrase_jobs, unpublish
 from penish.worker.derive import (
     Public,
     UndecodableImage,
@@ -636,6 +636,13 @@ def _phrases_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder)
     return go
 
 
+def _name_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await name_jobs.handle_name(job, pool=pool, settings=settings)
+
+    return go
+
+
 def _unpublish_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
     async def go(job: Job) -> None:
         await unpublish.handle_unpublish(job, pool=pool, settings=settings)
@@ -667,6 +674,7 @@ HANDLERS: dict[str, HandlerFactory] = {
     facet_jobs.SPLIT_JOB: _split_handler,
     facet_jobs.EXTRACT_JOB: _extract_handler,
     phrase_jobs.JOB: _phrases_handler,
+    name_jobs.JOB: _name_handler,
     unpublish.UNPUBLISH: _unpublish_handler,
     unpublish.REPUBLISH: _republish_handler,
     unpublish.SETTLE: _settle_handler,

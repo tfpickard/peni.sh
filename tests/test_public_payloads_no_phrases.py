@@ -400,7 +400,12 @@ async def test_no_public_payload_carries_a_phrase(app: Any, clean_db: str) -> No
 
     templates = public_gets(app)
     # The routes this increment is about must be among them.
-    for must in ("/api/images/{slug}", "/api/galleries", "/api/galleries/{serial}"):
+    for must in (
+        "/api/images/{slug}",
+        "/api/galleries",
+        "/api/galleries/{serial}",
+        "/api/mycelium",
+    ):
         assert must in templates
     ok: dict[str, int] = {t: 0 for t in templates}
     leaks: list[str] = []
@@ -444,6 +449,12 @@ async def test_no_public_payload_carries_a_phrase(app: Any, clean_db: str) -> No
         page = await c.get(f"/g/{NEED_SERIAL}")
         assert page.status_code == 200 and 'property="og:title"' in page.text
         assert (await c.get("/api/mycelium/log")).json()["events"]
+        # The map draws need edges and the need gallery, never the unpublished picture.
+        m = (await c.get("/api/mycelium")).json()
+        assert any(e["layer"] == NEED for e in m["edges"])
+        assert any(g["serial"] == NEED_SERIAL for g in m["galleries"])
+        hidden_slug = sql(clean_db, "select slug from images where id = %s", hidden)[0][0]
+        assert hidden_slug not in {n["slug"] for n in m["nodes"]}
 
     # Control: the scan does find them where they are meant to be.
     async with client(app) as c:

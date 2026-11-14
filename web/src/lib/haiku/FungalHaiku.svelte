@@ -5,7 +5,13 @@
 	import { mulberry32, randomSeed } from './rng';
 
 	// seed and gen come from the server on first load so this renders the markup it already sent.
-	let { lines, seed, gen }: { lines: string[]; seed?: number; gen?: string } = $props();
+	// tag lets a page that already has its heading show a haiku under it.
+	let {
+		lines,
+		seed,
+		gen,
+		tag = 'h1'
+	}: { lines: string[]; seed?: number; gen?: string; tag?: 'h1' | 'p' } = $props();
 
 	const gens = { noise, ou };
 
@@ -37,10 +43,10 @@
 	});
 </script>
 
-<h1 class="haiku" aria-label={lines.join(' / ')}>
+<svelte:element this={tag} class="haiku" aria-label={lines.join(' / ')}>
 	{#each rows as row}
 		<span class="haiku-line">
 			{#each row as tok}{#if typeof tok === 'string'}{tok}{:else}{#each tok as c}<span aria-hidden="true" style={c.style}>{c.ch}</span>{/each}{/if}{/each}
 		</span>
 	{/each}
-</h1>
+</svelte:element>

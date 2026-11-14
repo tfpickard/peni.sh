@@ -1,6 +1,7 @@
 <script lang="ts">
 	import Picture from '../../../lib/components/Picture.svelte';
 	import Overlap from '../../../lib/components/Overlap.svelte';
+	import FungalHaiku from '../../../lib/haiku/FungalHaiku.svelte';
 	import {
 		day,
 		days,
@@ -158,6 +159,13 @@
 		{/each}
 	{/if}
 
+	{#if g.haiku}
+		<!-- Keyed so another gallery's haiku grows its own shape rather than reusing this one's. -->
+		{#key g.haiku.id}
+			<div class="verse"><FungalHaiku lines={g.haiku.lines} tag="p" /></div>
+		{/key}
+	{/if}
+
 	{#if strength || growth}
 		<dl class="spark">
 			{#if strength && lastStrength !== null}{@render spark('strength', strength, lastStrength.toFixed(2))}{/if}
@@ -251,6 +259,9 @@
 	}
 	.line a {
 		margin-right: 0.5rem;
+	}
+	.verse {
+		margin-top: 2.5rem;
 	}
 	dl {
 		margin: 1.5rem 0 0;

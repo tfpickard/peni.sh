@@ -8,11 +8,11 @@
 	let { children }: LayoutProps = $props();
 
 	// A picture belongs to the grid it was opened from; a tag's, category's or gallery's
-	// pictures to its index.
+	// pictures to its index. The map is the galleries' own view of the network.
 	const sections = [
 		{ label: 'pictures', href: '/', under: ['/i/'] },
 		{ label: 'categories', href: '/categories', under: ['/c/'] },
-		{ label: 'galleries', href: '/galleries', under: ['/g/'] },
+		{ label: 'galleries', href: '/galleries', under: ['/g/', '/mycelium'] },
 		{ label: 'tags', href: '/tags', under: ['/t/'] },
 		{ label: 'search', href: '/search', under: [] }
 	];

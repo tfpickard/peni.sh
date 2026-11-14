@@ -1,5 +1,5 @@
 """Admin for the organism: start and pause, tunables, regrow, reset, genesis, the facet
-source, the phrase backfill, and what it has grown.
+source, the phrase backfill, naming, and what it has grown.
 
 Need and offer phrases appear here and nowhere public.
 
@@ -18,11 +18,12 @@ from pydantic import BaseModel
 
 from penish import runtime
 from penish.api.admin import _gate, require_admin
+from penish.api.routes_galleries import parse_serial
 from penish.config import get_settings
 from penish.mycelium import genesis, store
 from penish.mycelium.tunables import DEFAULTS, SPECS, TunableError, Tunables
 from penish.text import no_em_dash
-from penish.worker import facet_jobs, phrase_jobs
+from penish.worker import facet_jobs, name_jobs, phrase_jobs
 from penish.worker.jobs import Pool, enqueue
 
 router = APIRouter(
@@ -170,6 +171,7 @@ async def _payload(pool: Pool, conn: store.Conn) -> dict[str, Any]:
         "needs": await store.needs_listing(
             conn, model=settings.embed_model, dim=settings.embed_dim, tunables=current
         ),
+        "naming": await name_jobs.listing(conn),
     }
 
 
@@ -287,3 +289,60 @@ async def facet_source(body: FacetSourcePost, request: Request) -> dict[str, Any
         except store.FacetSourceRefused as e:
             raise HTTPException(status_code=400, detail=str(e)) from None
         return await _payload(_pool(request), conn)
+
+
+class NamingPost(BaseModel):
+    on: bool
+
+
+@router.post("/naming")
+async def naming(body: NamingPost, request: Request) -> dict[str, Any]:
+    pool = _pool(request)
+    async with pool.connection() as conn:
+        await name_jobs.set_naming(conn, body.on)
+    if body.on:
+        # Queue what the rate allows now rather than at the worker's next wake.
+        await name_jobs.schedule(pool)
+    async with pool.connection() as conn:
+        return await _payload(pool, conn)
+
+
+class TitlePost(BaseModel):
+    title: str
+
+
+def _serial(raw: str) -> int:
+    n = parse_serial(raw)
+    if n is None:
+        raise HTTPException(status_code=404, detail="not here")
+    return n
+
+
+@router.post("/galleries/{serial}/title")
+async def title(serial: str, body: TitlePost, request: Request) -> dict[str, Any]:
+    n = _serial(serial)
+    pool = _pool(request)
+    async with pool.connection() as conn:
+        try:
+            await name_jobs.set_title(conn, n, body.title)
+        except name_jobs.NotHere:
+            raise HTTPException(status_code=404, detail="not here") from None
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
+        return await _payload(pool, conn)
+
+
+@router.post("/galleries/{serial}/regenerate")
+async def regenerate(serial: str, request: Request) -> dict[str, Any]:
+    n = _serial(serial)
+    pool = _pool(request)
+    try:
+        await name_jobs.regenerate(pool, n)
+    except name_jobs.NamingOff:
+        raise HTTPException(status_code=400, detail="naming is off") from None
+    except name_jobs.NotHere:
+        raise HTTPException(status_code=404, detail="not here") from None
+    except name_jobs.Busy:
+        raise HTTPException(status_code=409, detail="already naming") from None
+    async with pool.connection() as conn:
+        return await _payload(pool, conn)

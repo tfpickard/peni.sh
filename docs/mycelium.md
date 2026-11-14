@@ -1514,3 +1514,282 @@ content, the inline haiku, the unescaped text) and every header. No phrase or
 phrase word may appear; every route must answer 200 at least once; search's
 echo of the visitor's own `q` is the one thing left out. As a control, the same
 scan of the admin payload must find them.
+
+## Increment 6
+
+Naming and the map.
+
+### Naming
+
+The clerk: a title and a haiku for a fruited gallery, in one call, only while the
+switch is on. Outside the tick, which never calls a model. Code in
+`penish/worker/name_jobs.py`; the prompt is `penish/prompts/mycelium_name.md`.
+
+#### Tables (`migrations/013_naming.sql`)
+
+| Table or column | Shape | Notes |
+|---|---|---|
+| `haikus.colony_id` | `bigint null references colonies on delete set null`, partial index `haikus_colony_idx` | Set on a gallery's haiku, null on the deck and on picture haikus |
+| `haikus_text_uniq` | now `where colony_id is null` | The deck dedupes on its text as before |
+| `haikus_colony_text_uniq` | `(colony_id, lower(l1 \n l2 \n l3)) where colony_id is not null` | A gallery haiku dedupes within its gallery only, so it never collides with the deck |
+| `mycelium_state.naming` | `boolean not null default false` | The switch |
+| `colony_events.kind` | adds `named`, partial index on `scheduled_at where kind = 'named'` | One per title and haiku written. Admin event list only: the public log and the gallery page list their own kinds |
+
+Down deletes gallery haikus and `named` events, restores the deck index and the
+kind check, then drops both columns.
+
+#### Where a gallery haiku shows
+
+Only on its gallery. Every haikus query was checked:
+
+- `/api/haiku` and the home shell (`routes_meta.random_haiku`), examples for
+  picture haikus and naming (`haiku.load_examples`), the growth job's examples
+  and dedupe pool (`grow.load_pool`): `colony_id is null`.
+- Picture haikus (ingest, admin regen) are written with `image_id` and no
+  `colony_id`; no public route reads a haiku by picture.
+- `/api/admin/haikus` items gain `gallery: serial|null`; the haikus page links it
+  as `gallery <n>`.
+- `on delete set null` would hand a gallery haiku to the deck, so
+  `store.wipe_network` deletes gallery haikus before the colonies and
+  `store.wipe_layers` deletes those of its colonies (none ever had a serial, so
+  none was named). `tests/conftest.py` deletes `colonies` instead of truncating
+  it, since `haikus` references it.
+
+#### Tunables
+
+| Name | Default | Bounds | Meaning |
+|---|---|---|---|
+| `name_per_day` | 3 | 0..50 | galleries named per UTC day while naming is on |
+| `name_batch` | 1 | 1..10 | naming jobs queued at once |
+
+Neither touches the graph. The daily call cap (`mycelium.daily_calls`) applies
+as well.
+
+#### The scheduler (`name_jobs.schedule`, `run_loop`)
+
+A worker task beside the tick wakes every 60 s; the admin's switch also runs it
+once when turned on. A plain read of the switch first: off, nothing (and no
+lock). Then one transaction: the state row `for update` (the lock order), the
+switch and `public_since` read again, and
+
+```
+waiting = mycelium_name jobs queued or running (regenerates included)
+room = min(name_per_day - named today - waiting, name_batch - waiting)
+```
+
+`named today` counts `named` events since UTC midnight. Up to `room` jobs are
+inserted for colonies with a serial, state alive or fading, `title_source` null,
+at least one current member that is live and has a caption, no naming job
+queued or running, and no failed one in the last day; oldest `fruited_tick`
+first, then serial. Payload `{colony_id}`, dedupe key `mycelium_name:<colony id>`.
+
+Nothing is named before galleries are public: until then every serial comes
+from a genesis that may be run again.
+
+#### The job (`mycelium_name`)
+
+Payload `{colony_id, regenerate?: true}`.
+
+1. Switch off: done, no call. Colony gone or without a serial, or (automatic)
+   no longer living or already titled: done. A regenerate takes living, fading
+   and dead galleries.
+2. Inputs, live pictures only: the current members (`left_tick` null) or, for a
+   dead gallery, `peak_members`. Their captions (at most 24, by id), the tags
+   two or more of them hold (at most 12, by count then tag), and their need
+   phrases under today's embed model and dim, recipe `extract`, with
+   satisfaction at least 0.05, which is what "being fed" means (at most 8, most
+   satisfied first). No caption: done, no call.
+3. One call: `name.model`; system is `name.prompt` with `{examples}` filled by six
+   random deck haikus; the user message lists captions, shared tags and needs
+   being fed. `output_config` is the strict schema `{title: string, haiku:
+   [string]}`, no other keys. Before each attempt (the retry included) the
+   switch is read again (off: the job ends quietly, no call) and
+   `providers.check_daily_cap` runs; usage recorded as `name`, two attempts,
+   then a retryable failure.
+4. Checks: `text.no_em_dash`, whitespace collapsed, outer quotes and a trailing
+   period dropped; the title lowercased, 1 to 60 characters, at most 8 words;
+   exactly three non-empty haiku lines of at most 60 (`haiku.MAX_LINE`). An answer
+   that contains a need phrase (whole words, any case) is refused, since the
+   title and haiku are public and phrases never are.
+5. Write, one transaction: the state row `for update`, then the colony row. The
+   switch is read again (off: the answer is dropped) and so is the colony (an
+   automatic job whose gallery the owner titled meanwhile: dropped). An owner
+   title is kept, though a regenerate still files the haiku; otherwise `title`
+   and `title_source = 'model'`. The haiku is inserted with `source = 'model'`,
+   `colony_id`, no `image_id`; the same three lines for the same gallery
+   reactivate the old row instead. Then a `named` event (tick `last_tick` or 0,
+   `scheduled_at` now, not simulated).
+
+A dead gallery keeps whatever name it had unless regenerated.
+
+#### Admin API (`penish/api/admin_mycelium.py`)
+
+`GET` (and every POST) gains
+
+```
+naming: {on, named_today, queued,
+         galleries: [{serial, state, layer, title|null, title_source: model|owner|null,
+                      haiku: [l1, l2, l3]|null, queued: bool}]}
+```
+
+living and fading first, then dead, serial descending, at most 300. `haiku` is
+the newest active one.
+
+| Path | Body | Does | Errors |
+|---|---|---|---|
+| `/naming` | `{on: bool}` | sets the switch; on also schedules at once | 422 for a non-bool |
+| `/galleries/{serial}/title` | `{title}` | state row, then colony row. Cleaned as a model title but case kept. Empty (after trimming) sets title and source back to null: `gallery <n>`, and the clerk may name it again. Otherwise `title_source = 'owner'`, which nothing automatic overwrites | 404 `not here`, 400 `title too long` past 60 |
+| `/galleries/{serial}/regenerate` | none | queues `{colony_id, regenerate: true}` for a living, fading or dead gallery; a job already queued for it becomes a regenerate. A running one is refused: its handler has read its payload, so a merge would be lost. Not held to `name_per_day`, but counts toward it and the batch, and the daily cap applies | 400 `naming is off`, 404 `not here`, 409 `already naming` |
+
+The name model is set on the models page (`name` purpose, Increment 3).
+
+#### Public
+
+- A title is `title` or `gallery <serial>`, as before, everywhere.
+- `GET /api/galleries/{serial}` gains `haiku: {id, lines}|null`, the newest active
+  haiku filed for it. Nothing else carries it: not the list, the log, the image
+  detail or the `/g/<n>` tags.
+- `/g/<n>` shows it below the state lines with `FungalHaiku` (`tag="p"`, keyed
+  by id), the one flourish. `FungalHaiku` gains `tag: 'h1' | 'p'`, default `h1`.
+
+#### Admin web
+
+`/admin/mycelium`, under the phrases: `naming`, `on` or `off`, `n named today`,
+`n queued`, buttons `on` and `off`, then a row per gallery: its serial (a link),
+a title field (placeholder `gallery <n>`), `save`, `regenerate` (disabled while
+off or queued), state, layer, source, `queued`, and the haiku dim beneath.
+`0 galleries` when empty. Types `Naming`, `NamingGallery`; `setNaming`,
+`setGalleryTitle`, `regenerateName` in `web/src/lib/api.ts`.
+
+#### Tests
+
+`tests/test_mycelium_naming.py`: answer checks (em dash, quotes, bounds, lines,
+need phrases), the prompt, inputs (live only, shared tags, fed needs), one call
+with a FakeClient and its retry, the daily cap, the switch gating the scheduler,
+the job, a regenerate and a write after the call, rate per day and batch, the
+owner title against regenerates and a call in flight, refusals, the haiku stored
+with `colony_id` and absent from the deck, examples, growth pool and home, and a
+dead gallery named from its peak. Also: the switch going off while the first call
+is out stops the retry (one call, nothing written); an answer repeating a fed
+need is refused through the real call path (both leak: the job fails and writes
+nothing; only the first: the retry is stored); a gallery whose job failed within
+a day is not queued, one that failed two days ago is; a regenerate joins a
+queued job (same row, `regenerate` true) and is refused with 409 `already
+naming` while one is running. `tests/conftest.py` sets the seed deck active
+again before each test, since a test here switches it off.
+
+### Map
+
+The whole network on one page, `/mycelium`, drawn static from one payload.
+
+#### Payload (`penish/api/routes_mycelium.py`)
+
+`GET /api/mycelium`, public, no parameters:
+
+    {graph_version, tick,
+     nodes:     [{slug, x, y, overgrowth, galleries: [serial]}],
+     edges:     [{a, b, layer, strength}],
+     galleries: [{serial, title, state}]}
+
+- `nodes`: every live picture (`store.live_slugs`, id order), `x` and `y` in
+  0..1 from the layout below, `overgrowth` as on the picture page
+  (`store.overgrowth_by_id`), `galleries` the serials of the living or fading
+  galleries it is a current member of (`left_tick is null`), serial order.
+  Unpublished, queued and failed pictures are not nodes, and no edge or
+  membership reaches them.
+- `edges`: visible hyphae on every layer (`whole`, `facet:<name>`, `need`),
+  one per unordered pair and layer, `a`/`b` the slugs of the lower and higher
+  id, `strength` the larger of the two directions rounded to 3 places, kept
+  only when it reaches `hypha_visible`. Sorted by layer display order
+  (`engine.layer_order`), then `a`, `b` by id. Read from `edge_state` only.
+- `galleries`: living and fading galleries with a serial, serial order,
+  `title` through `store.gallery_title` (`gallery <serial>` until named),
+  `state` the public word. Dead galleries have no current members and so no
+  shape on the map; they stay on `/galleries`.
+- Gate: before `public_since` both `galleries` and every node's `galleries`
+  are empty. Nodes and edges show regardless, as hyphae on a picture page do.
+- No need or offer phrase, extract, caption or tag is read. The route is
+  covered by `tests/test_public_payloads_no_phrases.py`.
+- Empty organism: `{graph_version: 0, tick: null, nodes: [], edges: [],
+  galleries: []}`.
+
+#### Layout (`penish/mycelium/layout.py`)
+
+Pure numpy, Fruchterman-Reingold in the unit square over the whole layer's
+candidate graph (`candidate_edges` where `layer = 'whole'`, both ends live,
+undirected, the larger affinity of the two directions as the weight). Every
+pair repels, an edge pulls in proportion to its weight, a weak pull toward the
+middle keeps a picture with no edges on the map. Start positions are drawn per
+picture from `SeedSequence([seed, id])`, so the organism's seed decides the
+map and a picture keeps roughly its place when others arrive. Iterations are
+`clamp(300_000_000 // n^2, 40, 300)`, repulsion is chunked to 2M pairs at a
+time. The result is scaled into 0..1 with its aspect kept and the short side
+centred, rounded to 4 places.
+
+Walker strengths are not an input: they change every tick, and the map moves
+only when the candidate graph is rebuilt (a new `graph_version`), or when a
+picture is published or unpublished between ticks (the live set is an input,
+so a picture that left never keeps a place).
+
+`layout.fingerprint(ids, edges, seed)` hashes exactly those inputs (weights by
+`float.hex`); layouts are kept in process memory by fingerprint, the last 4,
+and computed in a thread. Two processes, or one after a restart, compute the
+same positions bit for bit, so no table is needed.
+
+#### Caching
+
+- The whole response body is kept in memory per cache key: `last_tick`,
+  `graph_version`, `graph_dirty`, `public`, `seed`, the count and id sum of
+  live pictures, an md5 of the living and fading galleries' `serial:state:title`
+  and the newest `mycelium_tunables` version. Within one tick edge strengths
+  and overgrowth stay as they were whatever the tables do; a publish, unpublish,
+  delete or reset (which mark the graph dirty and change the live set), a title
+  written by the owner or the naming job, and a tunables change (`hypha_visible`)
+  rebuild it at once. Those last two happen outside the tick, and while the
+  network is stopped no tick would come to carry them.
+- A miss builds under one `asyncio.Lock` in a repeatable read transaction, so
+  a tick committing midway cannot mix two ticks; waiting requests take what it
+  built.
+- `Cache-Control: public, max-age=<seconds until next_due>`, at most one tick
+  (600), 0 when behind schedule, 60 while stopped (no tick will come, but a
+  publish still changes the map).
+
+#### Web (`web/src/routes/mycelium/`, `web/src/lib/map.ts`)
+
+- `getMap()` in `lib/api.ts` (`MyceliumMap`, `MapNode`, `MapEdge`,
+  `MapGallery`). A failed fetch draws as the empty map.
+- One square, `width: 100%`, `max-width: 85vh`, centred: phone and desktop
+  widths without horizontal scroll. Count line `<n> pictures`; at none it is
+  `0 pictures` and nothing else.
+- A canvas draws the edges once per size: dotted quadratic threads bowed and
+  jittered by `mulberry32(hash(a|b|layer))`, so a thread keeps its shape across
+  visits. Kinds are told apart by dot radius and spacing only, the reaching
+  strip's values (whole 1.1 every 4.5, facet 0.6 every 2.4, need 1.7 every 8);
+  strength sets opacity. No animation.
+- An SVG on top: per gallery a faint round-joined convex hull of its current
+  members in `--secondary` (fading fainter), linking to `/g/<serial>`; per
+  picture a dot dimmed by overgrowth, linking to `/i/<slug>`.
+- Pointers hit the nearest dot, not a stack of hit areas: per-dot hit circles
+  overlap on a crowded map and the one drawn last wins, so a tap on a dot would
+  open a neighbour. The picture links take no pointer events and stay for the
+  keyboard and screen readers; one capture-phase click handler on the svg finds
+  the nearest dot within 12px (`map.nearest`) and goes there (meta, ctrl or
+  shift opens a new tab), before a hull link or the router sees the click. A
+  click from the keyboard (`detail` 0) is left to the focused link. A pointer
+  near a dot turns the cursor and colours that dot `--secondary`, as focus does.
+  A tap away from every dot falls through to the hull under it.
+- `/galleries` shows `map` next to its count; the galleries nav entry lists
+  `/mycelium` under `under`, so the map highlights galleries. No new top-level
+  entry.
+
+#### Tests (`tests/test_mycelium_map.py`)
+
+Payload shape, max over directions, visibility threshold, layer order, the
+gallery gate and memberships; no phrase and no unpublished or queued picture,
+including one unpublished between ticks; the body kept within a tick and
+renewed on the next, `max-age` from `next_due`, behind and stopped; a title
+change, a cleared title and a `hypha_visible` change reaching the map at once
+while the network is stopped; positions
+unchanged across ticks and after the layout memory is cleared, changed on a
+new graph; the empty payload; the pure layout's determinism, bounds, order
+independence, fingerprint, clustering and the 0, 1 and 2 picture cases.

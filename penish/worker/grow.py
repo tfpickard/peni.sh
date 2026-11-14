@@ -160,7 +160,8 @@ async def load_pool(conn: psycopg.AsyncConnection[Any]) -> list[Haiku]:
     # Tuple rows whatever the connection's row factory, so both the CLI's plain
     # connection and the worker pool's dict-row connections work.
     async with conn.cursor(row_factory=tuple_row) as cur:
-        await cur.execute("select l1, l2, l3 from haikus where active")
+        # The deck only: a gallery's haiku is neither an example nor a duplicate to avoid.
+        await cur.execute("select l1, l2, l3 from haikus where active and colony_id is null")
         return [(a, b, c) for a, b, c in await cur.fetchall()]
 
 

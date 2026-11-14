@@ -71,6 +71,8 @@ class Tunables:
     overgrowth_tau_min_h: float = 72.0
     overgrowth_sigma: float = 0.5
     overgrowth_cap: float = 0.85
+    name_per_day: int = 3
+    name_batch: int = 1
 
     def as_dict(self) -> dict[str, float | int]:
         return dataclasses.asdict(self)
@@ -113,6 +115,8 @@ SPECS: dict[str, Spec] = {
     "overgrowth_tau_min_h": Spec(1.0, 10_000.0, "floor of the overgrowth time constant, hours"),
     "overgrowth_sigma": Spec(0.0, 4.0, "spread from hypha neighbors"),
     "overgrowth_cap": Spec(0.0, 1.0, "drawn coverage at full overgrowth"),
+    "name_per_day": Spec(0, 50, "galleries named per UTC day while naming is on"),
+    "name_batch": Spec(1, 10, "naming jobs queued at once"),
 }
 
 DEFAULTS = Tunables()

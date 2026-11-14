@@ -64,7 +64,10 @@
 <svelte:head><title>galleries -- peni.sh</title></svelte:head>
 
 {#if galleries}
-	<p class="count">{galleries.length === 1 ? '1 gallery' : `${galleries.length} galleries`}</p>
+	<p class="count">
+		<span>{galleries.length === 1 ? '1 gallery' : `${galleries.length} galleries`}</span>
+		<a href="/mycelium">map</a>
+	</p>
 	{#each groups as s (s.label)}
 		<section>
 			<h2>{s.label}</h2>
@@ -122,6 +125,9 @@
 
 <style>
 	.count {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0 1.25rem;
 		margin: 0;
 		color: var(--muted-foreground);
 	}

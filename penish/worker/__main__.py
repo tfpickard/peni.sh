@@ -1,5 +1,5 @@
-"""Worker entrypoint: the inbox watcher, the job loop, the heartbeat, the mycelium tick and
-the internal embed server, side by side in one process."""
+"""Worker entrypoint: the inbox watcher, the job loop, the heartbeat, the mycelium tick, the
+naming scheduler and the internal embed server, side by side in one process."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from penish.worker.facet_jobs import enqueue_unsplit
 from penish.worker.heartbeat import run_heartbeat
 from penish.worker.ingest import handle_haiku, handle_ingest
 from penish.worker.jobs import Job
+from penish.worker.name_jobs import run_loop as run_naming
 from penish.worker.phrase_jobs import enqueue_unphrased
 from penish.worker.watcher import InboxWatcher
 
@@ -123,6 +124,7 @@ async def main() -> None:
             ),
             run_heartbeat(pool, stop, version=settings.git_sha),
             run_mycelium(pool, stop),
+            run_naming(pool, stop),
             serve_embed(embedder, stop, port=settings.embed_server_port),
         )
         warm.cancel()

@@ -224,6 +224,24 @@ export type Mycelium = {
 	phrases: Phrases;
 	// At most 200, by pull desc. The only place a need or offer phrase is ever sent.
 	needs: Need[];
+	naming: Naming;
+};
+// title is null until named (the page shows `gallery <serial>`); title_source says who
+// wrote it. haiku is the gallery's current one.
+export type NamingGallery = {
+	serial: number;
+	state: GalleryState;
+	layer: string;
+	title: string | null;
+	title_source: 'model' | 'owner' | null;
+	haiku: string[] | null;
+	queued: boolean;
+};
+export type Naming = {
+	on: boolean;
+	named_today: number;
+	queued: number;
+	galleries: NamingGallery[];
 };
 // Live pictures holding phrases under today's embed model, of those with a stored extract.
 export type Phrases = {
@@ -288,6 +306,11 @@ export const setTunables = (values: Record<string, number>, note: string | null)
 export const setFacetSource = (recipe: FacetRecipe) => mycelium('/facet_source', { recipe });
 // Only facet layers: a replay of those alone, allowed after galleries are public.
 export const facetGenesis = (layers: string[]) => mycelium('/genesis', { layers });
+export const setNaming = (on: boolean) => mycelium('/naming', { on });
+// An empty title gives the gallery back its serial name.
+export const setGalleryTitle = (serial: number, title: string) =>
+	mycelium(`/galleries/${serial}/title`, { title });
+export const regenerateName = (serial: number) => mycelium(`/galleries/${serial}/regenerate`, {});
 
 // Galleries. Mirrors penish/api/routes_galleries.py; nothing is served before the first
 // gallery is public, so every list here may simply be empty.
@@ -332,6 +355,8 @@ export type GalleryEvent = {
 };
 export type GalleryShare = GalleryRef & { n: number };
 export type Gallery = GalleryRef & {
+	// The haiku filed for the gallery when it was named, as /api/haiku has one.
+	haiku: Haiku | null;
 	state: GalleryState;
 	layer: string;
 	size: number;
@@ -381,3 +406,31 @@ export const getGallery = (serial: string, f: typeof fetch = fetch) =>
 
 export const getMyceliumLog = (before: number | null = null) =>
 	get<MyceliumLog>(`/api/mycelium/log${before === null ? '' : `?before=${before}`}`);
+
+// The map. Mirrors penish/api/routes_mycelium.py: positions in 0..1 from a layout that
+// moves only when the candidate graph is rebuilt; edges are the visible hyphae, one per
+// pair and layer; galleries stay empty until the first one is public.
+export type MapNode = {
+	slug: string;
+	x: number;
+	y: number;
+	overgrowth: number;
+	// Serials of the living or fading galleries the picture is in now.
+	galleries: number[];
+};
+// layer is whole, facet:<name> or need, as on hyphae.
+export type MapEdge = { a: string; b: string; layer: string; strength: number };
+export type MapGallery = GalleryRef & { state: GalleryState };
+export type MyceliumMap = {
+	graph_version: number;
+	tick: number | null;
+	nodes: MapNode[];
+	edges: MapEdge[];
+	galleries: MapGallery[];
+};
+
+export const getMap = (f: typeof fetch = fetch) =>
+	f('/api/mycelium').then((r) => {
+		if (!r.ok) throw new ApiError(r.status);
+		return r.json() as Promise<MyceliumMap>;
+	});
