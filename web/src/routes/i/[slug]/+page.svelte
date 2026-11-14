@@ -217,6 +217,13 @@
 			{p.text}
 		</p>
 	{/each}
+	{#if image.categories?.length}
+		<p class="cats">
+			{#each image.categories as c (c.slug)}
+				<a href="/c/{c.slug}">{c.label}</a>{' '}
+			{/each}
+		</p>
+	{/if}
 	{#if image.tags.length}
 		<p class="tags">
 			{#each image.tags as t (t.tag)}
@@ -286,6 +293,12 @@
 		font-variant-caps: all-small-caps;
 		letter-spacing: 0.06em;
 		color: var(--muted-foreground);
+	}
+	.cats {
+		margin: 1.5rem 0 0;
+	}
+	.cats a {
+		margin-right: 1rem;
 	}
 	.tags {
 		margin: 1.5rem 0 0;
