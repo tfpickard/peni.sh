@@ -309,3 +309,45 @@ async def test_pub_sha_defaults_to_sha256(clean_db: str) -> None:
             (sha(77),),
         ).fetchone()
     assert row == (sha(77),)
+
+
+async def test_detail_hyphae(client: httpx.AsyncClient, clean_db: str) -> None:
+    me = add_image(clean_db, 1, vec=unit(0))
+    a = add_image(clean_db, 2, vec=unit(0, 1))
+    b = add_image(clean_db, 3, vec=unit(5))
+    c = add_image(clean_db, 4, vec=unit(6))
+    weak = add_image(clean_db, 5, vec=unit(7))
+    hidden = add_image(clean_db, 6, vec=unit(8), status="queued")
+    r = await client.get("/api/images/img-1")
+    # Stopped with no state: nothing reaches.
+    assert r.json()["hyphae"] == []
+    with psycopg.connect(clean_db) as conn:
+        for layer, src, dst, s in (
+            ("whole", me, a, 0.2),
+            # The stronger direction and layer of a pair wins.
+            ("whole", a, me, 0.45),
+            ("facet:mood", me, a, 0.3),
+            ("whole", b, me, 0.6),
+            ("facet:style", me, c, 0.2),
+            ("whole", me, weak, 0.149),
+            ("whole", me, hidden, 0.9),
+            ("whole", a, b, 0.9),
+        ):
+            conn.execute(
+                "insert into edge_state (layer, src, dst, strength, latched, fatigue, fused,"
+                " idle) values (%s, %s, %s, %s, false, 0, false, 0)",
+                (layer, src, dst, s),
+            )
+        conn.commit()
+    body = (await client.get("/api/images/img-1")).json()
+    got = body["hyphae"]
+    assert [(h["slug"], h["strength"], h["layer"]) for h in got] == [
+        ("img-3", 0.6, "whole"),
+        ("img-2", 0.45, "whole"),
+        ("img-4", 0.2, "facet:style"),
+    ]
+    assert set(got[0]) == {"slug", "score", "blurhash", "src", "overgrowth", "strength", "layer"}
+    assert got[0]["score"] == 0.6
+    assert got[0]["src"] == f"/media/pub/{sha(3)}-480.webp"
+    assert got[0]["blurhash"] == "LEHV6n"
+    assert 0 <= got[0]["overgrowth"] <= 1

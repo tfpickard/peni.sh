@@ -1,5 +1,5 @@
-"""Worker entrypoint: the inbox watcher, the job loop, the heartbeat and the internal embed
-server, side by side in one process."""
+"""Worker entrypoint: the inbox watcher, the job loop, the heartbeat, the mycelium tick and
+the internal embed server, side by side in one process."""
 
 from __future__ import annotations
 
@@ -12,14 +12,17 @@ from pathlib import Path
 
 from penish.config import get_settings
 from penish.db import make_pool
+from penish.mycelium.tick import run_loop as run_mycelium
 from penish.worker import jobs
 from penish.worker.admin_jobs import make_handlers
 from penish.worker.categorize import enqueue_uncategorized, handle_categorize
 from penish.worker.embed import Embedder
 from penish.worker.embed_server import serve as serve_embed
+from penish.worker.facet_jobs import enqueue_unsplit
 from penish.worker.heartbeat import run_heartbeat
 from penish.worker.ingest import handle_haiku, handle_ingest
 from penish.worker.jobs import Job
+from penish.worker.phrase_jobs import enqueue_unphrased
 from penish.worker.watcher import InboxWatcher
 
 log = logging.getLogger("penish.worker")
@@ -47,6 +50,7 @@ async def main() -> None:
         settings.failed,
         settings.media_orig,
         settings.media_pub,
+        settings.media_held,
     ):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -94,6 +98,12 @@ async def main() -> None:
         n = await enqueue_uncategorized(pool)
         if n:
             log.info("enqueued %d pictures to categorize", n)
+        n = await enqueue_unsplit(pool, settings)
+        if n:
+            log.info("enqueued %d pictures to split into facets", n)
+        n = await enqueue_unphrased(pool, settings)
+        if n:
+            log.info("enqueued %d pictures to embed offers and needs", n)
 
         watcher = InboxWatcher(settings, enqueue, has_job=has_job)
         await watcher.recover()
@@ -112,6 +122,7 @@ async def main() -> None:
                 concurrency=2,
             ),
             run_heartbeat(pool, stop, version=settings.git_sha),
+            run_mycelium(pool, stop),
             serve_embed(embedder, stop, port=settings.embed_server_port),
         )
         warm.cancel()

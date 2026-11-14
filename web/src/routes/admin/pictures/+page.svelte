@@ -149,6 +149,7 @@
 		<option value="pending_enrichment">pending_enrichment</option>
 		<option value="processing">processing</option>
 		<option value="failed">failed</option>
+		<option value="unpublished">unpublished</option>
 	</select>
 	<select aria-label="sort" bind:value={sort} onchange={reload}>
 		<option value="new">new</option>

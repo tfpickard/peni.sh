@@ -167,7 +167,8 @@ async def test_lone_png_goes_live(p: Any, settings: Settings) -> None:
             "payload": {"image_id": img["id"]},
             "dedupe_key": f"{kind}:{img['id']}",
         }
-        for kind in ("categorize", "haiku")
+        # Facets ride the go-live transaction too; neither delays the publish.
+        for kind in ("categorize", "haiku", "mycelium_extract", "mycelium_split")
     ]
     stats = await q(p, "select n from corpus_stats where kind = 'description'")
     assert stats == [{"n": 1}]
@@ -361,8 +362,8 @@ async def test_crash_mid_job_then_rerun(p: Any, settings: Settings) -> None:
 
     # Re-running a finished job (dir gone) is a no-op.
     await run(job, p, settings)
-    # One haiku and one categorize job, not two of each.
-    assert len(await q(p, "select 1 from jobs")) == 2
+    # One haiku, categorize, extract and split job, not two of each.
+    assert len(await q(p, "select 1 from jobs")) == 4
 
 
 async def test_embedding_sidecar_wrong_model_ignored(p: Any, settings: Settings) -> None:

@@ -72,6 +72,9 @@ services:
       DATABASE_URL: *db-url
       DATA_DIR: /data
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
       SECRET_KEY: ${SECRET_KEY:-}
       # Leaves a core free for the db and api on the 4-core box.
       EMBED_THREADS: "3"

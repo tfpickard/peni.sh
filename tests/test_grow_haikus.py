@@ -117,14 +117,20 @@ async def test_insert_source_model(clean_db: str) -> None:
         assert await cur.fetchall() == [("model", None)]
 
 
-async def test_dry_run_inserts_nothing(clean_db: str, capsys: pytest.CaptureFixture[str]) -> None:
+async def test_dry_run_inserts_nothing(
+    clean_db: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     async with await psycopg.AsyncConnection.connect(clean_db) as conn:
         before = len(await gh.load_pool(conn))
     args = SimpleNamespace(n=1, batch=5, dry_run=True, model="m")
     h = ["moss in the mailbox", "the postman sorts around it", "tuesday, as usual"]
-    gh.anthropic.AsyncAnthropic = lambda **_: FakeClient(reply(h))
-    gh.embeddings_available = lambda: False
-    gh.get_settings = lambda: Settings(database_url=clean_db, anthropic_api_key="t")
+    # monkeypatch, not assignment: gh.anthropic is the real module, and a lambda left in
+    # place of AsyncAnthropic breaks every later isinstance check against it.
+    monkeypatch.setattr(gh.anthropic, "AsyncAnthropic", lambda **_: FakeClient(reply(h)))
+    monkeypatch.setattr(gh, "embeddings_available", lambda: False)
+    monkeypatch.setattr(
+        gh, "get_settings", lambda: Settings(database_url=clean_db, anthropic_api_key="t")
+    )
     assert await gh.run(args) == 0
     async with await psycopg.AsyncConnection.connect(clean_db) as conn:
         assert len(await gh.load_pool(conn)) == before

@@ -3,8 +3,11 @@
 	import * as ops from '../../../lib/admin-ops';
 
 	const OTHER = '__other';
-	const purposes = ['describe', 'haiku', 'grow'] as const;
+	const purposes = ['describe', 'haiku', 'grow', 'extract', 'name'] as const;
 	type Purpose = (typeof purposes)[number];
+	// The purposes with an effort key; the others always run at the model's own default.
+	const withEffort: readonly Purpose[] = ['describe', 'extract'];
+	const CAP = 'mycelium.daily_calls';
 
 	type Block = {
 		loaded: { model: string; effort: string; prompt: string };
@@ -18,14 +21,15 @@
 	let blocks = $state<Record<Purpose, Block> | null>(null);
 	let note = $state('');
 	let armed = $state('');
+	let cap = $state(0);
 
 	// Effort null means none; the select needs a string for it.
-	const eff = (v: string | null) => v ?? 'none';
+	const eff = (v: string | number | null) => (v === null ? 'none' : String(v));
 
 	function block(m: ops.Models, p: Purpose): Block {
 		const model = m.current[`${p}.model`] as string;
 		const known = m.known_models.includes(model);
-		const effort = p === 'describe' ? eff(m.current['describe.effort']) : 'none';
+		const effort = withEffort.includes(p) ? eff(m.current[`${p}.effort`]) : 'none';
 		const prompt = m.current[`${p}.prompt`] as string;
 		return {
 			loaded: { model, effort, prompt },
@@ -44,8 +48,11 @@
 		blocks = {
 			describe: block(data, 'describe'),
 			haiku: block(data, 'haiku'),
-			grow: block(data, 'grow')
+			grow: block(data, 'grow'),
+			extract: block(data, 'extract'),
+			name: block(data, 'name')
 		};
+		cap = Number(data.current[CAP]);
 	}
 
 	onMount(() => {
@@ -67,11 +74,17 @@
 
 	const saveModel = (p: Purpose) => run(() => ops.putSetting(`${p}.model`, modelValue(blocks![p])));
 	const resetModel = (p: Purpose) => run(() => ops.resetSetting(`${p}.model`));
-	const saveEffort = () => {
-		const e = blocks!.describe.effort;
-		return run(() => ops.putSetting('describe.effort', e === 'none' ? null : e));
+	const saveEffort = (p: Purpose) => {
+		const e = blocks![p].effort;
+		return run(() => ops.putSetting(`${p}.effort`, e === 'none' ? null : e));
 	};
-	const resetEffort = () => run(() => ops.resetSetting('describe.effort'));
+	const resetEffort = (p: Purpose) => run(() => ops.resetSetting(`${p}.effort`));
+	const capValid = $derived(Number.isInteger(cap) && cap >= 0 && cap <= 100000);
+	const saveCap = () => run(() => ops.putSetting(CAP, cap));
+	const resetCap = () => run(() => ops.resetSetting(CAP));
+	const keyed = $derived(
+		data?.keyed == null ? 'unknown' : data.keyed.length ? data.keyed.join(' ') : 'none'
+	);
 	const savePrompt = (p: Purpose) => run(() => ops.putSetting(`${p}.prompt`, blocks![p].prompt));
 	const resetPrompt = (p: Purpose) => run(() => ops.resetSetting(`${p}.prompt`));
 
@@ -86,6 +99,11 @@
 </script>
 
 {#if blocks && data}
+	<dl>
+		<dt>keyed</dt>
+		<dd>{keyed}</dd>
+	</dl>
+
 	{#each purposes as p}
 		{@const b = blocks[p]}
 		<section>
@@ -104,13 +122,15 @@
 				<button class="link" disabled={!custom(`${p}.model`)} onclick={() => resetModel(p)}>reset</button>
 			</div>
 
-			{#if p === 'describe'}
+			{#if withEffort.includes(p)}
 				<div class="row gap">
-					<select bind:value={b.effort} aria-label="effort">
+					<select bind:value={b.effort} aria-label="{p} effort">
 						{#each ['none', ...data.efforts] as e}<option value={e}>{e}</option>{/each}
 					</select>
-					<button disabled={b.effort === b.loaded.effort} onclick={saveEffort}>save</button>
-					<button class="link" disabled={!custom('describe.effort')} onclick={resetEffort}>reset</button>
+					<button disabled={b.effort === b.loaded.effort} onclick={() => saveEffort(p)}>save</button>
+					<button class="link" disabled={!custom(`${p}.effort`)} onclick={() => resetEffort(p)}>
+						reset
+					</button>
 				</div>
 			{/if}
 
@@ -124,6 +144,16 @@
 		</section>
 	{/each}
 
+	<section>
+		<h2>daily calls</h2>
+		<div class="row">
+			<input type="number" min="0" max="100000" step="1" bind:value={cap} aria-label="daily calls" />
+			<button disabled={!capValid || cap === data.current[CAP]} onclick={saveCap}>save</button>
+			<button class="link" disabled={!custom(CAP)} onclick={resetCap}>reset</button>
+		</div>
+		<p class="dim">{data.calls_today} today</p>
+	</section>
+
 	<h2>all</h2>
 	<div class="row">
 		<button onclick={() => sure('describe')}>{armed === 'describe' ? 'sure' : 're-describe all'}</button>
@@ -136,6 +166,21 @@
 {/if}
 
 <style>
+	dl {
+		display: grid;
+		grid-template-columns: max-content 1fr;
+		gap: 0.25rem 2rem;
+		margin: 0 0 1rem;
+	}
+	dt {
+		color: var(--muted-foreground);
+	}
+	dd {
+		margin: 0;
+	}
+	input[type='number'] {
+		width: 8rem;
+	}
 	section {
 		display: flex;
 		flex-direction: column;

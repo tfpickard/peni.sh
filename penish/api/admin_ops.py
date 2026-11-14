@@ -33,11 +33,22 @@ router = APIRouter(
 )
 
 # Static on purpose: the list only seeds a dropdown, and a model id set by hand still shows.
+# The prefixed ids were checked on 2026-11-14 against each provider's model list as taking
+# images and strict json schema output; any other `provider:id` is accepted by hand.
 KNOWN_MODELS = (
     "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-haiku-5-5",
     "claude-fable-5-2",
+    "openai:gpt-6-astra",
+    "openai:gpt-6.1-sol",
+    "openai:gpt-6.1-terra",
+    "openai:gpt-6-luna",
+    "xai:grok-4.7",
+    "xai:grok-4.6",
+    "openrouter:google/gemini-4-carbon",
+    "openrouter:qwen/qwen3.8-max-prime",
+    "openrouter:mistralai/mistral-large-4-0",
 )
 THUMB_WIDTH = 480
 HAIKU_LINE_MAX = 60
@@ -274,11 +285,21 @@ async def get_models(request: Request) -> dict[str, Any]:
     for k, v in current.items():
         if k.endswith(".model") and v not in known:
             known.append(v)
+    async with pool.connection() as conn:
+        cur = await conn.execute("select info from heartbeats where name = 'worker'")
+        beat = await cur.fetchone()
+    info = beat["info"] if beat and isinstance(beat["info"], dict) else {}
+    keyed = info.get("providers")
     return {
         "current": current,
         "default": default,
         "efforts": list(runtime.EFFORTS),
         "known_models": known,
+        "purposes": list(runtime.PURPOSES),
+        "providers": ["anthropic", *runtime.PROVIDERS],
+        # From the worker, which holds the keys; null until a worker that reports it beats.
+        "keyed": keyed if isinstance(keyed, list) else None,
+        "calls_today": await runtime.calls_today(pool),
     }
 
 

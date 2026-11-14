@@ -26,7 +26,16 @@ _JITTER = 0.10
 
 
 class SoftError(Exception):
-    """Transient failure: the job is retried with backoff."""
+    """Transient failure: the job is retried with backoff.
+
+    With `run_after` the job is not failing but waiting for a known time (a daily cap that
+    resets at midnight), so it is queued for exactly then and the attempt is handed back:
+    a week of waiting must not use up MAX_ATTEMPTS.
+    """
+
+    def __init__(self, message: str = "", *, run_after: datetime | None = None) -> None:
+        super().__init__(message)
+        self.run_after = run_after
 
 
 class HardError(Exception):
@@ -131,6 +140,16 @@ async def fail(
             )
 
 
+async def defer(pool: Pool, job: Job, error: str, run_after: datetime) -> None:
+    async with pool.connection() as conn:
+        await conn.execute(
+            "update jobs set status = 'queued', locked_at = null, last_error = %s,"
+            " run_after = %s, attempts = greatest(attempts - 1, 0), updated_at = now()"
+            " where id = %s",
+            (error, run_after, job.id),
+        )
+
+
 async def recover_stale(pool: Pool, older_than: timedelta = timedelta(minutes=30)) -> int:
     # A SIGKILLed worker never gets to call fail(), so its rows would stay running forever.
     async with pool.connection() as conn:
@@ -148,8 +167,15 @@ async def _run_one(pool: Pool, job: Job, handler: Callable[[Job], Awaitable[None
     except HardError as e:
         log.error("job %s (%s) failed permanently: %s", job.id, job.type, e, exc_info=True)
         await fail(pool, job, repr(e), retry=False)
+    except SoftError as e:
+        if e.run_after is None:
+            log.error("job %s (%s) failed, will retry: %s", job.id, job.type, e, exc_info=True)
+            await fail(pool, job, repr(e), retry=True)
+        else:
+            log.info("job %s (%s) waits until %s: %s", job.id, job.type, e.run_after, e)
+            await defer(pool, job, repr(e), e.run_after)
     except Exception as e:
-        # SoftError and anything unexpected: a bug in a handler should not drop the job.
+        # Anything unexpected: a bug in a handler should not drop the job.
         log.error("job %s (%s) failed, will retry: %s", job.id, job.type, e, exc_info=True)
         await fail(pool, job, repr(e), retry=True)
     else:

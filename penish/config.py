@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://penish:penish@localhost:5432/penish"
     data_dir: Path = Path("/srv/penish/data")
     anthropic_api_key: str | None = None
+    # Other providers, chosen per purpose by a `provider:` prefix on the model id. An unset
+    # key only matters once a purpose is pointed at that provider.
+    openai_api_key: str | None = None
+    openrouter_api_key: str | None = None
+    xai_api_key: str | None = None
     # Unset turns the whole admin surface off (404), so a fresh deploy exposes nothing.
     admin_password: str | None = None
     # Keys the hmac of voter ids and ip hashes. Rotating it orphans existing votes.
@@ -74,6 +79,13 @@ class Settings(BaseSettings):
     @property
     def media_pub(self) -> Path:
         return self.data_dir / "media" / "pub"
+
+    # Derivatives of unpublished pictures. Beside pub so a move is a rename, but nothing
+    # serves it and the api container does not mount it.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def media_held(self) -> Path:
+        return self.data_dir / "media" / "held"
 
 
 @lru_cache

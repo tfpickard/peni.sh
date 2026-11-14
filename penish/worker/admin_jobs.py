@@ -1,5 +1,6 @@
-"""Jobs the admin panel enqueues: per-image regen and crop, bulk re-embed and re-describe,
-and haiku growth.
+"""Jobs the admin panel enqueues: per-image regen, crop, unpublish and republish, bulk
+re-embed and re-describe, haiku growth and mycelium genesis, plus the facet and phrase
+jobs (registered here for the embedder).
 
 Same contract as ingest: SoftError retries, HardError fails, and an image deleted while its
 job waited is a quiet no-op rather than an error.
@@ -20,7 +21,10 @@ import pyvips
 from psycopg.types.json import Jsonb
 
 from penish.config import Settings
+from penish.mycelium import genesis
+from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
+from penish.worker import facet_jobs, phrase_jobs, unpublish
 from penish.worker.derive import (
     Public,
     UndecodableImage,
@@ -39,7 +43,9 @@ from penish.worker.ingest import (
     DocumentEmbedder,
     HaikuWriter,
     _describe_bytes,
+    _held,
     _texts,
+    record_served,
 )
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 from penish.worker.metrics import refresh_corpus_stats
@@ -188,6 +194,8 @@ async def _apply_described(
                 await conn.execute(
                     "delete from embeddings where image_id = %s and kind = %s", (image_id, KIND)
                 )
+                await facet_jobs.invalidate_split(conn, image_id)
+                await mycelium.mark_dirty(conn)
                 changed = True
         if "tags" in want and d.tags:
             if "tags" in force:
@@ -250,6 +258,8 @@ async def _embed(pool: Pool, image_id: int, settings: Settings, embedder: Docume
             if await _row(conn, image_id) is None:
                 return
             raise SoftError("analysis changed while embedding")
+        # Same transaction as the vector, committed when the connection is returned.
+        await mycelium.mark_dirty(conn)
     await refresh_corpus_stats(pool, kind=KIND, model=settings.embed_model)
     if prev is not None and prev["model"] != settings.embed_model:
         # The row moved spaces, so the old space's mean and n are now stale too.
@@ -406,12 +416,23 @@ async def _crop_locked(
         raise HardError(f"crop: {e}") from e
 
     storage = LocalStorage(settings.media_pub.parent)
+    # An unpublished picture is recropped into the holding dir, so the crop does not put
+    # it back on the site at a new URL. settle below sorts out a pub_sha shared with
+    # another picture either way.
+    hidden = row["status"] == "unpublished"
     for d in pub.derivatives:
-        if not storage.exists(d.key):
-            storage.put_bytes(d.key, d.data)
+        if not (storage.exists(d.key) or storage.exists(_held(d.key))):
+            storage.put_bytes(_held(d.key) if hidden else d.key, d.data)
 
     old = str(row["pub_sha"])
     async with conn.transaction():
+        if pub.pub_sha != old:
+            # First, as the tick takes the state row before the image rows it key-shares.
+            await mycelium.mark_dirty(conn)
+            if row["status"] == "live":
+                # The old URLs stay in Cloudflare after this; an unpublish later must
+                # still be able to name them.
+                await record_served(conn, image_id, old, row["width"])
         await conn.execute(
             """
             update images set pub_sha = %s, width = %s, height = %s, blurhash = %s, palette = %s,
@@ -428,15 +449,17 @@ async def _crop_locked(
                 image_id,
             ),
         )
-        cur = await conn.execute(
-            "select exists (select 1 from images where pub_sha = %s and id <> %s) as shared",
-            (old, image_id),
-        )
-        shared = await cur.fetchone()
+        if pub.pub_sha != old:
+            # The extract read the old pixels. The split follows the analysis, which the
+            # regen below rewrites (and invalidates) only if the model's reading changed.
+            await facet_jobs.invalidate_extract(conn, image_id)
     # After the commit, so a crash in between leaks files rather than breaking the page.
-    if old != pub.pub_sha and not (shared and shared["shared"]):
-        n = await asyncio.to_thread(remove_pub, settings.media_pub, old)
-        log.info("image %s cropped; removed %d files of %s", image_id, n, old[:10])
+    # The old files go only when no other picture uses them; when the ones left are all
+    # unpublished they move to the holding dir instead of staying on the site.
+    await unpublish.settle(conn, settings, pub.pub_sha)
+    if old != pub.pub_sha:
+        where = await unpublish.settle(conn, settings, old)
+        log.info("image %s cropped; files of %s now %s", image_id, old[:10], where)
     return True
 
 
@@ -585,12 +608,68 @@ def _grow_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) ->
     return go
 
 
+def _genesis_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await genesis.handle(job, pool=pool, settings=settings)
+
+    return go
+
+
+def _split_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await facet_jobs.handle_split(job, pool=pool, settings=settings, embedder=embedder)
+
+    return go
+
+
+def _extract_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await facet_jobs.handle_extract(job, pool=pool, settings=settings, embedder=embedder)
+
+    return go
+
+
+def _phrases_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await phrase_jobs.handle_phrases(job, pool=pool, settings=settings, embedder=embedder)
+
+    return go
+
+
+def _unpublish_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await unpublish.handle_unpublish(job, pool=pool, settings=settings)
+
+    return go
+
+
+def _republish_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await unpublish.handle_republish(job, pool=pool, settings=settings)
+
+    return go
+
+
+def _settle_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await unpublish.handle_settle(job, pool=pool, settings=settings)
+
+    return go
+
+
 HANDLERS: dict[str, HandlerFactory] = {
     "regen": _regen_handler,
     "crop": _crop_handler,
     "reembed_all": _reembed_all_handler,
     "redescribe_all": _redescribe_all_handler,
     "grow_haikus": _grow_handler,
+    genesis.JOB: _genesis_handler,
+    facet_jobs.SPLIT_JOB: _split_handler,
+    facet_jobs.EXTRACT_JOB: _extract_handler,
+    phrase_jobs.JOB: _phrases_handler,
+    unpublish.UNPUBLISH: _unpublish_handler,
+    unpublish.REPUBLISH: _republish_handler,
+    unpublish.SETTLE: _settle_handler,
 }
 
 

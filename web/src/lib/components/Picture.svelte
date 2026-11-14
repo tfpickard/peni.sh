@@ -1,14 +1,18 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { decode } from 'blurhash';
+	import Hyphae from './Hyphae.svelte';
 	import type { ImageItem } from '../api';
+
+	// Admin and the image page hero pass pictures without a level; they draw no growth.
+	type Tile = Omit<ImageItem, 'overgrowth'> & { overgrowth?: number };
 
 	let {
 		image,
 		sizes = '100vw',
 		eager = false,
 		alt = ''
-	}: { image: ImageItem; sizes?: string; eager?: boolean; alt?: string } = $props();
+	}: { image: Tile; sizes?: string; eager?: boolean; alt?: string } = $props();
 
 	let canvas = $state<HTMLCanvasElement>();
 	let img = $state<HTMLImageElement>();
@@ -64,6 +68,7 @@
 			onload={() => (loaded = true)}
 		/>
 	</picture>
+	<Hyphae slug={image.slug} level={image.overgrowth} />
 </span>
 
 <style>

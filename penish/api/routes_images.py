@@ -1,4 +1,5 @@
 import hashlib
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
@@ -9,6 +10,7 @@ from penish.api.media import variants_for, variants_for_many
 from penish.api.social import approved_comments, vote_summary, voter_for
 from penish.categories import LABELS, SLUGS
 from penish.config import get_settings
+from penish.mycelium.store import galleries_for_image, hyphae_for, overgrowth_by_id
 from penish.similarity import Mode, image_metrics, neighbors
 from penish.sort import EMBEDDED, SEEDED, SORTS, OrderCache, Row, Sort, order
 
@@ -20,8 +22,11 @@ PUBLIC_TEXTS = ("caption", "description", "prompt")
 _LIVE = "status = 'live' and published_at is not null"
 
 
-def grid_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Rows of images (pub_sha, slug, width, height, blurhash, palette) as grid entries."""
+def grid_items(rows: list[dict[str, Any]], overgrowth: Mapping[int, float]) -> list[dict[str, Any]]:
+    """Rows of images (id, pub_sha, slug, width, height, blurhash, palette) as grid entries.
+
+    overgrowth comes from one overgrowth_by_id call for the whole batch.
+    """
     variants = variants_for_many((r["pub_sha"], r["width"], r["height"]) for r in rows)
     return [
         {
@@ -31,6 +36,7 @@ def grid_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "blurhash": r["blurhash"],
             "palette": r["palette"],
             "variants": variants[r["pub_sha"]],
+            "overgrowth": overgrowth.get(r["id"], 0.0),
         }
         for r in rows
     ]
@@ -112,11 +118,12 @@ async def list_images(
             params,
         )
         rows = await cur.fetchall()
-    # One extra row tells us whether another page exists without a count query.
-    more = len(rows) > limit
-    rows = rows[:limit]
+        # One extra row tells us whether another page exists without a count query.
+        more = len(rows) > limit
+        rows = rows[:limit]
+        og = await overgrowth_by_id(conn, [r["id"] for r in rows])
     next_cursor = _encode_cursor(rows[-1]["published_at"], rows[-1]["id"]) if more else None
-    out: dict[str, Any] = {"items": grid_items(rows), "next_cursor": next_cursor}
+    out: dict[str, Any] = {"items": grid_items(rows, og), "next_cursor": next_cursor}
     if count is not None:
         out["count"] = count
     return out
@@ -169,11 +176,12 @@ async def _sorted_page(
             {**vp, "ids": page},
         )
         found = {r["id"]: r for r in await cur.fetchall()}
+        og = await overgrowth_by_id(conn, list(found))
     # A picture hidden or untagged since the snapshot is skipped, not returned as a hole.
     rows_out = [found[i] for i in page if i in found]
     nxt = offset + limit
     out: dict[str, Any] = {
-        "items": grid_items(rows_out),
+        "items": grid_items(rows_out, og),
         "next_cursor": f"{token}.{nxt}" if nxt < len(ids) else None,
     }
     if scope_where and not cursor:
@@ -347,13 +355,16 @@ async def image_detail(
         votes = await vote_summary(conn, img["id"], voter_for(request))
         comments = await approved_comments(conn, img["id"])
         prev, nxt = await _adjacent(conn, img)
+        hyphae = await hyphae_for(conn, img["id"])
+        galleries = await galleries_for_image(conn, img["id"])
 
     mode: Mode = sim or "auto"
     nb = await neighbors(pool, img["id"], k=_K, mode=mode)
     metrics = await image_metrics(pool, img["id"])
 
-    ids = [n.image_id for n in (*nb.similar, *nb.dissimilar)]
+    ids = [n.image_id for n in (*nb.similar, *nb.dissimilar)] + [h.image_id for h in hyphae]
     meta: dict[int, dict[str, Any]] = {}
+    og: dict[int, float] = {}
     if ids:
         async with pool.connection() as conn:
             cur = await conn.execute(
@@ -361,24 +372,32 @@ async def image_detail(
                 (ids,),
             )
             meta = {r["id"]: r for r in await cur.fetchall()}
+            og = await overgrowth_by_id(conn, ids)
     nb_variants = variants_for_many((m["pub_sha"], m["width"], m["height"]) for m in meta.values())
 
+    def card(image_id: int, slug: str, score: float) -> dict[str, Any]:
+        m = meta[image_id]
+        vs = nb_variants[m["pub_sha"]]
+        # 480 is the grid size; a small source may only have its native width.
+        pick = next((v for v in vs if v["w"] == 480), vs[0] if vs else None)
+        return {
+            "slug": slug,
+            "score": round(score, 3),
+            "blurhash": m["blurhash"],
+            "src": (pick["webp"] or pick["avif"]) if pick else None,
+            "overgrowth": og.get(image_id, 0.0),
+        }
+
     def strip(neighbor_list: list[Any]) -> list[dict[str, Any]]:
-        out = []
-        for n in neighbor_list:
-            m = meta[n.image_id]
-            vs = nb_variants[m["pub_sha"]]
-            # 480 is the grid size; a small source may only have its native width.
-            pick = next((v for v in vs if v["w"] == 480), vs[0] if vs else None)
-            out.append(
-                {
-                    "slug": n.slug,
-                    "score": round(n.score, 3),
-                    "blurhash": m["blurhash"],
-                    "src": (pick["webp"] or pick["avif"]) if pick else None,
-                }
-            )
-        return out
+        return [card(n.image_id, n.slug, n.score) for n in neighbor_list]
+
+    # A hypha has no similarity of its own to show, so its score is its strength. A
+    # neighbor deleted since the edge was read is skipped rather than failing the page.
+    reaching = [
+        {**card(h.image_id, h.slug, h.strength), "strength": round(h.strength, 3), "layer": h.layer}
+        for h in hyphae
+        if h.image_id in meta
+    ]
 
     return {
         "slug": img["slug"],
@@ -394,6 +413,8 @@ async def image_detail(
         "categories": categories,
         "similar": strip(nb.similar),
         "dissimilar": strip(nb.dissimilar),
+        "hyphae": reaching,
+        "galleries": galleries,
         "mode": nb.mode,
         "metrics": {
             "loneliness": metrics.loneliness,
