@@ -111,6 +111,9 @@ async def _payload(pool: Pool, conn: store.Conn) -> dict[str, Any]:
         "public": st.public,
         "simulated_through": st.simulated_through,
         "genesis": await _genesis(conn),
+        # Why a full genesis would be refused now, in the words the job refuses with:
+        # once any gallery address is public it never runs again.
+        "genesis_refused": "public" if st.public else "running" if st.running else None,
         "tunables": _tunables(current),
         "tunables_version": version,
         "history": await store.tunables_history(conn, HISTORY),

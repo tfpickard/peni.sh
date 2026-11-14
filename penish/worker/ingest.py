@@ -105,6 +105,24 @@ def _all_keys(sha: str, src_w: int) -> list[str]:
     return [f"pub/{sha}-{w}.{fmt}" for w in _widths(src_w) for fmt in ("avif", "webp")]
 
 
+def _held(key: str) -> str:
+    # Settings.media_held sits beside pub under the same storage root.
+    return "held/" + key.removeprefix("pub/")
+
+
+def _have(storage: LocalStorage, keys: list[str], hidden: bool) -> bool:
+    """Every key present where the picture needs it. An unpublished picture's files may
+    be held, or still in pub when a shown picture shares its pub_sha."""
+    return all(storage.exists(k) or (hidden and storage.exists(_held(k))) for k in keys)
+
+
+def _put(storage: LocalStorage, key: str, data: bytes, hidden: bool) -> None:
+    # An unpublished picture is healed into the holding dir: writing to pub would serve
+    # it again at its old URL.
+    if not _have(storage, [key], hidden):
+        storage.put_bytes(_held(key) if hidden else key, data)
+
+
 def _describe_bytes(img: Any) -> bytes:
     small = img.thumbnail_image(_DESCRIBE_EDGE, height=_DESCRIBE_EDGE, size="down")
     out = small.write_to_buffer(".webp", Q=85)
@@ -124,26 +142,46 @@ async def _ensure_orig(storage: LocalStorage, decoded: Decoded) -> int:
     return storage.path(key).stat().st_size
 
 
-async def _write_media(storage: LocalStorage, decoded: Decoded, settings: Settings) -> int:
+async def _write_media(
+    storage: LocalStorage, decoded: Decoded, settings: Settings, hidden: bool = False
+) -> int:
     # Only for images still displayed as uploaded, where pub_sha == sha256.
     sha, img = decoded.sha256, decoded.image
     size = await _ensure_orig(storage, decoded)
-    if not all(storage.exists(k) for k in _all_keys(sha, decoded.width)):
+    if not _have(storage, _all_keys(sha, decoded.width), hidden):
         derivs = await asyncio.to_thread(make_derivatives, img, sha, settings.watermark)
         for d in derivs:
-            if not storage.exists(d.key):
-                storage.put_bytes(d.key, d.data)
+            _put(storage, d.key, d.data, hidden)
     return size
 
 
+async def record_served(conn: Conn, image_id: int, pub_sha: str | None, width: int | None) -> None:
+    """Note a ladder the site served for this picture. Cloudflare keeps it as immutable
+    long after a crop, a heal or an unpublish stops naming it, and the purge list an
+    unpublished picture shows is built from these rows."""
+    if not pub_sha or not width:
+        return
+    await conn.execute(
+        "insert into served_media (image_id, pub_sha, width) values (%s, %s, %s)"
+        " on conflict do nothing",
+        (image_id, pub_sha, width),
+    )
+
+
 async def _rebuild(
-    conn: Conn, storage: LocalStorage, decoded: Decoded, row: dict[str, Any], settings: Settings
+    conn: Conn,
+    storage: LocalStorage,
+    decoded: Decoded,
+    row: dict[str, Any],
+    settings: Settings,
+    hidden: bool = False,
 ) -> tuple[str, int]:
     data = await asyncio.to_thread(storage.path(_orig_key(decoded)).read_bytes)
     pub = await asyncio.to_thread(rebuild_public, data, row["crop"], settings.watermark)
     for d in pub.derivatives:
-        if not storage.exists(d.key):
-            storage.put_bytes(d.key, d.data)
+        _put(storage, d.key, d.data, hidden)
+    if row["status"] == "live" and pub.pub_sha != row["pub_sha"]:
+        await record_served(conn, int(row["id"]), row["pub_sha"], row["width"])
     await conn.execute(
         """
         update images set pub_sha = %s, width = %s, height = %s, blurhash = %s, palette = %s,
@@ -359,7 +397,7 @@ async def _go_live(conn: Conn, image_id: int, base: str, surprise: float | None)
                     """
                     update images set slug = %s, status = 'live', published_at = now(),
                            surprise = coalesce(surprise, %s), updated_at = now()
-                     where id = %s and status <> 'live'
+                     where id = %s and status not in ('live', 'unpublished')
                     """,
                     (slug, surprise, image_id),
                 )
@@ -437,7 +475,9 @@ async def _image_row(conn: Conn, sha: str, stem: str) -> tuple[dict[str, Any], b
     cur = await conn.execute("select * from images where sha256 = %s", (sha,))
     row = await cur.fetchone()
     assert row is not None
-    if row["status"] != "live":
+    # A re-drop of a published picture leaves its status alone: one taken down by the
+    # admin stays down, whatever happens to its files and text here.
+    if row["status"] not in ("live", "unpublished"):
         await conn.execute(
             "update images set status = 'processing', updated_at = now() where id = %s",
             (row["id"],),
@@ -446,9 +486,11 @@ async def _image_row(conn: Conn, sha: str, stem: str) -> tuple[dict[str, Any], b
 
 
 async def _set_status(conn: Conn, image_id: int, status: str) -> None:
-    # A live image stays live: a failed reprocess must not unpublish it.
+    # A live image stays live: a failed reprocess must not unpublish it. An unpublished
+    # one stays unpublished: pending_enrichment would put it back in line for go-live.
     await conn.execute(
-        "update images set status = %s, updated_at = now() where id = %s and status <> 'live'",
+        "update images set status = %s, updated_at = now()"
+        " where id = %s and status not in ('live', 'unpublished')",
         (status, image_id),
     )
 
@@ -514,6 +556,8 @@ async def _ingest_locked(
     row, existed = await _image_row(conn, sha, group.stem)
     image_id = int(row["id"])
     was_live = row["status"] == "live"
+    # Unpublished: its files are held and it must never go live from here.
+    hidden = row["status"] == "unpublished"
     storage = LocalStorage(settings.media_pub.parent)
     pub_sha = str(row["pub_sha"])
     # Width of the displayed pixels, which is what names the derivative ladder.
@@ -524,14 +568,14 @@ async def _ingest_locked(
         # upload's, so ingest must not lay the uncropped ladder back down. It only heals.
         await _ensure_orig(storage, decoded)
         pub_width = int(row["width"])
-        if not all(storage.exists(k) for k in _all_keys(pub_sha, pub_width)):
-            pub_sha, pub_width = await _rebuild(conn, storage, decoded, row, settings)
+        if not _have(storage, _all_keys(pub_sha, pub_width), hidden):
+            pub_sha, pub_width = await _rebuild(conn, storage, decoded, row, settings, hidden)
     elif (
         not existed
         or row["width"] is None
-        or not all(storage.exists(k) for k in _all_keys(sha, decoded.width))
+        or not _have(storage, _all_keys(sha, decoded.width), hidden)
     ):
-        size = await _write_media(storage, decoded, settings)
+        size = await _write_media(storage, decoded, settings, hidden)
         bh = await asyncio.to_thread(blurhash_of, decoded.image)
         palette = await asyncio.to_thread(palette_of, decoded.image)
         await conn.execute(
@@ -572,7 +616,7 @@ async def _ingest_locked(
         (image_id, KIND, settings.embed_model),
     )
     emb = await cur.fetchone()
-    media_ok = all(storage.exists(k) for k in _webp_keys(pub_sha, pub_width))
+    media_ok = _have(storage, _webp_keys(pub_sha, pub_width), hidden)
     ok_texts = "description" in texts and EMBED_FIELD in texts
     if not (media_ok and ok_texts and emb and emb["e"]):
         await _set_status(conn, image_id, "pending_enrichment")
@@ -583,7 +627,7 @@ async def _ingest_locked(
 
     caption = texts.get("caption")
     base = _slug_base(caption["body"] if caption else None, sha)
-    if not was_live:
+    if not (was_live or hidden):
         surprise = await surprise_at_arrival(pool, image_id, kind=KIND, model=settings.embed_model)
         if await _go_live(conn, image_id, base, surprise):
             log.info("image %s (%s) is live", image_id, sha[:10])

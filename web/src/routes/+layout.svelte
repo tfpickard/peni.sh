@@ -7,10 +7,12 @@
 
 	let { children }: LayoutProps = $props();
 
-	// A picture belongs to the grid it was opened from; a tag's or category's pictures to its index.
+	// A picture belongs to the grid it was opened from; a tag's, category's or gallery's
+	// pictures to its index.
 	const sections = [
 		{ label: 'pictures', href: '/', under: ['/i/'] },
 		{ label: 'categories', href: '/categories', under: ['/c/'] },
+		{ label: 'galleries', href: '/galleries', under: ['/g/'] },
 		{ label: 'tags', href: '/tags', under: ['/t/'] },
 		{ label: 'search', href: '/search', under: [] }
 	];
@@ -87,7 +89,10 @@
 	}
 	nav {
 		display: flex;
-		gap: 1.25rem;
+		/* Five sections no longer fit beside the mark on a narrow phone. */
+		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 0.25rem 1.25rem;
 		font-size: 0.8rem;
 	}
 	nav a {

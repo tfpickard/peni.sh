@@ -80,6 +80,13 @@ class Settings(BaseSettings):
     def media_pub(self) -> Path:
         return self.data_dir / "media" / "pub"
 
+    # Derivatives of unpublished pictures. Beside pub so a move is a rename, but nothing
+    # serves it and the api container does not mount it.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def media_held(self) -> Path:
+        return self.data_dir / "media" / "held"
+
 
 @lru_cache
 def get_settings() -> Settings:

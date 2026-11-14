@@ -37,6 +37,7 @@ KEYS = {
     "public",
     "simulated_through",
     "genesis",
+    "genesis_refused",
     "tunables",
     "tunables_version",
     "history",
@@ -136,6 +137,7 @@ async def test_fresh_payload(client: httpx.AsyncClient) -> None:
     assert body["tick"] is None and body["next_due"] is None and body["behind"] == 0
     assert body["graph_version"] == 0 and body["graph_dirty"] is True
     assert body["public"] is False and body["simulated_through"] is None
+    assert body["genesis_refused"] is None
     assert body["history"] == [] and body["series"] == [] and body["events"] == []
     assert body["colonies"] == {"forming": [], "living": []}
     names = [t["name"] for t in body["tunables"]]
@@ -312,6 +314,9 @@ async def test_reset_before_public_is_a_full_wipe(
     corpus(clean_db)
     await running(app)
     await run_ticks(app, 6)
+    # A tick that ends with a serial makes galleries public; this test is about before.
+    async with app.state.pool.connection() as conn:
+        await store.save_state(conn, public_since=None)
     body = (await post(client, "reset")).json()
     assert body["tick"] is None and body["series"] == [] and body["events"] == []
     assert body["colonies"] == {"forming": [], "living": []}
@@ -363,11 +368,13 @@ async def test_genesis_enqueue_and_refusals(app: Any, client: httpx.AsyncClient)
         await store.save_state(conn, running=True)
     r = await post(client, "genesis")
     assert r.status_code == 409 and r.json()["detail"] == "running"
+    assert (await client.get(URL)).json()["genesis_refused"] == "running"
 
     async with app.state.pool.connection() as conn:
         await store.save_state(conn, running=False, public_since=T0)
     r = await post(client, "genesis")
     assert r.status_code == 409 and r.json()["detail"] == "public"
+    assert (await client.get(URL)).json()["genesis_refused"] == "public"
     assert len(sql(get_settings().database_url, "select id from jobs")) == 1
 
 

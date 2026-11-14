@@ -49,6 +49,7 @@ async def main() -> None:
         settings.failed,
         settings.media_orig,
         settings.media_pub,
+        settings.media_held,
     ):
         d.mkdir(parents=True, exist_ok=True)
 

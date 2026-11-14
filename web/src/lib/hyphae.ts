@@ -15,7 +15,7 @@ const MAX_TIPS = 24;
 export type Dot = { x: number; y: number; r: number; p: number };
 
 // FNV-1a: the slug alone decides where growth starts, so it is the same on every visit.
-function hash(s: string): number {
+export function hash(s: string): number {
 	let h = 0x811c9dc5;
 	for (let i = 0; i < s.length; i++) {
 		h ^= s.charCodeAt(i);

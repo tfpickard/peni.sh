@@ -313,6 +313,8 @@ async def test_same_state_same_hashes(p: Any, clean_db: str) -> None:
     events = sql(clean_db, "select tick, kind, colony_id, image_id from colony_events order by id")
     assert events, "the fast tunables should have formed a colony"
     async with p.connection() as conn:
+        # The fruiting made galleries public; a full wipe needs them not to be.
+        await store.save_state(conn, public_since=None)
         await store.reset(conn)
         await store.save_state(conn, next_due=T0)
     assert ticks(clean_db) == []

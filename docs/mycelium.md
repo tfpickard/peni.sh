@@ -905,3 +905,356 @@ colour at the cap). Links: `use extract` (or `use split`), disabled until every
 live picture has that recipe; `extract all`, disabled when nothing lacks it;
 `genesis facets`, a replay of the four facet layers, open while stopped and no
 genesis waits, public or not (the server refuses a layer with galleries).
+
+## Increment 4
+
+Fruiting and death: unpublish, galleries, tombstones. Three parts: the
+galleries API and projection, the reversible unpublish, and the public pages.
+
+### Galleries
+
+The public side of fruiting and death: the gallery list, one gallery (the same
+page is the tombstone), the event log, `galleries` on the image detail and the
+`/g/<n>` preview tags. Routes in `penish/api/routes_galleries.py`; projection
+changes in `store.apply_colonies`; `migrations/010_galleries.sql` (009 is the
+`unpublished` status value, alone in its file).
+
+#### When addresses are public
+
+`mycelium_state.public_since` is set by the first live tick (`tick.run_one`)
+that commits with a serial anywhere in the colony state, whether that tick
+fruited it or genesis left it; the value is the tick's clock (the database
+clock in production). Genesis runs stopped and never sets it, so it can be run
+again until then. Every public read below checks it first (`store.galleries_public`):
+before it is set the list and the log are empty, a gallery is `not here`, the
+image detail lists no galleries and `/g/<n>` is a 404. After it, a full genesis
+refuses (`public`, as before) and reset keeps tombstones. The admin payload
+carries `genesis_refused: "public" | "running" | null`, the reason a full
+genesis would be refused now.
+
+#### Tables (`migrations/010_galleries.sql`)
+
+| Table | Adds | Notes |
+|---|---|---|
+| `colonies` | `peak_members jsonb`, `peak_tick bigint` | `[{id, slug}]`, the members at the largest end-of-tick size while living, earliest tick on a tie. No foreign key: a deleted picture is still named by its slug |
+| `colony_ticks` | `total_strength double precision` | Sum of the latched strengths inside, beside the mean. Null on rows written before 010 (not recorded) |
+| `colonies` | index on `parent_id` | Children are read by parent |
+
+#### Projection (`store.apply_colonies`)
+
+For every alive or fading colony in a stepped layer, after the colony rows are
+written:
+
+- **Cover**: the member with the highest summed strength to other members over
+  the tick's latched edges of its layer, ties to the lowest id
+  (`store.cover_of`). Written when it changes. Never touched once the gallery
+  is dead, so a tombstone keeps the face it had at death. Forming colonies have
+  no cover.
+- **Peak**: when the colony has just become living or ends the tick with more
+  members than the tick before, the members are written to `peak_members` if
+  that is more than the stored snapshot holds. Exact without a read.
+- **Strength**: `colony_ticks.total_strength` beside `mean_strength`.
+
+#### Words
+
+State `alive` is `living`, `fading` is `fading`, `dead` is `dead`; forming and
+failed colonies have no address and never appear. Layer `whole` is `whole`,
+`facet:<name>` is `<name>`, `need` is `need`. An untitled gallery is
+`gallery <serial>`. A picture is live when `status = 'live'`; anything else
+(unpublished, hidden, deleted) is treated as never having been a member: not
+listed, not counted, no cover, its joins and leaves left out of every log.
+
+#### `GET /api/galleries?state=living|fading|dead|all`
+
+Default `all`; anything else is 400 `bad state`. A bare list, living first
+(newest fruiting first), then fading (newest fruiting first), then dead (most
+recent death first), serial descending on ties:
+
+```
+[{serial, title, state, layer, size, fruited_at: iso|null, died_at: iso|null,
+  cause: str|null, cover: grid item|null, age_days: int}]
+```
+
+`size` is live current members for living and fading, the peak for dead.
+`age_days` is whole days from fruiting to now, or to death. `cover` is the
+grid item shape (`slug, width, height, blurhash, palette, variants,
+overgrowth`), null when the cover is not live. Times are the scheduled times of
+the ticks (`mycelium_ticks`), simulated ones included; nothing says which were
+simulated.
+
+#### `GET /api/galleries/{serial}`
+
+`serial` must be canonical (digits, no leading zero, at most nine digits) and
+name a living, fading or dead gallery; otherwise 404 `not here`.
+
+```
+{serial, title, state, layer, size, peak,
+ formed_at, fruited_at, faded_at (fading only), died_at, cause, age_days,
+ cover: grid item|null,
+ parent: {serial, title}|null, absorbed_by: {serial, title}|null,
+ children: [{serial, title}],                       colonies it parented that have a serial
+ members: [grid item + caption: str|null, founder: bool, others: [{serial, title}]],
+ former_members: [grid item + caption + live: true | {slug, live: false}],
+ edges: [{a: slug, b: slug, strength}],
+ series: [{tick, size, mean_strength, total_strength: float|null}],
+ events: [{at, kind, slug|null, other: {serial, title}|null}],
+ shares: [{serial, title, n}]}
+```
+
+- `members`: live current members, founders first, then by joining tick, then
+  id. Empty for a dead gallery. `others` are the other alive or fading
+  galleries (any layer) the picture is in now, by serial.
+- `former_members`: dead galleries only, the peak snapshot in id order; a live
+  picture as an item to link, anything else by the slug it had.
+- `edges`: undirected, the stronger direction, this gallery's layer, between
+  live current members, strength at least `hypha_visible`, by id pair.
+- `series`: every `colony_ticks` row from forming on, thinned evenly to at most
+  288 points and always ending on the last.
+- `events`: newest first; kinds `formed, fruited, joined, left, faded, revived`
+  and the deaths `depopulated, absorbed, schism, drifted, starved, reset`.
+  `failed` never reaches a colony with a serial. `other` is the parent (formed),
+  the survivor (absorbed) or the child (drifted), when that colony has a serial.
+- `shares`: other alive or fading galleries holding any of the current
+  members, `n` of them, by `n` desc then serial.
+
+#### `GET /api/mycelium/log?before=<id>`
+
+The public log standing in for the brief's feed: fruitings, joins, leaves and
+deaths of galleries with a serial, newest first by (tick, id) since a layer
+replay can write old ticks after new ones; 50 a page.
+
+```
+{events: [{id, at, kind: fruited|joined|left|died, cause: str|null,
+           gallery: {serial, title}, slug: str|null, other: {serial, title}|null}],
+ next: id|null}
+```
+
+`next` is the `before` of the following page, null on the last. An unknown
+`before` gives an empty page.
+
+#### Image detail
+
+`GET /api/images/{slug}` gains `galleries: [{serial, title, state, current}]`:
+galleries the picture is in now (`current`, alive or fading), living then
+fading, then the galleries it was in, newest serial first. A stint counts only
+if it lasted past fruiting.
+
+#### `/g/<n>` (`index.py`)
+
+A path `g/` followed by digits only. A canonical serial of a public gallery is
+200 with `og:title` the title, `og:description` `12 pictures` (`1 picture`)
+while living or fading and `died today`, `died 1 day ago`, `died 3 days ago`
+once dead, and the cover's largest webp as `og:image` with its size. Anything
+else made of digits (unknown, `0`, a leading zero, ten digits) is the shell
+with 404, GET and HEAD alike. `g/abc`, `g/1/x` and the like fall through as
+before.
+
+### Unpublish
+
+A reversible status for a published picture (B9). `/media/pub/` serves by
+filename with no database lookup, so the status alone hides nothing: the files
+move too. Code in `penish/worker/unpublish.py`; the api only enqueues.
+
+#### Status (`migrations/009_unpublished.sql`)
+
+`image_status` gains `unpublished`, alone in its file and without
+`transaction:false` (a new enum value cannot be used in the transaction that
+adds it; tests/conftest.py runs each file's up section as one statement batch).
+Down rebuilds the type without the value and turns unpublished pictures into
+`failed`, never `live`, since their files are still held. Nothing else goes in
+this file.
+
+#### Served ladders (`migrations/011_served_media.sql`)
+
+`served_media (image_id -> images on delete cascade, pub_sha, width,
+created_at)`, primary key `(image_id, pub_sha)`: every derivative ladder a
+picture's page served, for the purge list. A row is written (`on conflict do
+nothing`, via `ingest.record_served`) in the unpublish job's status-flip
+transaction from the row it flips, and whenever a live picture's pub_sha is
+replaced: a crop in `admin_jobs._crop_locked` (after the dirty mark, in the
+same transaction as the pub_sha update) and a heal in `ingest._rebuild`. Rows
+outlive a republish, as the Cloudflare copies do. The up section backfills
+pictures already unpublished from their current ladder. In the conftest
+truncate list.
+
+#### Files
+
+`Settings.media_held` is `<data>/media/held`, beside `pub` so a move is a
+rename (a copy and rename across filesystems, should anyone mount them apart).
+Nothing serves it and the api container does not mount it. File names are the
+pub names, `<pub_sha>-<w>.<avif|webp>`.
+
+One rule, `unpublish.settle(conn, settings, pub_sha)`, decides where a pub_sha's
+files live, from every `images` row with that pub_sha:
+
+| Rows | Files |
+|---|---|
+| any whose status is not `unpublished` (live, or still in ingest, whose gate looks in pub) | `pub` (held copies move back) |
+| all `unpublished` | `held` (pub copies move out) |
+| none | removed from both |
+
+It runs under an advisory lock on `pub:<pub_sha>`, taken inside a sha lock or
+alone and never two at once, so two pictures sharing a pub_sha (identical
+crops) under different sha locks cannot interleave a republish with an
+unpublish. Each call is idempotent, which is what makes every caller crash safe.
+
+#### Jobs
+
+Registered in `admin_jobs.HANDLERS`. `unpublish` and `republish` take payload
+`{image_id}` and the per-sha advisory lock ingest, crop and delete take.
+
+| Job | Dedupe key | Does |
+|---|---|---|
+| `unpublish` | none (see the admin API) | live: one transaction marks the graph dirty (state row first), sets `status = 'unpublished'`; then `settle` moves the files to held unless another shown picture shares the pub_sha. Status before files: every public route reads the status, so the picture is gone the moment it commits, and a crash before the move leaves only hash-named files a rerun moves. Already unpublished: just `settle` (a rerun finishes a partial move) |
+| `republish` | none | checks the webp ladder for `(pub_sha, width)` exists in pub or held, else `HardError("media missing; drop the file again")` before anything moves; moves held files back to pub; then one transaction marks dirty, sets `status = 'live'`, resets the `picture_attention` clock as go-live does (views kept), and queues `mycelium_extract`, `mycelium_split` (each returns at once when complete) and `categorize` when the picture has no category. Files before status, so the page never goes live without its pictures. `published_at` and the slug are kept |
+| `settle_media` | `settle_media:<pub_sha>` | payload `{pub_sha}` (64 hex, else `HardError`); just `settle`. Enqueued by the api's delete, which cannot reach the holding dir |
+
+Both directions then refresh corpus stats for every `(kind, model)` the picture
+has a vector in: `refresh_corpus_stats('description', model)` (which carries that
+model's facet kinds and marks dirty last), `image`, and any facet kind under a
+model with no description vector. A picture that is neither live nor
+unpublished, or is gone, is a quiet no-op. A job skips itself when a newer
+`unpublish` or `republish` of the same picture exists in any status but
+`failed`, so the newest press wins even when two workers hold one of each.
+
+#### Guards against an accidental republish
+
+| Where | Guard |
+|---|---|
+| `ingest._image_row` | a re-drop flips only rows that are neither live nor unpublished to `processing` |
+| `ingest._set_status` | never touches a live or unpublished row (so neither `pending_enrichment` nor `failed` puts it back in line) |
+| `ingest._go_live` | `where status not in ('live', 'unpublished')` |
+| `ingest._ingest_locked` | an unpublished picture is treated as published: no go-live; an owner caption still renames it. Media heal and the gate count a file present in pub or held, and missing derivatives (heal and rebuild paths alike) are written to held, never pub |
+| `admin_jobs._crop_locked` | an unpublished picture's new ladder is written to held; afterwards `settle` runs for the new pub_sha and, if it changed, the old one (this replaces the old "remove unless shared": unused files go, files left only to unpublished pictures are held) |
+| regen, re-describe, re-embed, categorize | never touch status; `redescribe_all` stays live only |
+| `mycelium_split`, `mycelium_extract` | skip any picture that is not live (unchanged); republish queues them again |
+| the tick | treats a non-live member as gone and rebuilds on the dirty mark |
+
+#### Public
+
+Every public read already selects `status = 'live'`, so an unpublished picture
+is `not here` everywhere with no route change: `/api/images` (newest and
+computed sorts, tag and category scopes, counts), the detail by slug or alias,
+`similar`, `dissimilar`, `hyphae`, `/api/search`, `/api/tags`,
+`/api/categories`, `/api/stats` (`pictures`), views, clicks and votes, `/i/<slug>`
+(shell with 404, GET and HEAD) and the galleries (members are live only). Its
+`/media/pub/` URLs 404 once the files are held. `tests/test_unpublish.py` holds
+each of these.
+
+#### Admin API (`penish/api/admin_pictures.py`)
+
+| Path | Does | Errors |
+|---|---|---|
+| `POST /{id}/unpublish` | under a transaction advisory lock on `press:<id>`: deletes a queued `republish` of this picture; if the newest queued or running `unpublish`/`republish` of it is an `unpublish`, returns `{job_id: null, queued: false}` (that job is newest, so it acts); else inserts `unpublish` with no dedupe key and returns `{job_id, queued: true}` | 404, 409 `not live` unless live or unpublished |
+| `POST /{id}/republish` | the mirror image | same |
+
+- `GET ""` accepts `status=unpublished`; an unpublished item's `thumb` is
+  `/api/admin/pictures/{id}/original`.
+- `GET /{id}` gains `purge: [url] | null`, set only while unpublished: the page
+  under the slug and every alias (`<base>/i/<slug>`), then every ladder in
+  `served_media` for the picture, oldest first
+  (`<base>/media/pub/<pub_sha>-<w>.<avif|webp>`, the ingest ladder for the
+  recorded width), each left out while another shown picture still serves the
+  same files. Never built from the current pub_sha: a crop or heal while down
+  renames the files to URLs that were never served. `<base>` is the request's
+  base URL, as `og:image` uses.
+- `DELETE /{id}` of an unpublished picture, or of one whose pub_sha is still
+  shared, also enqueues `settle_media` in its transaction.
+
+#### Web (`/admin/pictures`)
+
+The status filter gains `unpublished`. The editor shows an unpublished picture
+from its original, hides `view`, and has `unpublish` or `republish` beside
+`crop` (disabled while either job waits or runs; the page polls while a job is
+active). While unpublished it lists the purge URLs under `purge`, one per line,
+selected whole on click.
+
+### Web
+
+The public pages for galleries. Types for every payload above are in
+`web/src/lib/api.ts` (`GalleryCard`, `Gallery`, `GalleryMember`,
+`FormerMember`, `GalleryEdge`, `GalleryPoint`, `GalleryEvent`, `GalleryShare`,
+`LogEvent`, `MyceliumLog`, `ImageGallery`, and `genesis_refused` on the admin
+`Mycelium`), with `getGalleries`, `getGallery` (null on 404) and
+`getMyceliumLog`. Words and drawing helpers are in `web/src/lib/galleries.ts`.
+
+#### Nav
+
+`galleries` sits between `categories` and `tags`, current on `/galleries` and
+under `/g/`. The nav now wraps, right-aligned, when five entries do not fit
+beside the mark on a phone.
+
+#### `/galleries`
+
+`N galleries` (`1 gallery`, `0 galleries` when there are none or before
+anything is public), then up to three sections in the API's order: `living`,
+`fading` and `departed`, each shown only when it has a gallery in it. A row is a
+4rem square cover (the smallest webp of at least 160w, with its overgrowth) or
+the palette colour without one, the title, and one muted line:
+`8 pictures  age 5 days  whole` for living and fading, `died 2026-11-08  schism
+5 pictures  whole` for dead (size is the peak). Under the sections the public
+log, 50 a page with `more`: `<time> <gallery> <words> <picture or gallery>`.
+
+#### `/g/<n>`
+
+`+page.ts` loads `/api/galleries/<n>`; a 404 reads `not here`. Same-route
+navigation scrolls to the top.
+
+- Living or fading: the title, then `living  whole  8 pictures  age 5 days`,
+  then `fading since <date>`, `from <parent>`, `children ...` and one
+  `shares 2 with gallery 12` line per share, each only when it applies.
+- Dead (the tombstone): the title, `dead  whole`, then rows `formed`,
+  `fruited`, `died` (dates), `lifespan` (`age_days`, fruiting to death),
+  `cause`, `peak` (`N pictures`), `absorbed by`, `from`, `children`. Below,
+  `at peak`: the live peak members as tiles with captions, then the slugs of
+  the ones no longer live as plain text.
+- Two sparklines, `strength` (total strength) and `size`, each with its last
+  value; points are placed by tick so a gap in the record stays a gap. Ticks
+  with a null `total_strength` are skipped; a row with fewer than two points is
+  left out.
+- Members: the grid's columns (2, 3 from 40rem), `Picture` tiles with the
+  caption under each. Dead galleries have no members, only the peak tiles.
+- The log, newest first, 40 lines then `all N`. Words: `formed`,
+  `formed from <gallery>`, `fruited`, `joined <picture>`, `left <picture>`,
+  `faded`, `revived`, and deaths as `died <cause>` (`died absorbed by
+  <gallery>`, `died drifted into <gallery>`). A picture is named by its caption
+  where the page has one, else by slug. The public log uses the same words.
+- Dates are the visitor's local `YYYY-MM-DD`, log times `YYYY-MM-DD HH:MM`.
+
+#### Hyphae between tiles
+
+One canvas over the members grid, `pointer-events: none`, drawn once the tiles
+are laid out and again only when the grid changes size (a `ResizeObserver`);
+nothing animates. Each edge is a dotted quadratic curve between tile centres,
+bowed and jittered by a generator seeded with `a|b`, so a thread keeps its
+shape. Strength `s` (clamped to 0..1) sets the dot spacing (10 - 5.5s px), the
+radius (0.6 + 1.1s) and the opacity (0.3 + 0.6s); one dot in twelve is a knot
+at 1.7 times the radius, and every tile with a thread gets a knot at its
+centre. Colours are the overgrowth's pale dot with a dark halo, so threads read
+over bright and dark pictures. The seed hash is `hash` from `hyphae.ts`, now
+exported.
+
+#### The overlap mark (`Overlap.svelte`)
+
+A cyan ring with a dot in it, on a 1.75rem button: the shape is the cue (no
+other mark on the site is a ring) and the colour a second one. It sits at the
+end of a member's caption line when `others` is not empty, and after the
+caption on the image page when the picture is in two or more living or fading
+galleries (there is no "this gallery" on the image page, so one is not an
+overlap). The button's name is `also in 2 galleries` (`in 2 galleries` on the
+image page). The list (`also in` / `in`, then one link per gallery) hangs below
+the ring without moving anything else: shown on hover (hover devices only),
+while the ring or a link in it has keyboard focus, or pinned by a tap or press.
+A second press, a tap elsewhere, focus leaving the mark, Escape or any
+navigation (`afterNavigate`) closes it. The last one matters because `/g/<n>`
+reuses its page and keys tiles by slug, so a tap on a link in the list (which
+does not move focus on touch Safari) would otherwise arrive with the same
+picture's list still pinned open.
+`aria-expanded` follows everything but hover. Tiles are inline blocks so an
+open list never continues into the next column.
+
+#### Image page
+
+Under the tags: `in` and the galleries the picture is in now, then `was in`
+and the ones it was in, plain links in the API's order. Either line is left out
+when empty.

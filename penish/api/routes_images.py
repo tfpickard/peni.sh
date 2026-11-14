@@ -10,7 +10,7 @@ from penish.api.media import variants_for, variants_for_many
 from penish.api.social import approved_comments, vote_summary, voter_for
 from penish.categories import LABELS, SLUGS
 from penish.config import get_settings
-from penish.mycelium.store import hyphae_for, overgrowth_by_id
+from penish.mycelium.store import galleries_for_image, hyphae_for, overgrowth_by_id
 from penish.similarity import Mode, image_metrics, neighbors
 from penish.sort import EMBEDDED, SEEDED, SORTS, OrderCache, Row, Sort, order
 
@@ -356,6 +356,7 @@ async def image_detail(
         comments = await approved_comments(conn, img["id"])
         prev, nxt = await _adjacent(conn, img)
         hyphae = await hyphae_for(conn, img["id"])
+        galleries = await galleries_for_image(conn, img["id"])
 
     mode: Mode = sim or "auto"
     nb = await neighbors(pool, img["id"], k=_K, mode=mode)
@@ -413,6 +414,7 @@ async def image_detail(
         "similar": strip(nb.similar),
         "dissimilar": strip(nb.dissimilar),
         "hyphae": reaching,
+        "galleries": galleries,
         "mode": nb.mode,
         "metrics": {
             "loneliness": metrics.loneliness,

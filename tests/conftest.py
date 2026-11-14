@@ -89,7 +89,7 @@ def clean_db(database_url: str) -> str:
             "truncate jobs, corpus_stats, corpus_stats_history, settings, api_usage, heartbeats,"
             " picture_attention, view_days, candidate_edges, edge_state, mycelium_traffic,"
             " mycelium_ticks, mycelium_tunables, colony_ticks, colony_events, colony_members,"
-            " colonies, image_facets, image_extracts restart identity"
+            " colonies, image_facets, image_extracts, served_media restart identity"
         )
         # The singleton row back to how the migration leaves it, with a fixed seed so
         # a test that never sets one still runs the same organism every time.

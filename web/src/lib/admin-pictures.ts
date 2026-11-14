@@ -40,6 +40,8 @@ export type Detail = {
 	votes: { up: number; down: number; net: number };
 	comments: { pending: number; approved: number; rejected: number };
 	jobs: Job[];
+	// Unpublished only: the URLs Cloudflare may still hold, to purge by hand.
+	purge: string[] | null;
 };
 
 const H = { 'X-Requested-With': 'penish' };
@@ -95,6 +97,7 @@ export async function detail(id: string | number): Promise<Detail> {
 		votes: { up: 0, down: 0, net: 0 },
 		comments: { pending: 0, approved: 0, rejected: 0 },
 		jobs: [],
+		purge: null,
 		...d
 	};
 }
@@ -107,6 +110,10 @@ export const regen = (id: number, fields: Regen[]) =>
 
 export const crop = (id: number, rect: Rect | null) =>
 	call<unknown>(`/${id}/crop`, { method: 'POST', body: JSON.stringify({ rect }) });
+
+export const unpublish = (id: number) => call<unknown>(`/${id}/unpublish`, { method: 'POST' });
+
+export const republish = (id: number) => call<unknown>(`/${id}/republish`, { method: 'POST' });
 
 export const remove = (id: number) => call<unknown>(`/${id}`, { method: 'DELETE' });
 

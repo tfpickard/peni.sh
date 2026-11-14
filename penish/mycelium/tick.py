@@ -244,6 +244,13 @@ async def run_one(
             graph_version=graph_version,
         )
         await store.insert_tick(conn, row)
+        # The site serves gallery addresses only once this is set, so the first live
+        # tick that ends with a serial anywhere (its own fruiting or one genesis left)
+        # is the moment they become public. Genesis runs stopped and never sets it,
+        # which is what lets it run again until then.
+        public: dict[str, datetime] = {}
+        if st.public_since is None and any(c.serial is not None for c in s.colonies.colonies):
+            public["public_since"] = clock
         await store.save_state(
             conn,
             last_tick=tick,
@@ -252,6 +259,7 @@ async def run_one(
             graph_version=graph_version,
             graph_dirty=False,
             tunables_version=tversion,
+            **public,
         )
     return Ran(
         tick=tick,

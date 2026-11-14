@@ -57,6 +57,8 @@ export type ImageDetail = Omit<ImageItem, 'overgrowth'> & {
 	// Neighbours in grid order, wrapping; null only when this is the sole picture.
 	prev: string | null;
 	next: string | null;
+	// Galleries it is in now (living, then fading), then the ones it was in.
+	galleries: ImageGallery[];
 };
 export type ImageRedirect = { redirect: string };
 
@@ -208,6 +210,8 @@ export type Mycelium = {
 	graph_version: number;
 	graph_dirty: boolean;
 	public: boolean;
+	// Why a full genesis would be refused now, if it would.
+	genesis_refused: 'public' | 'running' | null;
 	simulated_through: number | null;
 	genesis: { status: GenesisStatus; error: string | null };
 	tunables: Tunable[];
@@ -256,3 +260,96 @@ export const setTunables = (values: Record<string, number>, note: string | null)
 export const setFacetSource = (recipe: FacetRecipe) => mycelium('/facet_source', { recipe });
 // Only facet layers: a replay of those alone, allowed after galleries are public.
 export const facetGenesis = (layers: string[]) => mycelium('/genesis', { layers });
+
+// Galleries. Mirrors penish/api/routes_galleries.py; nothing is served before the first
+// gallery is public, so every list here may simply be empty.
+export type GalleryState = 'living' | 'fading' | 'dead';
+export type GalleryRef = { serial: number; title: string };
+export type ImageGallery = GalleryRef & { state: GalleryState; current: boolean };
+export type GalleryCard = GalleryRef & {
+	state: GalleryState;
+	// whole, subject, setting, style, mood or need.
+	layer: string;
+	// Members now, or at the peak for a dead gallery.
+	size: number;
+	fruited_at: string | null;
+	died_at: string | null;
+	cause: string | null;
+	cover: ImageItem | null;
+	age_days: number;
+};
+export type GalleryMember = ImageItem & {
+	caption: string | null;
+	founder: boolean;
+	// Other living or fading galleries the picture is in now.
+	others: GalleryRef[];
+};
+// A tombstone keeps its peak members; one no longer live is only the slug it had.
+export type FormerMember =
+	| (ImageItem & { caption: string | null; live: true })
+	| { slug: string; live: false };
+export type GalleryEdge = { a: string; b: string; strength: number };
+// total_strength is null on ticks recorded before it was kept.
+export type GalleryPoint = {
+	tick: number;
+	size: number;
+	mean_strength: number;
+	total_strength: number | null;
+};
+export type GalleryEvent = {
+	at: string;
+	kind: string;
+	slug: string | null;
+	other: GalleryRef | null;
+};
+export type GalleryShare = GalleryRef & { n: number };
+export type Gallery = GalleryRef & {
+	state: GalleryState;
+	layer: string;
+	size: number;
+	peak: number;
+	formed_at: string | null;
+	fruited_at: string | null;
+	faded_at: string | null;
+	died_at: string | null;
+	cause: string | null;
+	age_days: number;
+	cover: ImageItem | null;
+	parent: GalleryRef | null;
+	absorbed_by: GalleryRef | null;
+	children: GalleryRef[];
+	members: GalleryMember[];
+	former_members: FormerMember[];
+	edges: GalleryEdge[];
+	series: GalleryPoint[];
+	// Newest first.
+	events: GalleryEvent[];
+	shares: GalleryShare[];
+};
+export type LogEvent = {
+	id: number;
+	at: string;
+	kind: 'fruited' | 'joined' | 'left' | 'died';
+	cause: string | null;
+	gallery: GalleryRef;
+	slug: string | null;
+	other: GalleryRef | null;
+};
+export type MyceliumLog = { events: LogEvent[]; next: number | null };
+
+export const getGalleries = (state: GalleryState | 'all' = 'all', f: typeof fetch = fetch) =>
+	f(`/api/galleries${state === 'all' ? '' : `?state=${state}`}`).then((r) => {
+		if (!r.ok) throw new ApiError(r.status);
+		return r.json() as Promise<GalleryCard[]>;
+	});
+
+// null for an address that is not a gallery, so the page can say so.
+export const getGallery = (serial: string, f: typeof fetch = fetch) =>
+	f(`/api/galleries/${encodeURIComponent(serial)}`).then((r) => {
+		if (r.status === 404) return null;
+		if (!r.ok) throw new ApiError(r.status);
+		return r.json() as Promise<Gallery>;
+	});
+
+export const getMyceliumLog = (before: number | null = null) =>
+	get<MyceliumLog>(`/api/mycelium/log${before === null ? '' : `?before=${before}`}`);

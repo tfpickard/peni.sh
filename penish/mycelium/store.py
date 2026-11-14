@@ -694,18 +694,43 @@ def _colony_row(c: colony.Colony) -> tuple[Any, ...]:
     )
 
 
-def colony_strengths(
+def colony_strength_sums(
     state: colony.ColoniesState, latched: Mapping[str, Sequence[tuple[int, int, float]]]
-) -> dict[int, float]:
-    """Mean strength of the latched edges inside each forming or living colony; 0 with none."""
-    out: dict[int, float] = {}
+) -> dict[int, tuple[float, float]]:
+    """(total, mean) strength of the latched edges inside each forming or living colony;
+    (0, 0) with none."""
+    out: dict[int, tuple[float, float]] = {}
     for c in state.colonies:
         if c.state not in (colony.FORMING, colony.ALIVE, colony.FADING):
             continue
         mine = c.images()
         values = [s for a, b, s in latched.get(c.layer, ()) if a in mine and b in mine]
-        out[c.id] = math.fsum(values) / len(values) if values else 0.0
+        total = math.fsum(values)
+        out[c.id] = (total, total / len(values) if values else 0.0)
     return out
+
+
+def colony_strengths(
+    state: colony.ColoniesState, latched: Mapping[str, Sequence[tuple[int, int, float]]]
+) -> dict[int, float]:
+    """Mean strength of the latched edges inside each forming or living colony; 0 with none."""
+    return {k: mean for k, (_, mean) in colony_strength_sums(state, latched).items()}
+
+
+def cover_of(
+    c: colony.Colony, latched: Mapping[str, Sequence[tuple[int, int, float]]]
+) -> int | None:
+    """The member with the highest summed strength to other members over the latched
+    edges of its layer, ties to the lowest id; None for a colony with no members."""
+    mine = c.images()
+    if not mine:
+        return None
+    sums = dict.fromkeys(mine, 0.0)
+    for a, b, s in latched.get(c.layer, ()):
+        if a in mine and b in mine:
+            sums[a] += s
+            sums[b] += s
+    return min(sums, key=lambda i: (-sums[i], i))
 
 
 async def apply_colonies(
@@ -847,22 +872,88 @@ async def apply_colonies(
                     for ev in events
                 ],
             )
-        strengths = colony_strengths(new, latched)
+        strengths = colony_strength_sums(new, latched)
         if layers is not None:
             stepped = {c.id for c in new.colonies if c.layer in layers}
             strengths = {k: v for k, v in strengths.items() if k in stepped}
         if strengths:
             sizes = {c.id: len(c.members) for c in new.colonies}
             await cur.executemany(
-                "insert into colony_ticks (colony_id, tick, size, mean_strength)"
-                " values (%(c)s, %(tick)s, %(size)s, %(s)s)"
+                "insert into colony_ticks (colony_id, tick, size, mean_strength, total_strength)"
+                " values (%(c)s, %(tick)s, %(size)s, %(s)s, %(total)s)"
                 " on conflict (colony_id, tick) do update"
-                " set size = excluded.size, mean_strength = excluded.mean_strength",
+                " set size = excluded.size, mean_strength = excluded.mean_strength,"
+                " total_strength = excluded.total_strength",
                 [
-                    {"c": cid, "tick": tick, "size": sizes[cid], "s": strengths[cid]}
+                    {
+                        "c": cid,
+                        "tick": tick,
+                        "size": sizes[cid],
+                        "s": strengths[cid][1],
+                        "total": strengths[cid][0],
+                    }
                     for cid in sorted(strengths)
                 ],
             )
+        await _galleries(cur, prev_by, new, tick=tick, slugs=slugs, latched=latched, layers=layers)
+
+
+async def _galleries(
+    cur: Any,
+    prev_by: Mapping[int, colony.Colony],
+    new: colony.ColoniesState,
+    *,
+    tick: int,
+    slugs: Mapping[int, str],
+    latched: Mapping[str, Sequence[tuple[int, int, float]]],
+    layers: Collection[str] | None,
+) -> None:
+    """Cover and peak membership of every living colony in a stepped layer.
+
+    The cover is recomputed every tick while the gallery lives and left alone once it
+    dies, so a tombstone keeps the face it had. A dead or failed colony is skipped, and
+    so is a layer that did not step, whose latched edges this call was not given.
+    """
+    covers: list[dict[str, Any]] = []
+    peaks: list[dict[str, Any]] = []
+    for c in new.colonies:
+        if c.state not in colony.LIVING or (layers is not None and c.layer not in layers):
+            continue
+        covers.append({"c": c.id, "img": cover_of(c, latched)})
+        p = prev_by.get(c.id)
+        # Only a tick that could have set a new high: the first living tick, or more
+        # members than the tick before. The SQL guard settles it against the snapshot.
+        if p is None or p.state not in colony.LIVING or len(c.members) > len(p.members):
+            peaks.append(
+                {
+                    "c": c.id,
+                    "n": len(c.members),
+                    "tick": tick,
+                    "members": Jsonb(
+                        [
+                            {"id": m.image, "slug": slugs.get(m.image, str(m.image))}
+                            for m in c.members
+                        ]
+                    ),
+                }
+            )
+    if covers:
+        await cur.executemany(
+            """
+            update colonies set cover_image_id = (select id from images where id = %(img)s)
+             where id = %(c)s
+               and cover_image_id is distinct from (select id from images where id = %(img)s)
+            """,
+            covers,
+        )
+    if peaks:
+        await cur.executemany(
+            """
+            update colonies set peak_members = %(members)s, peak_tick = %(tick)s
+             where id = %(c)s and coalesce(jsonb_array_length(peak_members), 0) < %(n)s
+            """,
+            peaks,
+        )
 
 
 # -- ticks -------------------------------------------------------------------
@@ -1157,3 +1248,75 @@ async def hyphae_for(
     ]
     found.sort(key=lambda h: (-h.strength, h.slug))
     return found[:limit]
+
+
+# -- galleries ---------------------------------------------------------------
+
+# The colonies module's states as the public names them. Forming and failed colonies
+# have no address and never appear.
+PUBLIC_STATES: dict[str, str] = {
+    colony.ALIVE: "living",
+    colony.FADING: "fading",
+    colony.DEAD: "dead",
+}
+GALLERY_STATES: tuple[str, ...] = tuple(PUBLIC_STATES)
+
+
+def public_kind(layer: str) -> str:
+    """The plain word a layer goes by in public: `facet:mood` is `mood`."""
+    return layer.removeprefix("facet:")
+
+
+def gallery_title(serial: int, title: str | None) -> str:
+    """Until a gallery is named it is its address."""
+    return title or f"gallery {serial}"
+
+
+async def galleries_public(conn: Conn) -> bool:
+    """Whether the site serves gallery addresses yet: only once a live tick has run
+    with a serial in existence (`tick.run_one`). Before that, genesis may still
+    renumber them, so nothing about them is public."""
+    cur = await conn.execute(
+        "select public_since is not null as p from mycelium_state where id = 1"
+    )
+    row = await cur.fetchone()
+    return bool(row and row["p"])
+
+
+async def galleries_for_image(conn: Conn, image_id: int) -> list[dict[str, Any]]:
+    """`[{serial, title, state, current}]` for one picture, JSON-ready: galleries it is
+    in now first (living, then fading), then galleries it was in, newest serial first.
+
+    A stint counts only if it reached past fruiting, so a picture that left a colony
+    while it was still forming was never in the gallery. Empty before galleries are
+    public.
+    """
+    if not await galleries_public(conn):
+        return []
+    cur = await conn.execute(
+        """
+        select c.serial, c.title, c.state,
+               bool_or(m.left_tick is null and c.state in ('alive', 'fading')) as current
+          from colony_members m
+          join colonies c on c.id = m.colony_id
+         where m.image_id = %(id)s and c.serial is not null
+           and c.state = any(%(states)s)
+           and (m.left_tick is null or m.left_tick > c.fruited_tick)
+         group by c.id, c.serial, c.title, c.state
+        """,
+        {"id": image_id, "states": list(GALLERY_STATES)},
+    )
+    rows = await cur.fetchall()
+    order = {s: i for i, s in enumerate(GALLERY_STATES)}
+    rows.sort(
+        key=lambda r: (not r["current"], order[r["state"]] if r["current"] else 0, -r["serial"])
+    )
+    return [
+        {
+            "serial": int(r["serial"]),
+            "title": gallery_title(int(r["serial"]), r["title"]),
+            "state": PUBLIC_STATES[r["state"]],
+            "current": bool(r["current"]),
+        }
+        for r in rows
+    ]

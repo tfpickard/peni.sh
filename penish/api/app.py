@@ -11,6 +11,7 @@ from penish.api import (
     attention,
     index,
     media,
+    routes_galleries,
     routes_images,
     routes_meta,
     routes_search,
@@ -36,6 +37,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_meta.router)
     app.include_router(routes_images.router)
     app.include_router(routes_search.router)
+    app.include_router(routes_galleries.router)
     app.include_router(media.router)
     app.include_router(admin.router)
     app.include_router(admin_ops.router)
