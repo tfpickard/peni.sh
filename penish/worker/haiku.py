@@ -14,12 +14,17 @@ Haiku = tuple[str, str, str]
 
 MAX_LINE = 60
 N_EXAMPLES = 6
+_STRINGS = {"type": "array", "items": {"type": "string"}}
+# What the model is asked for. `drafts` is scratch that is never stored: it comes first and
+# is required so the candidates are written before the pick, whether or not the model thinks.
 _SCHEMA = {
     "type": "object",
-    "properties": {"lines": {"type": "array", "items": {"type": "string"}}},
-    "required": ["lines"],
+    "properties": {"drafts": _STRINGS, "lines": _STRINGS},
+    "required": ["drafts", "lines"],
     "additionalProperties": False,
 }
+# What a reply must hold. Looser than _SCHEMA because grow.py validates bare lines here too.
+_REPLY = {"type": "object", "properties": {"lines": _STRINGS}, "required": ["lines"]}
 
 
 async def load_examples(pool: Pool, n: int = N_EXAMPLES) -> list[Haiku]:
@@ -40,7 +45,7 @@ def build_prompt(template: str, examples: list[Haiku]) -> str:
 
 def _validate(text: str) -> Haiku:
     data = parse_json(text)
-    jsonschema.validate(data, _SCHEMA)
+    jsonschema.validate(data, _REPLY)
     lines = [no_em_dash(x).strip() for x in data["lines"]]
     if len(lines) != 3 or any(not x or len(x) > MAX_LINE for x in lines):
         raise ValueError("haiku must be three non-empty lines of at most 60 characters")
@@ -67,8 +72,8 @@ async def haiku_from(
         examples = await load_examples(pool) if pool is not None else []
     kwargs: dict[str, Any] = {
         # The budget covers thinking too: haiku-5-5 thinks by default, and at 300 it spent
-        # every token there and returned no text.
-        "max_tokens": 2048,
+        # every token there and returned no text. The drafts share it as well.
+        "max_tokens": 4096,
         "system": build_prompt(template, examples),
         "output_config": output_config(_SCHEMA, None),
         "messages": [{"role": "user", "content": description}],

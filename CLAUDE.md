@@ -13,15 +13,21 @@ similar and most dissimilar neighbors plus a few embedding metrics.
 
 ## Voice and style
 
-Minimalist and dry. Never wink, never explain the joke. Write as if the site
-has always been this way. Applies to UI, errors, prompts and design.
+Absurdist, and entirely serious about it: this is a serious art site. The
+visitor should laugh before knowing why, then feel uneasy and not know why
+either. Minimalist and dry. Never wink, never explain the joke. Write as if
+the site has always been this way. Applies to UI, errors, prompts and design.
 
 - UI copy: plain lowercase labels, as few words as possible (`142 pictures`,
   `similar`, `dissimilar`, `loneliness 0.41`). No exclamation marks, emoji,
   "oops", or asides about the site being weird. No tooltips on metric names.
 - Empty and error states are flat, no apology: `0 pictures`, `not here`.
 - Model prompts ask for a deadpan, matter-of-fact voice that treats strange
-  content as ordinary. Descriptions stay literal and precise.
+  content as ordinary. Descriptions stay literal and precise: the clerk is the
+  straight man and never gets weird.
+- Haikus are the one place that invents. Precise, never random: plain
+  sentences whose logic does not close. They add what the picture and its
+  description do not show, and they are not a second clerk.
 - og tags: caption and description only. No taglines or calls to action.
 - Visual: lots of empty dark ground, one type scale, no cards or shadows,
   almost no chrome. Magenta and cyan sparingly. The Fungal haiku is the only
