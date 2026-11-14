@@ -50,9 +50,14 @@ A `NetworkDown…` SSID therefore means the OpenAI call failed. Check the error 
 
 ### Images
 
-On startup, and again whenever the cache is more than 5 minutes old, the app scans `IMAGE_DIR`
-recursively. It keeps files ending in `.jpg`, `.jpeg`, `.png`, `.gif` or `.webp`, up to 1000 of them.
-New images show up within 5 minutes without a restart.
+The image list is cached and refreshed only when a request needs it. There's no scan at startup and
+no background task. When `/`, `/api/images` or `/health` is called and the cache is empty or more
+than 5 minutes old, the app rescans `IMAGE_DIR` recursively. It keeps files ending in `.jpg`,
+`.jpeg`, `.png`, `.gif` or `.webp`.
+
+The cache holds at most 1000 files, taken in whatever order `rglob` returns them. A new image
+therefore appears on the first of those requests after the cache goes stale. Once the directory
+holds more than 1000 images, a new one may never appear at all.
 
 `/image/{filename}` resolves the requested path and refuses anything outside `IMAGE_DIR`. It also
 refuses any extension not on that list.
@@ -113,7 +118,8 @@ The script does the following, in order:
 9. Installs `nginx.conf` as the real site config, with rate limiting turned on. The real config
    redirects HTTP to HTTPS, serves TLS 1.2/1.3, sets HSTS and a few security headers, and caches
    `/image/` responses for 1 hour.
-10. Enables `certbot.timer` for renewal and starts everything.
+10. Enables `certbot.timer` for renewal (which currently fails, see *Known issues*) and starts
+    everything.
 
 To deploy under a different name, change `DOMAIN` (and the other variables) at the top of
 `deploy.sh`. The certificate paths in `nginx.conf` are hard-coded to `peni.sh`, so update those too.
@@ -141,7 +147,7 @@ sudo systemctl restart penish
 sudo install -o penish -g penish -m 644 main.py /opt/penish/main.py
 sudo systemctl restart penish
 
-# Add images (picked up within 5 minutes, no restart needed)
+# Add images (no restart needed; they appear after the next cache refresh, see "Images")
 sudo install -o penish -g penish -m 644 *.jpg /var/www/peni.sh/images/
 
 # Logs. The unit sends output to files, so journalctl only shows start/stop events.
@@ -156,9 +162,36 @@ curl -s https://peni.sh/health | jq
 
 These are real problems in the current code, listed so they don't surprise anyone:
 
-- **No `requirements.txt`.** Without one, `deploy.sh` installs a fallback package list that leaves
-  out `openai`. The service then crashes on import. Until a requirements file is added, run
-  `sudo -u penish /opt/penish/venv/bin/pip install openai` after deploying.
+- **No `requirements.txt`, so the first deploy doesn't finish.** Without one, `deploy.sh` installs
+  a fallback package list that leaves out `openai`, and the service crashes on import. A missing
+  `OPENAI_API_KEY` crashes it the same way. `start_services` runs `systemctl status penish`, which
+  exits non-zero for a dead service, and `set -e` then aborts the script. That happens *before*
+  nginx restarts, so nginx keeps serving the temporary HTTP-only config, and the HTTPS config
+  written to `sites-available` never loads. Until a requirements file is added, finish the deploy
+  by hand:
+
+  ```bash
+  sudo -u penish /opt/penish/venv/bin/pip install openai
+  sudo nvim /opt/penish/.env          # make sure OPENAI_API_KEY is set
+  sudo systemctl restart penish
+  sudo nginx -t && sudo systemctl restart nginx
+  ```
+- **Automatic certificate renewal will fail.** The certificate comes from `certbot certonly --webroot
+  -w /var/www/letsencrypt`, so renewals expect `/.well-known/acme-challenge/` to be served from that
+  directory. The final `nginx.conf` doesn't do that. Port 80 redirects everything to HTTPS, and on
+  443 the `location ~ /\.` rule (a regex, so it wins over `location /`) returns 403 for the dot-path.
+  Separately, `certonly` installs no hook to reload nginx, so even a successful renewal wouldn't be
+  picked up. Until `nginx.conf` is fixed, add this to the port-80 server, before the `return 301`:
+
+  ```nginx
+  location /.well-known/acme-challenge/ {
+      root /var/www/letsencrypt;
+  }
+  ```
+
+  Then move the redirect into a `location / { return 301 https://$host$request_uri; }` block. Add
+  `--deploy-hook "systemctl reload nginx"` to the renewal (for example with
+  `certbot reconfigure`), and check the result with `sudo certbot renew --dry-run`.
 - **Arch is not really supported by `deploy.sh`.** It tries `paru` before `pacman`, but paru refuses
   to run as root. The pacman branch uses Debian package names (`python3-pip`, `python3-venv`), and
   Arch's nginx has no `sites-available` directory. Debian and Ubuntu are the only paths that work.
