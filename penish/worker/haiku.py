@@ -1,14 +1,19 @@
 import json
 from typing import Any
 
-import anthropic
 import jsonschema
 
 from penish import runtime
 from penish.config import Settings
 from penish.runtime import Getter, Pool
 from penish.text import no_em_dash
-from penish.worker.describe import DescribeError, call_text, output_config, parse_json
+from penish.worker.describe import (
+    DescribeError,
+    LazyAnthropic,
+    call_text,
+    output_config,
+    parse_json,
+)
 
 Haiku = tuple[str, str, str]
 
@@ -62,7 +67,7 @@ async def haiku_from(
     """`get` overrides the runtime lookup (tests); `pool` supplies it, the examples and
     usage recording otherwise."""
     if client is None:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = LazyAnthropic(settings.anthropic_api_key)
     get = get or runtime.getter(pool, settings)
     model = await get("haiku.model")
     template = await get("haiku.prompt")

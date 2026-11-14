@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import anthropic
 import jsonschema
 import numpy as np
 from psycopg import AsyncConnection
@@ -34,7 +33,13 @@ from penish.mycelium import facets
 from penish.mycelium import store as mycelium
 from penish.text import no_em_dash
 from penish.worker import phrase_jobs, providers
-from penish.worker.describe import DescribeError, call_text, output_config, parse_json
+from penish.worker.describe import (
+    DescribeError,
+    LazyAnthropic,
+    call_text,
+    output_config,
+    parse_json,
+)
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 from penish.worker.metrics import refresh_facet_stats
 
@@ -131,7 +136,7 @@ async def extract(
     """One vision call for the four facets, offers and needs. With a pool, every attempt
     is checked against the daily cap first (SoftError with run_after when over)."""
     if client is None:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = LazyAnthropic(settings.anthropic_api_key)
     get = runtime.getter(pool, settings)
     model = await get("extract.model")
     effort = await get("extract.effort")

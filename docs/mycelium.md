@@ -92,7 +92,9 @@ defaults.
 `TICK_SECONDS = 600` is a constant, not a tunable.
 
 Tunables are versioned append-only. A tick reads one version at its start and
-records its number.
+records its number. A version must keep `min_size <= remerge_size <= max_size`
+(a remerge below the floor would leave a full gallery to die before it ever
+admits again), `colony_leave <= colony_enter` and `wither_min <= colony_leave`.
 
 ## Candidate graph (`graph.py`)
 
@@ -296,7 +298,9 @@ one query per batch:
 - `hours` = database `now()` minus `last_viewed_at`, or `published_at` when a
   picture has no attention row; 0 overgrowth when it has neither.
 - `min(1, base * (1 + overgrowth_sigma * neighbor_level))`, clamped to 0..1,
-  rounded to 3 places.
+  then `overgrowth.coverage` (times `overgrowth_cap` from the loaded tunables),
+  rounded to 3 places. What leaves the server is drawn coverage, so the admin
+  cap is the only cap: at 0 every payload reads 0 and nothing is drawn.
 - Tunables are `tunables.DEFAULTS` until the versioned table arrives in
   Increment 2.
 
@@ -319,7 +323,8 @@ match `^[a-z0-9-]{1,100}$` (a mistyped URL would otherwise make the server
 422 the whole view). Slugs viewed this session render at
 0 everywhere, including grids restored from a snapshot. `lib/hyphae.ts` draws
 a fixed dot order seeded from the slug, so only extent changes with level,
-capped at `overgrowth_cap`, once, near the viewport, no animation. Every slug
+`round(overgrowth * 220)` dots as sent (the cap is already in the value, the
+client holds no copy of it), once, near the viewport, no animation. Every slug
 gets exactly 220 dots (a tip that would leave the picture turns back off the
 edge rather than dying), so a level covers the same share of every picture;
 `tests/test_hyphae.py` runs the shipped source under node to hold that.
@@ -374,8 +379,15 @@ of the go-live, admin delete, admin analysis edit and `ingest._ensure_embedding`
 transactions, since those take locks on `images` (or rows the tick's foreign
 keys key-share lock) that a tick holding the state row would wait on. The other
 description-embedding writers (`ingest._write_text`, `admin_jobs._apply_described`,
-`admin_jobs._embed`) mark after their write: they lock only texts and
-embeddings, which the tick never locks. `refresh_corpus_stats` for
+`admin_jobs._embed`) take the state row first too: the tick never locks texts
+or embeddings, but a facet write and an admin analysis edit take the state row
+and then the analysis row, so a writer holding that row while it waits for the
+state row deadlocks with them. `_embed` marks first. `_write_text` and
+`_apply_described` lock it `for update` before the analysis row whenever they
+may write a new analysis and mark only once the write lands, so an owner text
+that turns the model away, or an analysis that comes back unchanged, costs no
+rebuild.
+`refresh_corpus_stats` for
 `description` marks once more at the end of its own transaction, because the
 writer's mark commits before the new mean does and a tick in between would
 rebuild on the old mean and clear the mark; it marks last so the state row is
@@ -513,9 +525,16 @@ is stripped too (`openai: gpt-6-astra` is stored as `openai:gpt-6-astra`), and
 space as part of the id and refuses every call.
 
 The seam is `describe.call_text`. When the id has a prefix and the client it
-was given is `None` or a real `anthropic.AsyncAnthropic`, it swaps in
-`providers.client_for(model)`; a test fake is kept, so tests that inject
-`FakeClient` stay off the network whatever model the runtime returns. The
+was given is `None`, a `describe.LazyAnthropic` or a real
+`anthropic.AsyncAnthropic`, it swaps in `providers.client_for(model)`; a test
+fake is kept, so tests that inject `FakeClient` stay off the network whatever
+model the runtime returns. Every caller (describe, categorize, extract, haiku,
+name, grow and `scripts/grow_haikus.py`) defaults to a `LazyAnthropic`, which
+builds the SDK client only on the first bare-id call: with no key the SDK
+resolves credentials from env and disk at construction and can raise there, so
+a worker keyed only for other providers never builds one. A bare id with no
+`ANTHROPIC_API_KEY` fails without a request: `no key for anthropic`, not
+retryable. The
 adapter exposes `.messages.create(model=..., **kwargs)` and returns
 `.content = [TextBlock(type="text", text=...)]` and `.usage` with
 `input_tokens` and `output_tokens`, so callers and `api_usage` (recorded under
@@ -1740,13 +1759,21 @@ same positions bit for bit, so no table is needed.
 
 - The whole response body is kept in memory per cache key: `last_tick`,
   `graph_version`, `graph_dirty`, `public`, `seed`, the count and id sum of
-  live pictures, an md5 of the living and fading galleries' `serial:state:title`
-  and the newest `mycelium_tunables` version. Within one tick edge strengths
-  and overgrowth stay as they were whatever the tables do; a publish, unpublish,
-  delete or reset (which mark the graph dirty and change the live set), a title
-  written by the owner or the naming job, and a tunables change (`hypha_visible`)
-  rebuild it at once. Those last two happen outside the tick, and while the
-  network is stopped no tick would come to carry them.
+  live pictures, an md5 of the living and fading galleries' `serial:state:title`,
+  the newest `mycelium_tunables` version and `mycelium_state.updated_at`. Within
+  one tick edge strengths and overgrowth stay as they were whatever the tables
+  do; a publish, unpublish or delete (which mark the graph dirty and change the
+  live set), a reset, wipe, genesis, start or pause (every `store.save_state`
+  moves `updated_at`; a public reset deletes edges and levels while the tick,
+  graph, live set and an already set dirty flag stay as they were), a title
+  written by the owner or the naming job, and a tunables change
+  (`hypha_visible`) rebuild it at once. Titles and tunables change outside the
+  tick, and while the network is stopped no tick would come to carry them.
+- With no tick ahead (stopped, or running with `next_due` already past) the
+  body also expires `STOPPED_MAX_AGE` (60 s) after it was built, on the
+  process's monotonic clock, so overgrowth moved by neglect and views reaches
+  the map without a publish, tunable change or restart. While a tick is
+  scheduled ahead the body is kept for the whole tick.
 - A miss builds under one `asyncio.Lock` in a repeatable read transaction, so
   a tick committing midway cannot mix two ticks; waiting requests take what it
   built.
@@ -1787,7 +1814,10 @@ same positions bit for bit, so no table is needed.
 Payload shape, max over directions, visibility threshold, layer order, the
 gallery gate and memberships; no phrase and no unpublished or queued picture,
 including one unpublished between ticks; the body kept within a tick and
-renewed on the next, `max-age` from `next_due`, behind and stopped; a title
+renewed on the next, `max-age` from `next_due`, behind and stopped; a public
+reset while stopped dropping the kept edges; the kept body expiring after
+`STOPPED_MAX_AGE` while stopped and while behind, and not while a tick is
+scheduled (an injected clock); a title
 change, a cleared title and a `hypha_visible` change reaching the map at once
 while the network is stopped; positions
 unchanged across ticks and after the layout memory is cleared, changed on a

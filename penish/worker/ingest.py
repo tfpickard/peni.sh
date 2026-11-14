@@ -222,9 +222,15 @@ async def _write_text(
     model: str | None,
     prev_body: str | None,
 ) -> None:
+    reembed = field == EMBED_FIELD and body != prev_body
     async with conn.transaction():
+        if reembed:
+            # Before the text row: a facet write and an admin edit take the state row and
+            # then the analysis row, so the other order deadlocks with them. Locked rather
+            # than marked: an owner analysis may turn the model's write away.
+            await mycelium.read_state(conn, lock=True)
         cur = await conn.execute(_UPSERT_TEXT, (image_id, field, body, source, model))
-        if cur.rowcount > 0 and field == EMBED_FIELD and body != prev_body:
+        if cur.rowcount > 0 and reembed:
             # No column records which text an embedding came from, so dropping it in the
             # same transaction is what guarantees a crash can never leave a stale vector.
             await conn.execute(

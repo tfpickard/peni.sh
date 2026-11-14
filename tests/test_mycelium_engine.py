@@ -372,6 +372,14 @@ def test_latched_edges_undirected() -> None:
     assert latched_edges(state) == [(1, 3, 0.4), (2, 4, 0.33)]
 
 
+def test_min_size_above_remerge_size_is_refused() -> None:
+    # A full gallery that must shrink under min_size to admit again dies first instead.
+    with pytest.raises(TunableError, match="min_size <= remerge_size <= max_size"):
+        with_overrides(DEFAULTS, {"min_size": 11})
+    ok = with_overrides(DEFAULTS, {"min_size": 10})
+    assert ok.min_size == ok.remerge_size == 10
+
+
 def test_wither_min_above_colony_leave_is_refused() -> None:
     # Otherwise a latched edge could wither after step 8 and leave its reverse fused alone.
     with pytest.raises(TunableError):

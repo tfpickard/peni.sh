@@ -28,7 +28,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-import anthropic
 import jsonschema
 from psycopg import AsyncConnection
 from psycopg.rows import DictRow
@@ -40,7 +39,13 @@ from penish.mycelium import colonies as colony
 from penish.mycelium import store as mycelium
 from penish.text import no_em_dash
 from penish.worker import haiku, providers
-from penish.worker.describe import DescribeError, call_text, output_config, parse_json
+from penish.worker.describe import (
+    DescribeError,
+    LazyAnthropic,
+    call_text,
+    output_config,
+    parse_json,
+)
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 
 log = logging.getLogger(__name__)
@@ -171,7 +176,7 @@ async def name_gallery(
     the switch (NamingOff) and the daily cap (SoftError with run_after when over) first,
     and recorded as `name`."""
     if client is None:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = LazyAnthropic(settings.anthropic_api_key)
     get = get or runtime.getter(pool, settings)
     model = await get("name.model")
     template = await get("name.prompt")

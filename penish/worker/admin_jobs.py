@@ -178,6 +178,11 @@ async def _apply_described(
     admin explicitly handed back to the model, so owner text there is overwritten."""
     changed = False
     async with conn.transaction():
+        if EMBED_FIELD in want and d.analysis:
+            # Before the analysis row: a facet write and an admin edit take the state row
+            # and then that row, so the other order deadlocks with them. Locked rather
+            # than marked, so an analysis that comes back unchanged costs no rebuild.
+            await mycelium.read_state(conn, lock=True)
         cur = await conn.execute(
             "select body from image_texts where image_id = %s and field = %s",
             (image_id, EMBED_FIELD),
@@ -232,6 +237,9 @@ async def _embed(pool: Pool, image_id: int, settings: Settings, embedder: Docume
     if vec.shape != (settings.embed_dim,):
         raise HardError(f"embedding has shape {vec.shape}, want ({settings.embed_dim},)")
     async with pool.connection() as conn:
+        # The state row before the vector's row, as every embedding write takes them, and
+        # held to commit so a tick cannot clear the mark before it sees the new vector.
+        await mycelium.mark_dirty(conn)
         # Conditional on the text still being what was embedded: an owner edit during the
         # embed enqueues a regen that dedupes into this running job, so nothing else would
         # replace a vector written for the old text.
@@ -258,8 +266,6 @@ async def _embed(pool: Pool, image_id: int, settings: Settings, embedder: Docume
             if await _row(conn, image_id) is None:
                 return
             raise SoftError("analysis changed while embedding")
-        # Same transaction as the vector, committed when the connection is returned.
-        await mycelium.mark_dirty(conn)
     await refresh_corpus_stats(pool, kind=KIND, model=settings.embed_model)
     if prev is not None and prev["model"] != settings.embed_model:
         # The row moved spaces, so the old space's mean and n are now stale too.

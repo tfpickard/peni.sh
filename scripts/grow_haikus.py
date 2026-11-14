@@ -11,12 +11,12 @@ import asyncio
 import sys
 from typing import Any
 
-import anthropic
 import psycopg
 
 from penish import runtime
 from penish.config import get_settings
 from penish.db import make_pool
+from penish.worker.describe import LazyAnthropic
 from penish.worker.grow import (
     Stats,
     build_prompt,
@@ -33,7 +33,7 @@ __all__ = ["Stats", "build_prompt", "grow", "insert", "load_pool", "normalize", 
 
 async def run(args: argparse.Namespace) -> int:
     settings = get_settings()
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = LazyAnthropic(settings.anthropic_api_key)
     embedder: Any = None
     if embeddings_available():
         from penish.worker.embed import Embedder

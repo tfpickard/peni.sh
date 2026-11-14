@@ -11,10 +11,12 @@ from typing import Any
 import httpx
 import numpy as np
 import psycopg
+import pytest
+from psycopg.rows import dict_row
 
 from penish.api import routes_mycelium
 from penish.config import get_settings
-from penish.mycelium import layout
+from penish.mycelium import layout, store
 from tests.test_api_images import DIM, add_image, client  # noqa: F401
 
 # A word that occurs nowhere else, so a hit can only be a phrase.
@@ -241,6 +243,71 @@ async def test_cache_follows_titles_and_tunables_while_stopped(
     )
     body, _ = await fetch(client)
     assert [e["strength"] for e in body["edges"]] == [0.7]
+
+
+async def test_reset_while_stopped_drops_the_kept_edges(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+) -> None:
+    """A public reset deletes edges and levels but keeps the tick, the graph, the live
+    set and, with no gallery to kill, the titles; the dirty flag was set already."""
+    seed(clean_db)
+    sql(
+        clean_db,
+        "update mycelium_state set running = false, graph_dirty = true,"
+        " public_since = now() where id = 1",
+    )
+    body, _ = await fetch(client)
+    assert len(body["edges"]) == 3
+
+    async with await psycopg.AsyncConnection.connect(
+        clean_db, row_factory=dict_row, autocommit=True
+    ) as conn:
+        assert await store.reset(conn) == "public"
+    body, _ = await fetch(client)
+    assert body["edges"] == []
+    assert body["tick"] == 7 and body["graph_version"] == 3
+
+
+async def test_stopped_body_expires(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no tick coming, what changes with time alone (strength here stands for
+    overgrowth, which moves with neglect and views) still reaches the map."""
+    ids, _ = seed(clean_db)
+    t = [1000.0]
+    monkeypatch.setattr(routes_mycelium, "clock", lambda: t[0])
+    sql(clean_db, "update mycelium_state set running = false where id = 1")
+    first, _ = await fetch(client)
+    assert first["edges"][0]["strength"] == 0.7
+
+    strength(clean_db, ids[1], ids[0], 0.95)
+    t[0] += routes_mycelium.STOPPED_MAX_AGE - 1
+    body, _ = await fetch(client)
+    assert body == first
+    t[0] += 2
+    body, _ = await fetch(client)
+    assert body["edges"][0]["strength"] == 0.95
+
+    # Behind schedule: no tick is coming either.
+    sql(
+        clean_db, "update mycelium_state set running = true, next_due = now() - interval '1 minute'"
+    )
+    first, _ = await fetch(client)
+    strength(clean_db, ids[1], ids[0], 0.85)
+    t[0] += routes_mycelium.STOPPED_MAX_AGE + 1
+    body, _ = await fetch(client)
+    assert body["edges"][0]["strength"] == 0.85
+
+    # Running on schedule: kept for the tick, however long the clock says it has been.
+    sql(clean_db, "update mycelium_state set next_due = now() + interval '5 minutes'")
+    first, _ = await fetch(client)
+    strength(clean_db, ids[1], ids[0], 0.75)
+    t[0] += 10 * routes_mycelium.STOPPED_MAX_AGE
+    body, _ = await fetch(client)
+    assert body == first
 
 
 async def test_layout_per_graph_version(client: httpx.AsyncClient, clean_db: str) -> None:  # noqa: F811

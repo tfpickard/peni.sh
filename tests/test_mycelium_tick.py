@@ -844,7 +844,8 @@ async def test_overgrowth_reads_current_tunables(p: Any, clean_db: str) -> None:
         before = await store.overgrowth_by_id(conn, [a])
         await store.set_tunables(conn, {"overgrowth_sigma": 0.0})
         after = await store.overgrowth_by_id(conn, [a])
-    assert cast(float, before[a]) > after[a] == 0.632
+    # 1 - e^-1 drawn at the default cap of 0.85.
+    assert cast(float, before[a]) > after[a] == 0.537
 
 
 async def test_loop_survives_a_failing_tick(

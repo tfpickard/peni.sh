@@ -160,6 +160,8 @@ def with_overrides(base: Tunables, overrides: Mapping[str, Any]) -> Tunables:
     # wither, or its partner would stay fused to nothing for a tick.
     if out.wither_min > out.colony_leave:
         raise TunableError("wither_min must not exceed colony_leave")
-    if out.remerge_size > out.max_size or out.min_size > out.max_size:
+    # A full colony admits again only at or below remerge_size, and one under min_size
+    # dies, so a remerge below the floor would never reopen a full gallery.
+    if not out.min_size <= out.remerge_size <= out.max_size:
         raise TunableError("sizes must satisfy min_size <= remerge_size <= max_size")
     return out

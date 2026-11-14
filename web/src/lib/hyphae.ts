@@ -1,9 +1,5 @@
 import { mulberry32 } from './haiku/rng';
 
-// Mirrors overgrowth_cap in penish/mycelium/tunables.py. The API sends the level; the
-// cap is what keeps a fully overgrown picture recognizable.
-export const OVERGROWTH_CAP = 0.85;
-
 // Dots in a full pattern. Enough to read as growth on a phone tile, few enough that a
 // grid of 48 draws in well under a frame each. Every slug gets exactly this many, so a
 // level covers the same share of every picture.
@@ -82,8 +78,10 @@ export function pattern(slug: string): Dot[] {
 	return dots;
 }
 
+// The API sends coverage with overgrowth_cap already applied, so the admin tunable is
+// the only cap and a level is drawn as given.
 const count = (level: number, total: number) =>
-	Math.round(Math.min(1, Math.max(0, level)) * OVERGROWTH_CAP * total);
+	Math.round(Math.min(1, Math.max(0, level)) * total);
 
 // Below one dot there is nothing to draw, so no canvas is made at all.
 export const visible = (level: number) => count(level, N) >= 1;

@@ -751,9 +751,12 @@ async def _attention(conn: Conn, ids: Sequence[int], at: datetime | None) -> lis
 async def overgrowth_by_id(
     conn: Conn, ids: Sequence[int], tunables: Tunables | None = None
 ) -> dict[int, float]:
-    """Overgrowth in 0..1 per picture, rounded to 3 places; ids not found are absent.
+    """Drawn overgrowth per picture, 0..overgrowth_cap, rounded to 3 places; ids not
+    found are absent.
 
-    One query for the whole batch, plus one for the tunables when none are given.
+    The cap is applied here, the one place every public payload gets the value from, so
+    the admin tunable governs what is drawn and the client needs no copy of it. One
+    query for the whole batch, plus one for the tunables when none are given.
     """
     if not ids:
         return {}
@@ -772,7 +775,7 @@ async def overgrowth_by_id(
             continue
         base = overgrowth.base_from_hours(r["hours"], tau)
         lvl = overgrowth.level(base, r["neighbor_level"], t)
-        out[r["id"]] = round(min(1.0, max(0.0, lvl)), 3)
+        out[r["id"]] = round(overgrowth.coverage(min(1.0, max(0.0, lvl)), t), 3)
     return out
 
 

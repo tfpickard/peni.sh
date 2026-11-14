@@ -124,9 +124,9 @@ async def test_dry_run_inserts_nothing(
         before = len(await gh.load_pool(conn))
     args = SimpleNamespace(n=1, batch=5, dry_run=True, model="m")
     h = ["moss in the mailbox", "the postman sorts around it", "tuesday, as usual"]
-    # monkeypatch, not assignment: gh.anthropic is the real module, and a lambda left in
-    # place of AsyncAnthropic breaks every later isinstance check against it.
-    monkeypatch.setattr(gh.anthropic, "AsyncAnthropic", lambda **_: FakeClient(reply(h)))
+    # The script's own binding, not anthropic.AsyncAnthropic: a lambda left on the real
+    # module breaks every later isinstance check against it.
+    monkeypatch.setattr(gh, "LazyAnthropic", lambda _key: FakeClient(reply(h)))
     monkeypatch.setattr(gh, "embeddings_available", lambda: False)
     monkeypatch.setattr(
         gh, "get_settings", lambda: Settings(database_url=clean_db, anthropic_api_key="t")

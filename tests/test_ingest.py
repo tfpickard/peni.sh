@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
+import psycopg
 import pytest
 import pyvips
 from psycopg.types.json import Jsonb
@@ -121,6 +123,17 @@ async def image(p: Any) -> dict[str, Any]:
 async def texts(p: Any, image_id: int) -> dict[str, dict[str, Any]]:
     rows = await q(p, "select * from image_texts where image_id = %s", image_id)
     return {r["field"]: r for r in rows}
+
+
+async def unlocked(p: Any, sql: str, *args: Any) -> bool:
+    """No other transaction holds a row lock on what `sql` selects."""
+    async with p.connection() as conn:
+        try:
+            async with conn.transaction():
+                await conn.execute(sql + " for update nowait", args)
+        except psycopg.errors.LockNotAvailable:
+            return False
+    return True
 
 
 def present(job: Job) -> bool:
@@ -417,6 +430,26 @@ async def test_owner_analysis_change_reembeds(p: Any, settings: Settings) -> Non
     assert emb.calls[-1] == ["Subject: new."] and not np.allclose(before, after)
     # A model caption never renames a live image.
     assert (await image(p))["slug"] == "a-lamp-in-moss"
+
+
+async def test_owner_analysis_waits_for_the_state_row(p: Any, settings: Settings) -> None:
+    data = png(16)
+    await run(drop(settings, "w", data), p, settings)
+    img = await image(p)
+    analysis = "select 1 from image_texts where image_id = %s and field = 'analysis'"
+    async with p.connection() as held, held.transaction():
+        await held.execute("select 1 from mycelium_state where id = 1 for update")
+        task = asyncio.create_task(
+            run(drop(settings, "w", data, analysis="Subject: new."), p, settings)
+        )
+        await asyncio.sleep(0.5)
+        assert not task.done()
+        # Waiting before the text row, not holding it: a facet write and an admin edit
+        # take the state row and then this one.
+        assert await unlocked(p, analysis, img["id"])
+        assert (await texts(p, img["id"]))["analysis"]["body"] == ANALYSIS
+    await task
+    assert (await texts(p, img["id"]))["analysis"]["body"] == "Subject: new."
 
 
 async def test_haiku_job(p: Any, settings: Settings) -> None:

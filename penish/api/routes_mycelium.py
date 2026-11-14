@@ -4,7 +4,8 @@ between them and the living galleries they form.
 Positions come from the whole layer's candidate graph (`layout.force_layout`), so they
 change only when that graph is rebuilt, and are kept in memory per input. The rest
 changes every tick, so the whole response is kept per tick and the browser may keep it
-until the next one is due.
+until the next one is due. With no tick coming (stopped, or behind schedule) it is kept
+for `STOPPED_MAX_AGE` at most, so neglect and views still reach the map.
 
 Reads edge state, candidate affinities and colonies only: no need or offer phrase, no
 picture that is not live. Galleries follow the public gate like every gallery payload;
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -29,7 +31,8 @@ from penish.mycelium.tunables import TICK_SECONDS
 router = APIRouter()
 
 WHOLE = "whole"
-# While stopped no tick will come; a publish or unpublish still changes the map.
+# While stopped no tick will come; a publish or unpublish still changes the map, and
+# overgrowth keeps moving with time and views. Bounds the browser's copy and ours.
 STOPPED_MAX_AGE = 60
 # Layouts kept in memory. One is current; the others cover a request that read just
 # before a rebuild committed.
@@ -37,11 +40,24 @@ LAYOUTS_KEPT = 4
 
 _layouts: OrderedDict[str, layout.Positions] = OrderedDict()
 
+# Monotonic, so a wall clock step cannot keep a body forever; tests replace it.
+clock = time.monotonic
+
 
 @dataclass(frozen=True, slots=True)
 class _Cached:
     key: tuple[Any, ...]
     body: bytes
+    built: float
+
+    def fresh(self, key: tuple[Any, ...], st: store.State) -> bool:
+        if self.key != key:
+            return False
+        # A tick on schedule renews the key itself; without one, neglect and views
+        # would otherwise never reach the map.
+        if _tick_coming(st):
+            return True
+        return clock() - self.built < STOPPED_MAX_AGE
 
 
 async def _key(conn: store.Conn) -> tuple[tuple[Any, ...], store.State]:
@@ -50,7 +66,11 @@ async def _key(conn: store.Conn) -> tuple[tuple[Any, ...], store.State]:
     delete, reset) is part of it, so a picture that stops being live leaves the map
     before the next tick. Titles and tunables change outside the tick (the owner, the
     naming job, the admin), and while the network is stopped no tick would ever come
-    to carry them."""
+    to carry them.
+
+    The state row's `updated_at` stands for every write that goes through
+    `store.save_state`: a reset or wipe deletes edges and levels without moving the
+    tick, the graph or the live set, and the dirty flag it sets is often set already."""
     st = await store.read_state(conn)
     cur = await conn.execute(
         """
@@ -61,7 +81,8 @@ async def _key(conn: store.Conn) -> tuple[tuple[Any, ...], store.State]:
                                 '')
                   from colonies
                  where serial is not null and state in ('alive', 'fading')) as titles,
-               (select coalesce(max(version), 0) from mycelium_tunables) as tunables
+               (select coalesce(max(version), 0) from mycelium_tunables) as tunables,
+               (select updated_at from mycelium_state where id = 1) as changed
         """
     )
     live = await cur.fetchone()
@@ -76,6 +97,7 @@ async def _key(conn: store.Conn) -> tuple[tuple[Any, ...], store.State]:
         int(live["s"]),
         str(live["titles"]),
         int(live["tunables"]),
+        live["changed"],
     )
     return key, st
 
@@ -191,6 +213,11 @@ async def build(conn: store.Conn, st: store.State) -> dict[str, Any]:
     }
 
 
+def _tick_coming(st: store.State) -> bool:
+    """Whether a tick is scheduled ahead of this read, to renew the key."""
+    return st.running and st.next_due is not None and st.next_due > st.now
+
+
 def _max_age(st: store.State) -> int:
     """Until the next tick is due, as far as this read could tell."""
     if not st.running or st.next_due is None:
@@ -210,22 +237,24 @@ def _lock(request: Request) -> asyncio.Lock:
 @router.get("/api/mycelium")
 async def mycelium_map(request: Request) -> Response:
     """`{graph_version, tick, nodes: [{slug, x, y, overgrowth, galleries}], edges: [{a, b,
-    layer, strength}], galleries: [{serial, title, state}]}`, kept for one tick."""
+    layer, strength}], galleries: [{serial, title, state}]}`, kept for one tick, or for
+    `STOPPED_MAX_AGE` when none is coming."""
     pool = request.app.state.pool
     async with pool.connection() as conn:
         key, st = await _key(conn)
     cached: _Cached | None = getattr(request.app.state, "mycelium_map", None)
-    if cached is None or cached.key != key:
+    if cached is None or not cached.fresh(key, st):
         # One request builds; the others wait and take what it built.
         async with _lock(request):
             cached = getattr(request.app.state, "mycelium_map", None)
-            if cached is None or cached.key != key:
+            if cached is None or not cached.fresh(key, st):
                 async with pool.connection() as conn, conn.transaction():
                     # One snapshot, so a tick committing midway cannot mix two ticks.
                     await conn.execute("set transaction isolation level repeatable read")
                     key, st = await _key(conn)
                     payload = await build(conn, st)
-                cached = _Cached(key, json.dumps(payload, separators=(",", ":")).encode())
+                body = json.dumps(payload, separators=(",", ":")).encode()
+                cached = _Cached(key, body, clock())
                 request.app.state.mycelium_map = cached
     return Response(
         cached.body,

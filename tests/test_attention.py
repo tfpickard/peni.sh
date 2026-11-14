@@ -14,8 +14,11 @@ from tests.test_api_images import add_image, client, sha, unit  # noqa: F401
 
 H = {"X-Requested-With": "penish"}
 MIGRATION = Path(__file__).resolve().parent.parent / "migrations" / "006_attention.sql"
-# 1 - e^-1: a picture unseen for exactly one time constant.
-ONE_TAU = 0.632
+# Payloads carry drawn coverage: the level times overgrowth_cap. FULL is a picture
+# grown over completely; ONE_TAU one unseen for exactly one time constant, 1 - e^-1.
+CAP = DEFAULTS.overgrowth_cap
+FULL = CAP
+ONE_TAU = round((1 - 2.718281828459045**-1) * CAP, 3)
 
 
 @pytest.fixture(autouse=True)
@@ -224,7 +227,7 @@ async def test_overgrowth_on_every_tile(
         assert items, name
         for v in _values(items):
             assert isinstance(v, float), name
-        assert set(_values(items)) == {1.0}, name
+        assert set(_values(items)) == {FULL}, name
 
     # One view clears exactly that picture, wherever it shows up.
     assert (await view(client)).status_code == 204
@@ -232,7 +235,7 @@ async def test_overgrowth_on_every_tile(
     for name, items in after.items():
         assert items, name
         assert {it["slug"]: it["overgrowth"] for it in items} == {
-            it["slug"]: 0.0 if it["slug"] == "img-1" else 1.0 for it in items
+            it["slug"]: 0.0 if it["slug"] == "img-1" else FULL for it in items
         }, name
     for name in ("newest", "random", "search", "strips"):
         assert "img-1" in {it["slug"] for it in after[name]}, name
@@ -246,10 +249,63 @@ async def test_fresh_view_clears_overgrowth(client: httpx.AsyncClient, clean_db:
     unseen_for(clean_db, a, 10_000)
     unseen_for(clean_db, b, 10_000)
     by = {i["slug"]: i["overgrowth"] for i in (await client.get("/api/images")).json()["items"]}
-    assert by == {"img-1": 1.0, "img-2": 1.0}
+    assert by == {"img-1": FULL, "img-2": FULL}
     assert (await view(client)).status_code == 204
     by = {i["slug"]: i["overgrowth"] for i in (await client.get("/api/images")).json()["items"]}
-    assert by == {"img-1": 0.0, "img-2": 1.0}
+    assert by == {"img-1": 0.0, "img-2": FULL}
+
+
+async def test_cap_tunable_governs_every_surface(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from penish.api import embed_client
+
+    for n in range(1, 4):
+        add_image(clean_db, n, vec=unit(n - 1))
+    with psycopg.connect(clean_db) as conn:
+        conn.execute(
+            "insert into image_categories (image_id, category, source)"
+            " select id, 'cartoon', 'model' from images"
+        )
+        conn.execute(
+            "insert into tags (image_id, tag, source) select id, 'cup', 'model' from images"
+        )
+        conn.commit()
+
+    async def fake(text: str, **kw: Any) -> dict[str, Any]:
+        return {"vector": unit(0), "model": None, "dim": len(unit(0))}
+
+    monkeypatch.setattr(embed_client, "embed_query_full", fake)
+
+    def set_cap(cap: float) -> None:
+        with psycopg.connect(clean_db) as conn:
+            conn.execute(
+                'insert into mycelium_tunables ("values") values (%s)',
+                (psycopg.types.json.Jsonb({"overgrowth_cap": cap}),),
+            )
+            conn.commit()
+
+    async def levels() -> dict[str, set[float]]:
+        detail = (await client.get("/api/images/img-1")).json()
+        covers = (await client.get("/api/categories")).json()["categories"]
+        return {
+            name: {it["overgrowth"] for it in items}
+            for name, items in {
+                "newest": (await client.get("/api/images")).json()["items"],
+                "search": (await client.get("/api/search", params={"q": "cup"})).json()["items"],
+                "covers": [c["cover"] for c in covers if c["cover"]],
+                "strips": detail["similar"] + detail["dissimilar"],
+                "map": (await client.get("/api/mycelium")).json()["nodes"],
+            }.items()
+        }
+
+    # Fully grown over everywhere, so each surface shows the cap itself.
+    for cap in (0.5, 0.0):
+        set_cap(cap)
+        for name, got in (await levels()).items():
+            assert got == {cap}, name
 
 
 # -- rows created up front --------------------------------------------------
@@ -401,8 +457,22 @@ async def test_og_neighbor_spread_and_clamp(pool: object, clean_db: str) -> None
         conn.execute("insert into view_days (day, n) values (current_date, 1000)")
         conn.commit()
     got = await _og(p, [a, b])
-    assert got[a] == round((1 - 2.718281828459045**-1) * (1 + DEFAULTS.overgrowth_sigma), 3)
-    assert got[b] == 1.0
+    assert got[a] == round((1 - 2.718281828459045**-1) * (1 + DEFAULTS.overgrowth_sigma) * CAP, 3)
+    assert got[b] == FULL
+
+
+async def test_og_is_drawn_coverage_under_the_configured_cap(pool: object, clean_db: str) -> None:
+    p = cast(Any, pool)
+    a = await _img(p, 1)
+    unseen_for(clean_db, a, 10_000)
+    assert await _og(p, [a]) == {a: FULL}
+    async with p.connection() as conn:
+        await store.set_tunables(conn, {"overgrowth_cap": 0.4})
+        assert await store.overgrowth_by_id(conn, [a]) == {a: 0.4}
+        await store.set_tunables(conn, {"overgrowth_cap": 0.0})
+        assert await store.overgrowth_by_id(conn, [a]) == {a: 0.0}
+        # Tunables passed in win over the stored ones, as the map passes its own.
+        assert await store.overgrowth_by_id(conn, [a], DEFAULTS) == {a: FULL}
 
 
 # -- clicks become traffic --------------------------------------------------

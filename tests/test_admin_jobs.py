@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,7 +21,18 @@ from penish.worker.admin_jobs import (
 from penish.worker.describe import Described, DescribeError, expand
 from penish.worker.grow import Stats
 from penish.worker.jobs import HardError, Job, SoftError
-from tests.test_ingest import DIM, FakeDescriber, FakeEmbedder, drop, png, pub_files, q, run
+from tests.test_ingest import (
+    ANALYSIS,
+    DIM,
+    FakeDescriber,
+    FakeEmbedder,
+    drop,
+    png,
+    pub_files,
+    q,
+    run,
+    unlocked,
+)
 
 TAGS2 = ["fern", "bulb", "stool", "pane", "ash", "night"]
 ANALYSIS2 = "Subject: a bulb.\n\nSetting: ferns.\n\nStyle: photo.\n\nMood: still."
@@ -244,6 +256,35 @@ async def test_regen_embedding_uses_current_analysis(p: Any, settings: Settings)
     assert e.calls == [["Subject: owner analysis now."]]
     assert await vec(p, image_id) is not None
     assert await history(p) == before + 1
+
+
+async def test_regen_analysis_waits_for_the_state_row(p: Any, settings: Settings) -> None:
+    image_id = await live(p, settings)
+    analysis = "select 1 from image_texts where image_id = %s and field = 'analysis'"
+    async with p.connection() as held, held.transaction():
+        await held.execute("select 1 from mycelium_state where id = 1 for update")
+        task = asyncio.create_task(regen(p, settings, image_id, ["analysis"]))
+        await asyncio.sleep(0.5)
+        assert not task.done()
+        # A facet write and an admin edit take the state row and then the analysis row,
+        # so the regen must be waiting before that row, not holding it.
+        assert await unlocked(p, analysis, image_id)
+        assert (await text_rows(p, image_id))["analysis"]["body"] == ANALYSIS
+    await task
+    assert (await text_rows(p, image_id))["analysis"]["body"] == ANALYSIS2
+
+
+async def test_regen_embedding_waits_for_the_state_row(p: Any, settings: Settings) -> None:
+    image_id = await live(p, settings)
+    vector = "select 1 from embeddings where image_id = %s and kind = 'description'"
+    async with p.connection() as held, held.transaction():
+        await held.execute("select 1 from mycelium_state where id = 1 for update")
+        task = asyncio.create_task(regen(p, settings, image_id, ["embedding"]))
+        await asyncio.sleep(0.5)
+        assert not task.done()
+        assert await unlocked(p, vector, image_id)
+    await task
+    assert await vec(p, image_id) is not None
 
 
 async def test_regen_haiku_links_image(p: Any, settings: Settings) -> None:

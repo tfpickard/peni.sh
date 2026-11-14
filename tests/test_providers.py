@@ -12,9 +12,14 @@ import pyvips
 from penish import runtime
 from penish.config import Settings, get_settings
 from penish.worker import jobs, providers
-from penish.worker.describe import DescribeError, call_text, output_config
+from penish.worker.categorize import classify
+from penish.worker.describe import DescribeError, LazyAnthropic, call_text, describe, output_config
+from penish.worker.facet_jobs import extract
+from penish.worker.grow import grow_into
+from penish.worker.haiku import haiku_from
 from penish.worker.heartbeat import beat
 from penish.worker.jobs import Job, SoftError
+from penish.worker.name_jobs import Inputs, name_gallery
 from tests.test_admin_ops import client, sql  # noqa: F401  (client is a fixture)
 
 KEYS = Settings(
@@ -407,6 +412,98 @@ async def test_prefixed_id_keeps_a_test_fake(wire: Any) -> None:
     fake = FakeClient()
     text, _ = await call("openai:gpt-6-astra", kwargs(), via=fake)
     assert text == "hi" and w.requests == []
+
+
+# -- no anthropic key -----------------------------------------------------
+
+ASTRA = "openai:gpt-6-astra"
+NO_ANTHROPIC = Settings(
+    anthropic_api_key=None, openai_api_key="ok", describe_model=ASTRA, haiku_model=ASTRA
+)
+
+
+def responses(answer: dict[str, Any]) -> dict[str, Any]:
+    msg = {"type": "output_text", "text": json.dumps(answer)}
+    return {
+        "output": [{"type": "message", "role": "assistant", "content": [msg]}],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+@pytest.fixture
+def anthropic_unresolvable(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    # With no key the SDK goes looking for a profile at construction; one that is named
+    # but absent makes that raise, which is what an eagerly built client tripped over.
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("ANTHROPIC_PROFILE", "absent")
+    with pytest.raises(Exception, match="absent"):
+        anthropic.AsyncAnthropic(api_key=None)
+
+
+HAIKU = ["moss on the kettle", "it boils water anyway", "tea at four as planned"]
+
+
+async def _describe(pool: Any) -> Any:
+    return await describe(webp(), "image/webp", want={"caption"}, settings=NO_ANTHROPIC)
+
+
+async def _extract(pool: Any) -> Any:
+    return await extract(webp(), "image/webp", settings=NO_ANTHROPIC)
+
+
+async def _classify(pool: Any) -> Any:
+    return await classify(webp(), "image/webp", settings=NO_ANTHROPIC)
+
+
+async def _haiku(pool: Any) -> Any:
+    return await haiku_from("a kettle", settings=NO_ANTHROPIC)
+
+
+async def _name(pool: Any) -> Any:
+    return await name_gallery(Inputs(["a kettle"], ["kettle"], []), settings=NO_ANTHROPIC)
+
+
+async def _grow(pool: Any) -> Any:
+    return await grow_into(pool, 1, settings=NO_ANTHROPIC, batch=1)
+
+
+FACET_ANSWER = {
+    **{f: f"a plain {f}" for f in ("subject", "setting", "style", "mood")},
+    "offers": ["heat"],
+    "needs": ["water"],
+}
+
+
+@pytest.mark.parametrize(
+    ("job", "answer"),
+    [
+        (_describe, {"caption": "a stove"}),
+        (_extract, FACET_ANSWER),
+        (_classify, {"categories": ["drawing"]}),
+        (_haiku, {"lines": HAIKU}),
+        (_name, {"title": "the kettle", "haiku": HAIKU}),
+        (_grow, {"haikus": [HAIKU]}),
+    ],
+    ids=["describe", "extract", "categorize", "haiku", "name", "grow"],
+)
+async def test_prefixed_model_needs_no_anthropic_key(
+    wire: Any, anthropic_unresolvable: None, pool: Any, job: Any, answer: dict[str, Any]
+) -> None:
+    w = wire(body=responses(answer))
+    assert await job(pool)
+    assert len(w.requests) == 1 and str(w.requests[0].url).startswith("https://api.openai.com")
+
+
+async def test_bare_model_without_anthropic_key_is_refused(
+    wire: Any, anthropic_unresolvable: None
+) -> None:
+    w = wire(body=RESPONSES_OK)
+    with pytest.raises(DescribeError) as e:
+        await call_text(LazyAnthropic(None), model="claude-sonnet-5-5", create_kwargs=kwargs())
+    assert str(e.value) == "no key for anthropic" and not e.value.retryable
+    assert w.requests == []
 
 
 # -- daily cap ------------------------------------------------------------
