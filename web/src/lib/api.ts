@@ -18,16 +18,25 @@ export type ImageItem = {
 	blurhash: string;
 	palette: string[];
 	variants: Variant[];
+	// 0..1, how far neglect has grown over the picture; drawn on tiles only.
+	overgrowth: number;
 };
 // count rides only on the first page of a tag listing.
 export type ImagePage = { items: ImageItem[]; next_cursor: string | null; count?: number };
 export type TagCount = { tag: string; n: number };
 export type SearchResult = { q: string; tags: TagCount[]; items: ImageItem[] };
 export type Text = { body: string; source: string; model: string | null };
-export type Neighbor = { slug: string; score: number; blurhash: string; src: string };
+export type Neighbor = {
+	slug: string;
+	score: number;
+	blurhash: string;
+	src: string;
+	overgrowth: number;
+};
 export type Votes = { up: number; down: number; net: number; mine: -1 | 0 | 1 };
 export type Comment = { name: string | null; body: string; created_at: string };
-export type ImageDetail = ImageItem & {
+// The picture being looked at is the one a view clears, so the detail carries no level.
+export type ImageDetail = Omit<ImageItem, 'overgrowth'> & {
 	caption: Text | null;
 	description: Text | null;
 	prompt: Text | null;
@@ -120,5 +129,14 @@ export const postComment = (
 	slug: string,
 	c: { name: string | null; body: string; turnstile: string | null }
 ) => post<{ ok: true }>(`/api/images/${encodeURIComponent(slug)}/comments`, c);
+
+// Fire and forget: keepalive lets the view land even when the visitor has just left.
+export const postView = (slug: string, from: string | null) =>
+	fetch(`/api/images/${encodeURIComponent(slug)}/view`, {
+		method: 'POST',
+		keepalive: true,
+		headers: { 'x-requested-with': 'penish', 'content-type': 'application/json' },
+		body: JSON.stringify({ from })
+	}).then((r) => r.ok);
 
 export const getConfig = () => get<{ turnstile_site_key: string | null }>('/api/config');

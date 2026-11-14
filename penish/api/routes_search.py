@@ -11,6 +11,7 @@ from penish.api.routes_images import grid_items
 from penish.api.social import RateLimit, ip_hash
 from penish.categories import CATEGORIES
 from penish.config import get_settings
+from penish.mycelium.store import overgrowth_by_id
 from penish.text import slugify
 
 router = APIRouter()
@@ -57,17 +58,18 @@ async def categories(request: Request) -> dict[str, Any]:
         cur = await conn.execute(
             f"""
             select c.category, count(*) over (partition by c.category)::int as n,
-                   i.pub_sha, i.slug, i.width, i.height, i.blurhash, i.palette
+                   i.id, i.pub_sha, i.slug, i.width, i.height, i.blurhash, i.palette
               from image_categories c join images i on i.id = c.image_id
              where {_LIVE}
              order by c.category, i.published_at desc, i.id desc
             """.encode()
         )
         rows = await cur.fetchall()
-    first: dict[str, dict[str, Any]] = {}
-    for r in rows:
-        first.setdefault(r["category"], r)
-    covers = dict(zip(first, grid_items(list(first.values())), strict=True))
+        first: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            first.setdefault(r["category"], r)
+        og = await overgrowth_by_id(conn, [r["id"] for r in first.values()])
+    covers = dict(zip(first, grid_items(list(first.values()), og), strict=True))
     return {
         "categories": [
             {
@@ -165,6 +167,7 @@ async def search(
     async with pool.connection() as conn:
         cur = await conn.execute(sql.encode(), params)
         rows = await cur.fetchall()
+        og = await overgrowth_by_id(conn, [r["id"] for r in rows])
     if emb is None and not rows and not tags:
         raise HTTPException(status_code=503, detail="search unavailable")
-    return {"q": q, "tags": tags, "items": grid_items(rows)}
+    return {"q": q, "tags": tags, "items": grid_items(rows, og)}

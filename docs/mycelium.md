@@ -244,3 +244,82 @@ Peak size is the most members a colony has held while living.
 0 verify and simulate, 1 attention and overgrowth, 2 the network on the whole
 layer, 3 providers and facets, 4 fruiting and death, 5 needs and offers,
 6 naming and the map. Detail per increment lives with each change.
+
+## Increment 1
+
+Attention and overgrowth. Useful alone: neglected pictures grow over, a view
+clears them. `neighbor_level` is 0 everywhere until the tick writes it in
+Increment 2.
+
+### Tables (`migrations/006_attention.sql`)
+
+| Table | Columns | Notes |
+|---|---|---|
+| `picture_attention` | `image_id bigint` primary key, references `images` on delete cascade; `views integer` default 0; `last_viewed_at timestamptz not null`; `neighbor_level double precision` default 0 | One row per picture. Backfilled for every existing image with `last_viewed_at = now()` at migration time, and upserted in the `ingest._go_live` transaction (`on conflict` resets `last_viewed_at = now()`, keeps `views`), so nothing starts overgrown, including a picture that waited in the queue with a row from an earlier stint |
+| `view_days` | `day date` primary key; `n integer` default 0 | Counted views per day; the pace behind tau |
+
+Neither table has a column about the visitor: no address, no hash, no cookie,
+no user agent. A test introspects `information_schema` to keep it that way.
+Both join the truncate list in `tests/conftest.py`.
+
+### `POST /api/images/{slug}/view`
+
+- Body optional: `{"from": slug | null}`. `from` is a string of `[a-z0-9-]`,
+  1 to 100 characters, or null; anything else is 422. In this increment it is
+  validated and dropped; Increment 2 turns it into traffic on a candidate edge.
+- Guards in order: `social._gate` (`x-requested-with: penish`, else 403
+  `no`); `attention.view_limit`, a `social.RateLimit` of 30 per 60 s keyed by
+  `ip_hash` in memory only (429 `wait`), checked before the lookup so a flood
+  never reaches the database; `resolve_live` (current slug or alias of a live
+  picture, else 404 `not here`).
+- `store.record_view` in one transaction: an upsert into
+  `picture_attention` that sets `views + 1, last_viewed_at = now()` only
+  `where last_viewed_at < now() - interval '1 minute'`. The minute rule lives
+  in the row, so it holds across restarts and processes. Only when a row came
+  back does `view_days(current_date)` gain one.
+- Never touches `images.updated_at`, which versions the sort snapshots.
+- Returns 204 with no body.
+
+### Overgrowth on tiles
+
+`store.overgrowth_by_id(conn, ids, tunables=DEFAULTS) -> dict[int, float]`,
+one query per batch:
+
+- `live` = count of live published pictures; `views` = `sum(view_days.n)`
+  where `day > current_date - 7` (seven days, today included).
+- `tau = overgrowth.tau_hours(live, views_per_day(views), tunables)`, so at
+  least `overgrowth_tau_min_h` (72 h) with no views or no live pictures.
+- `hours` = database `now()` minus `last_viewed_at`, or `published_at` when a
+  picture has no attention row; 0 overgrowth when it has neither.
+- `min(1, base * (1 + overgrowth_sigma * neighbor_level))`, clamped to 0..1,
+  rounded to 3 places.
+- Tunables are `tunables.DEFAULTS` until the versioned table arrives in
+  Increment 2.
+
+Payloads gain `overgrowth: float` on:
+
+- every item of `GET /api/images` (newest and computed sorts),
+  `GET /api/search` and each category `cover` of `GET /api/categories` (its
+  query now selects `i.id`); all through `grid_items(rows, overgrowth)`;
+- every entry of `similar` and `dissimilar` in `GET /api/images/{slug}`.
+
+The detail payload itself carries no overgrowth for the picture being shown.
+
+### Client
+
+`ImageItem.overgrowth` and `Neighbor.overgrowth` in `web/src/lib/api.ts`.
+The image page sends the view two seconds after it is shown (`fetch` with
+`keepalive`, cancelled when the reader leaves first), `from` being the
+previous image slug from `afterNavigate`, or null when that slug does not
+match `^[a-z0-9-]{1,100}$` (a mistyped URL would otherwise make the server
+422 the whole view). Slugs viewed this session render at
+0 everywhere, including grids restored from a snapshot. `lib/hyphae.ts` draws
+a fixed dot order seeded from the slug, so only extent changes with level,
+capped at `overgrowth_cap`, once, near the viewport, no animation. Every slug
+gets exactly 220 dots (a tip that would leave the picture turns back off the
+edge rather than dying), so a level covers the same share of every picture;
+`tests/test_hyphae.py` runs the shipped source under node to hold that.
+
+### Deferred
+
+- The `most overgrown` sort.

@@ -7,6 +7,7 @@ from penish.api import (
     admin,
     admin_ops,
     admin_pictures,
+    attention,
     index,
     media,
     routes_images,
@@ -39,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_ops.router)
     app.include_router(admin_pictures.router)
     app.include_router(social.router)
+    app.include_router(attention.router)
     app.middleware("http")(admin.no_store)
     # Last: its catch-all must not shadow routes registered above it.
     app.include_router(index.router)

@@ -1,4 +1,5 @@
 import hashlib
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
@@ -9,6 +10,7 @@ from penish.api.media import variants_for, variants_for_many
 from penish.api.social import approved_comments, vote_summary, voter_for
 from penish.categories import LABELS, SLUGS
 from penish.config import get_settings
+from penish.mycelium.store import overgrowth_by_id
 from penish.similarity import Mode, image_metrics, neighbors
 from penish.sort import EMBEDDED, SEEDED, SORTS, OrderCache, Row, Sort, order
 
@@ -20,8 +22,11 @@ PUBLIC_TEXTS = ("caption", "description", "prompt")
 _LIVE = "status = 'live' and published_at is not null"
 
 
-def grid_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Rows of images (pub_sha, slug, width, height, blurhash, palette) as grid entries."""
+def grid_items(rows: list[dict[str, Any]], overgrowth: Mapping[int, float]) -> list[dict[str, Any]]:
+    """Rows of images (id, pub_sha, slug, width, height, blurhash, palette) as grid entries.
+
+    overgrowth comes from one overgrowth_by_id call for the whole batch.
+    """
     variants = variants_for_many((r["pub_sha"], r["width"], r["height"]) for r in rows)
     return [
         {
@@ -31,6 +36,7 @@ def grid_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "blurhash": r["blurhash"],
             "palette": r["palette"],
             "variants": variants[r["pub_sha"]],
+            "overgrowth": overgrowth.get(r["id"], 0.0),
         }
         for r in rows
     ]
@@ -112,11 +118,12 @@ async def list_images(
             params,
         )
         rows = await cur.fetchall()
-    # One extra row tells us whether another page exists without a count query.
-    more = len(rows) > limit
-    rows = rows[:limit]
+        # One extra row tells us whether another page exists without a count query.
+        more = len(rows) > limit
+        rows = rows[:limit]
+        og = await overgrowth_by_id(conn, [r["id"] for r in rows])
     next_cursor = _encode_cursor(rows[-1]["published_at"], rows[-1]["id"]) if more else None
-    out: dict[str, Any] = {"items": grid_items(rows), "next_cursor": next_cursor}
+    out: dict[str, Any] = {"items": grid_items(rows, og), "next_cursor": next_cursor}
     if count is not None:
         out["count"] = count
     return out
@@ -169,11 +176,12 @@ async def _sorted_page(
             {**vp, "ids": page},
         )
         found = {r["id"]: r for r in await cur.fetchall()}
+        og = await overgrowth_by_id(conn, list(found))
     # A picture hidden or untagged since the snapshot is skipped, not returned as a hole.
     rows_out = [found[i] for i in page if i in found]
     nxt = offset + limit
     out: dict[str, Any] = {
-        "items": grid_items(rows_out),
+        "items": grid_items(rows_out, og),
         "next_cursor": f"{token}.{nxt}" if nxt < len(ids) else None,
     }
     if scope_where and not cursor:
@@ -354,6 +362,7 @@ async def image_detail(
 
     ids = [n.image_id for n in (*nb.similar, *nb.dissimilar)]
     meta: dict[int, dict[str, Any]] = {}
+    og: dict[int, float] = {}
     if ids:
         async with pool.connection() as conn:
             cur = await conn.execute(
@@ -361,6 +370,7 @@ async def image_detail(
                 (ids,),
             )
             meta = {r["id"]: r for r in await cur.fetchall()}
+            og = await overgrowth_by_id(conn, ids)
     nb_variants = variants_for_many((m["pub_sha"], m["width"], m["height"]) for m in meta.values())
 
     def strip(neighbor_list: list[Any]) -> list[dict[str, Any]]:
@@ -376,6 +386,7 @@ async def image_detail(
                     "score": round(n.score, 3),
                     "blurhash": m["blurhash"],
                     "src": (pick["webp"] or pick["avif"]) if pick else None,
+                    "overgrowth": og.get(n.image_id, 0.0),
                 }
             )
         return out

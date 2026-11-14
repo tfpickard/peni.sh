@@ -363,6 +363,15 @@ async def _go_live(conn: Conn, image_id: int, base: str, surprise: float | None)
                             " on conflict do nothing",
                             (kind, Jsonb({"image_id": image_id}), f"{kind}:{image_id}"),
                         )
+                    # A new picture starts as just seen, not as neglected since upload.
+                    # A row left from an earlier stint (or an older backfill) would carry
+                    # a stale clock, so going live resets it; views stay counted.
+                    await conn.execute(
+                        "insert into picture_attention (image_id, last_viewed_at)"
+                        " values (%s, now()) on conflict (image_id)"
+                        " do update set last_viewed_at = now()",
+                        (image_id,),
+                    )
             return went_live
         except psycopg.errors.UniqueViolation:
             # Another image claimed the same slug between our check and the update.

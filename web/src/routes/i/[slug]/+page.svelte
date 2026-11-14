@@ -1,10 +1,12 @@
 <script lang="ts">
-	import { goto, preloadData } from '$app/navigation';
+	import { afterNavigate, goto, preloadData } from '$app/navigation';
 	import { tick } from 'svelte';
 	import Picture from '../../../lib/components/Picture.svelte';
 	import Strip from '../../../lib/components/Strip.svelte';
 	import Votes from '../../../lib/components/Votes.svelte';
 	import Comments from '../../../lib/components/Comments.svelte';
+	import { postView } from '../../../lib/api';
+	import { markViewed } from '../../../lib/viewed';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -37,6 +39,48 @@
 	$effect(() => {
 		data;
 		window.scrollTo(0, 0);
+	});
+
+	// The picture this one was reached from, when that was a picture too. Same-route
+	// navigation reuses this component, so it is refreshed on every arrival.
+	let cameFrom: string | null = null;
+	// The server rejects the whole view over a malformed `from`, and a mistyped URL can
+	// sit on this route as 'not here'; dropping it here keeps the real view.
+	const SLUG = /^[a-z0-9-]{1,100}$/;
+	afterNavigate((nav) => {
+		const f = nav.from;
+		const prev = f?.route.id === '/i/[slug]' ? f.params?.slug : undefined;
+		cameFrom = prev && SLUG.test(prev) ? prev : null;
+	});
+
+	// A derived primitive, so a reload of the same picture (another ?sim) does not restart it.
+	const viewing = $derived(image?.slug ?? null);
+
+	// A view counts once the picture has been on screen for two seconds. Leaving sooner
+	// cancels it; a background tab waits until it is brought forward.
+	$effect(() => {
+		const slug = viewing;
+		if (!slug) return;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let sent = false;
+		const arm = () => {
+			clearTimeout(timer);
+			if (sent || document.visibilityState !== 'visible') return;
+			timer = setTimeout(() => {
+				sent = true;
+				// Read at send time: afterNavigate runs after this effect has armed.
+				const from = cameFrom === slug ? null : cameFrom;
+				postView(slug, from)
+					.then((ok) => ok && markViewed(slug))
+					.catch(() => {});
+			}, 2000);
+		};
+		arm();
+		document.addEventListener('visibilitychange', arm);
+		return () => {
+			clearTimeout(timer);
+			document.removeEventListener('visibilitychange', arm);
+		};
 	});
 
 	// Swipe left for the next picture in grid order, right for the previous one. The hero

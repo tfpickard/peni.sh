@@ -86,8 +86,8 @@ def clean_db(database_url: str) -> str:
         # would wipe the seed deck along with them.
         conn.execute("delete from haikus where source <> 'seed'")
         conn.execute(
-            "truncate jobs, corpus_stats, corpus_stats_history, settings, api_usage, heartbeats"
-            " restart identity"
+            "truncate jobs, corpus_stats, corpus_stats_history, settings, api_usage, heartbeats,"
+            " picture_attention, view_days restart identity"
         )
         conn.execute("delete from images")
     return database_url

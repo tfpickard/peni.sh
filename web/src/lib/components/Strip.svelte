@@ -1,4 +1,5 @@
 <script lang="ts">
+	import Hyphae from './Hyphae.svelte';
 	import type { Neighbor } from '../api';
 
 	let { label, items }: { label: string; items: Neighbor[] } = $props();
@@ -13,6 +14,7 @@
 					<a href="/i/{n.slug}">
 						<span class="thumb" style:background-image={hashUrl(n.blurhash)}>
 							<img src={n.src} alt="" loading="lazy" decoding="async" />
+							<Hyphae slug={n.slug} level={n.overgrowth} />
 						</span>
 					</a>
 					<span class="score">{n.score.toFixed(2)}</span>
@@ -71,6 +73,7 @@
 		scroll-snap-align: start;
 	}
 	.thumb {
+		position: relative;
 		display: block;
 		height: 7rem;
 		background-size: cover;
