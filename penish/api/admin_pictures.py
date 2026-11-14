@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 from typing import Any, Literal
 
@@ -29,6 +30,8 @@ from penish.worker.derive import clamp_rect
 from penish.worker.ingest import EMBED_FIELD
 from penish.worker.jobs import enqueue
 from penish.worker.metrics import refresh_corpus_stats
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/admin/pictures",
@@ -469,11 +472,17 @@ async def crop_picture(request: Request, image_id: int, body: CropBody) -> dict[
 # -- delete -----------------------------------------------------------------
 
 
-@router.delete("/{image_id}")
-async def delete_picture(request: Request, image_id: int) -> dict[str, bool]:
+async def _delete(pool: Any, image_id: int) -> tuple[str, list[str]] | None:
+    """Remove one picture and its files. Its status and embedding models, or None if gone.
+
+    Corpus stats are left to the caller, so a bulk delete refreshes them once.
+    """
     settings = get_settings()
-    pool = _pool(request)
-    row = await _require(request, image_id)
+    async with pool.connection() as conn:
+        cur = await conn.execute("select sha256 from images where id = %s", (image_id,))
+        row = await cur.fetchone()
+    if row is None:
+        return None
     sha = row["sha256"]
     async with pool.connection() as conn:
         await conn.set_autocommit(True)
@@ -494,7 +503,7 @@ async def delete_picture(request: Request, image_id: int) -> dict[str, bool]:
                 )
                 gone = await cur.fetchone()
                 if gone is None:
-                    raise _not_here()
+                    return None
                 cur = await conn.execute(
                     "select exists (select 1 from images where pub_sha = %s) as shared",
                     (gone["pub_sha"],),
@@ -507,15 +516,92 @@ async def delete_picture(request: Request, image_id: int) -> dict[str, bool]:
                 if not (shared and shared["shared"]):
                     remove_pub(settings.media_pub, gone["pub_sha"])
 
-            await asyncio.to_thread(unlink)
+            # The rows are already gone; a stuck file must not hide that from the caller.
+            try:
+                await asyncio.to_thread(unlink)
+            except OSError as e:
+                log.warning("delete: image %s files left behind: %s", image_id, e)
         finally:
             with contextlib.suppress(psycopg.Error):
                 await conn.execute("select pg_advisory_unlock(hashtextextended(%s, 0))", (sha,))
                 await conn.set_autocommit(False)
-    if gone["status"] == "live":
-        for model in models:
-            await refresh_corpus_stats(pool, kind=KIND, model=model)
+    return gone["status"], models
+
+
+async def _refresh(pool: Any, models: set[str]) -> None:
+    for model in models:
+        await refresh_corpus_stats(pool, kind=KIND, model=model)
+
+
+@router.delete("/{image_id}")
+async def delete_picture(request: Request, image_id: int) -> dict[str, bool]:
+    pool = _pool(request)
+    gone = await _delete(pool, image_id)
+    if gone is None:
+        raise _not_here()
+    if gone[0] == "live":
+        await _refresh(pool, set(gone[1]))
     return {"ok": True}
+
+
+# -- bulk -------------------------------------------------------------------
+
+# What each bulk action regenerates. Redescribe is the detail page's "regenerate all".
+BULK_REGEN: dict[str, list[str]] = {
+    "redescribe": ["caption", "description", "analysis", "tags"],
+    "retag": ["tags"],
+    "rehaiku": ["haiku"],
+    "reembed": ["embedding"],
+}
+BULK_MAX = 500
+
+
+class BulkBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["delete", "redescribe", "retag", "rehaiku", "reembed"]
+    ids: list[int] = Field(min_length=1, max_length=BULK_MAX)
+
+
+@router.post("/bulk")
+async def bulk(request: Request, body: BulkBody) -> dict[str, Any]:
+    pool = _pool(request)
+    ids = list(dict.fromkeys(body.ids))
+    if body.action == "delete":
+        done: list[int] = []
+        live_models: set[str] = set()
+        try:
+            for image_id in ids:
+                gone = await _delete(pool, image_id)
+                if gone is None:
+                    continue
+                done.append(image_id)
+                if gone[0] == "live":
+                    live_models.update(gone[1])
+        finally:
+            # Once for the batch, since each refresh rescans every vector; and also when
+            # a later delete fails, because the earlier ones are committed.
+            await _refresh(pool, live_models)
+        return {"action": "delete", "done": done}
+    fields = BULK_REGEN[body.action]
+    async with pool.connection() as conn:
+        cur = await conn.execute("select id from images where id = any(%s)", (ids,))
+        found = {r["id"] for r in await cur.fetchall()}
+    queued: list[int] = []
+    for image_id in ids:
+        if image_id not in found:
+            continue
+        # Unlike the per-picture button, a batch leaves owner-written text alone: one
+        # click should not undo edits across a hundred pictures.
+        job_id = await enqueue(
+            pool,
+            "regen",
+            {"image_id": image_id, "fields": fields},
+            dedupe_key=regen_key(image_id, fields),
+        )
+        if job_id is not None:
+            queued.append(image_id)
+    return {"action": body.action, "done": [i for i in ids if i in found], "queued": queued}
 
 
 # -- original ---------------------------------------------------------------
