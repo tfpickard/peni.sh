@@ -26,6 +26,7 @@ from penish.config import Settings
 from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
 from penish.text import slugify
+from penish.worker import facet_jobs
 from penish.worker.derive import (
     WIDTHS,
     Decoded,
@@ -191,6 +192,7 @@ async def _write_text(
             await conn.execute(
                 "delete from embeddings where image_id = %s and kind = %s", (image_id, KIND)
             )
+            await facet_jobs.invalidate_split(conn, image_id)
             await mycelium.mark_dirty(conn)
 
 
@@ -365,7 +367,12 @@ async def _go_live(conn: Conn, image_id: int, base: str, surprise: float | None)
                 if went_live:
                     # Same transaction as the status flip: jobs.enqueue would use its own
                     # connection, and a crash between the two would lose the haiku forever.
-                    for kind in ("haiku", "categorize"):
+                    for kind in (
+                        "haiku",
+                        "categorize",
+                        facet_jobs.EXTRACT_JOB,
+                        facet_jobs.SPLIT_JOB,
+                    ):
                         await conn.execute(
                             "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s)"
                             " on conflict do nothing",

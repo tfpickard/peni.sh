@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -24,7 +24,7 @@ from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
 from penish.mycelium import colonies as colony
-from penish.mycelium import overgrowth
+from penish.mycelium import facets, overgrowth
 from penish.mycelium.engine import EdgeState, LayerState, Pair, layer_order
 from penish.mycelium.graph import Edge
 from penish.mycelium.tunables import (
@@ -50,7 +50,7 @@ TICK = timedelta(seconds=TICK_SECONDS)
 RESET = "reset"
 
 # A change to any of these changes who may grow toward whom, so the graph is rebuilt.
-GRAPH_TUNABLES = frozenset({"candidates", "affinity_floor", "min_size"})
+GRAPH_TUNABLES = frozenset({"candidates", "affinity_floor", "min_size", "facet_bonus"})
 
 # Network and colony tables a full wipe empties. Tunables are settings, not network.
 NETWORK_TABLES = (
@@ -76,6 +76,7 @@ _STATE_COLUMNS = frozenset(
         "colonies",
         "public_since",
         "simulated_through",
+        "facet_recipe",
     }
 )
 
@@ -101,6 +102,8 @@ class State:
     simulated_through: int | None
     # The database clock when this was read: the transaction's start inside one.
     now: datetime
+    # Which recipe's vectors the four facet layers grow on.
+    facet_recipe: str = facets.SPLIT
 
     @property
     def public(self) -> bool:
@@ -150,6 +153,7 @@ async def read_state(conn: Conn, *, lock: bool = False) -> State:
         public_since=row["public_since"],
         simulated_through=row["simulated_through"],
         now=row["db_now"],
+        facet_recipe=str(row["facet_recipe"]),
     )
 
 
@@ -312,6 +316,10 @@ async def load_graph_inputs(conn: Conn, *, model: str, dim: int, kind: str = KIN
     Vectors come back as float32 widened to float64, so every reader of the same rows
     builds the same graph.
     """
+    return await _load_inputs(conn, model=model, dim=dim, kind=kind)
+
+
+async def _load_inputs(conn: Conn, *, model: str, dim: int, kind: str) -> GraphInputs:
     cur = await conn.execute(
         """
         select i.id, i.published_at, e.vec::real[] as vec
@@ -339,6 +347,68 @@ async def load_graph_inputs(conn: Conn, *, model: str, dim: int, kind: str = KIN
     if row is not None and row["mean"] is not None and len(row["mean"]) == dim:
         mean = np.asarray(row["mean"], dtype=np.float64)
     return GraphInputs(vectors, mean, published)
+
+
+async def load_facet_inputs(
+    conn: Conn, *, recipe: str, model: str, dim: int
+) -> dict[str, GraphInputs]:
+    """One recipe's four facet spaces, keyed by layer (`facet:mood`), each with its own
+    mean. A picture without a vector of a facet is absent from that layer only."""
+    return {
+        facets.layer(f): await _load_inputs(conn, model=model, dim=dim, kind=facets.kind(f, recipe))
+        for f in facets.FACETS
+    }
+
+
+async def facet_counts(conn: Conn, *, model: str, dim: int) -> dict[str, int]:
+    """`{split, extract, live}`: live pictures with all four bodies and all four vectors
+    of each recipe, and live pictures in all."""
+    cur = await conn.execute(
+        """
+        with live as (select id from images where status = 'live'),
+        done as (
+          select f.recipe, f.image_id
+            from image_facets f
+            join live on live.id = f.image_id
+            join embeddings e on e.image_id = f.image_id
+             and e.kind = 'facet:' || f.facet || '/' || f.recipe
+             and e.model = %(model)s and e.dim = %(dim)s
+           group by f.recipe, f.image_id
+          having count(distinct f.facet) = %(n)s
+        )
+        select (select count(*) from live)::int as live,
+               (select count(*) from done where recipe = 'split')::int as split,
+               (select count(*) from done where recipe = 'extract')::int as extract
+        """,
+        {"model": model, "dim": dim, "n": len(facets.FACETS)},
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    return {"split": row["split"], "extract": row["extract"], "live": row["live"]}
+
+
+class FacetSourceRefused(Exception):
+    pass
+
+
+async def set_facet_recipe(conn: Conn, recipe: str, *, model: str, dim: int) -> State:
+    """Switch the facet layers to `recipe` once every live picture has it in full.
+
+    Takes the state row first, so the count and the switch see the same live set
+    and no tick runs between them. Raises FacetSourceRefused with the flat message
+    the admin shows.
+    """
+    if recipe not in facets.RECIPES:
+        raise FacetSourceRefused(f"unknown recipe {recipe}")
+    async with conn.transaction():
+        st = await read_state(conn, lock=True)
+        if st.facet_recipe != recipe:
+            counts = await facet_counts(conn, model=model, dim=dim)
+            if counts[recipe] < counts["live"]:
+                raise FacetSourceRefused(f"not every live picture has {recipe} facets")
+            await save_state(conn, facet_recipe=recipe)
+            await mark_dirty(conn)
+    return await read_state(conn)
 
 
 async def live_slugs(conn: Conn) -> dict[int, str]:
@@ -649,11 +719,14 @@ async def apply_colonies(
     simulated: bool,
     slugs: Mapping[int, str],
     latched: Mapping[str, Sequence[tuple[int, int, float]]],
+    layers: Collection[str] | None = None,
 ) -> None:
     """Write the difference between two colony states into the colony tables.
 
     `slugs` names pictures joining a colony; `latched` gives the per-tick strength.
-    Colony rows are upserted when they change and never deleted.
+    Colony rows are upserted when they change and never deleted. `layers` limits the
+    per-tick size and strength rows to the layers that stepped, so a replay of some
+    layers does not overwrite the others' rows for the same tick with zeros.
     """
     prev_by = {c.id: c for c in prev.colonies}
 
@@ -775,6 +848,9 @@ async def apply_colonies(
                 ],
             )
         strengths = colony_strengths(new, latched)
+        if layers is not None:
+            stepped = {c.id for c in new.colonies if c.layer in layers}
+            strengths = {k: v for k, v in strengths.items() if k in stepped}
         if strengths:
             sizes = {c.id: len(c.members) for c in new.colonies}
             await cur.executemany(
@@ -847,6 +923,34 @@ async def wipe_network(conn: Conn, *, levels: bool = True) -> None:
     if levels:
         await clear_neighbor_levels(conn)
     await save_state(conn, last_tick=None, colonies=None, simulated_through=None, graph_dirty=True)
+
+
+async def wipe_layers(conn: Conn, layers: Collection[str]) -> None:
+    """Empty some layers' candidates, edge state and colonies (with their members,
+    events and per-tick rows, by cascade). The caller holds the state lock and has
+    checked that none of those colonies ever had a serial. Ticks, clicks and the
+    other layers stay."""
+    names = sorted(layers)
+    await conn.execute("delete from candidate_edges where layer = any(%s)", (names,))
+    await conn.execute("delete from edge_state where layer = any(%s)", (names,))
+    await conn.execute("delete from colonies where layer = any(%s)", (names,))
+
+
+async def tick_times(conn: Conn) -> list[tuple[int, datetime]]:
+    """Every stored tick and its scheduled time, in order."""
+    cur = await conn.execute("select tick, scheduled_at from mycelium_ticks order by tick")
+    return [(int(r["tick"]), r["scheduled_at"]) for r in await cur.fetchall()]
+
+
+async def merge_tick_stats(
+    conn: Conn, tick: int, stats: Mapping[str, Mapping[str, float | int]]
+) -> None:
+    """Put some layers' figures on an existing tick row, leaving the others and the
+    hashes as the run that wrote the row left them."""
+    await conn.execute(
+        "update mycelium_ticks set stats = stats || %s where tick = %s",
+        (Jsonb({k: dict(v) for k, v in stats.items()}), tick),
+    )
 
 
 async def clear_neighbor_levels(conn: Conn, keep: Sequence[int] = ()) -> None:

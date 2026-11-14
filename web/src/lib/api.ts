@@ -216,8 +216,17 @@ export type Mycelium = {
 	series: TickPoint[];
 	colonies: { forming: ColonyRow[]; living: ColonyRow[] };
 	events: ColonyEvent[];
+	facets: Facets;
 };
-export type MyceliumAction = 'start' | 'pause' | 'regrow' | 'reset' | 'genesis';
+export type FacetRecipe = 'split' | 'extract';
+export type Facets = {
+	active: FacetRecipe;
+	// Live pictures with all four facets and vectors of each recipe, and live in all.
+	counts: { split: number; extract: number; live: number };
+	queued: { split: number; extract: number };
+	cap: { used_today: number; daily_calls: number };
+};
+export type MyceliumAction = 'start' | 'pause' | 'regrow' | 'reset' | 'genesis' | 'extract_all';
 
 async function mycelium(path: string, body?: unknown): Promise<Mycelium> {
 	const res = await fetch(`/api/admin/mycelium${path}`, {
@@ -244,3 +253,6 @@ export const getMycelium = () => mycelium('');
 export const myceliumAction = (a: MyceliumAction) => mycelium(`/${a}`, {});
 export const setTunables = (values: Record<string, number>, note: string | null) =>
 	mycelium('/tunables', note ? { values, note } : { values });
+export const setFacetSource = (recipe: FacetRecipe) => mycelium('/facet_source', { recipe });
+// Only facet layers: a replay of those alone, allowed after galleries are public.
+export const facetGenesis = (layers: string[]) => mycelium('/genesis', { layers });

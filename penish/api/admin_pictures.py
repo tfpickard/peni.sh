@@ -18,6 +18,7 @@ from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for, variants_for_many
 from penish.config import get_settings
 from penish.mycelium import store as mycelium
+from penish.worker import facet_jobs
 from penish.worker.admin_jobs import (
     ORIG_TYPES,
     find_original,
@@ -380,6 +381,7 @@ async def edit_picture(request: Request, image_id: int, body: Edit) -> dict[str,
                         "delete from embeddings where image_id = %s and kind = %s",
                         (image_id, KIND),
                     )
+                    await facet_jobs.invalidate_split(conn, image_id)
                     await conn.execute(
                         "insert into jobs (type, payload, dedupe_key) values ('regen', %s, %s)"
                         " on conflict do nothing",

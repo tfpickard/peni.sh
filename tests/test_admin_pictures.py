@@ -316,13 +316,15 @@ async def test_patch_texts_become_owner(client: httpx.AsyncClient, clean_db: str
     r = await client.patch(f"{URL}/{a}", json={"analysis": "Subject: a mug."}, headers=XHR)
     assert r.json()["analysis"] == {"body": "Subject: a mug.", "source": "owner", "model": None}
     assert sql(clean_db, "select count(*) from embeddings") == [(0,)]
-    jobs = sql(clean_db, "select type, payload, dedupe_key from jobs")
+    jobs = sql(clean_db, "select type, payload, dedupe_key from jobs order by type")
     assert jobs == [
+        # The split facets went with the old words.
+        ("mycelium_split", {"image_id": a}, f"mycelium_split:{a}"),
         ("regen", {"image_id": a, "fields": ["embedding"]}, f"regen:{a}:embedding"),
     ]
     # Same text again: nothing new to embed.
     await client.patch(f"{URL}/{a}", json={"analysis": "Subject: a mug."}, headers=XHR)
-    assert sql(clean_db, "select count(*) from jobs") == [(1,)]
+    assert sql(clean_db, "select count(*) from jobs") == [(2,)]
 
     r = await client.patch(
         f"{URL}/{a}", json={"tags": ["Mug", " mug", "", "Steam"], "prompt": "p"}, headers=XHR

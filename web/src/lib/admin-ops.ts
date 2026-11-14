@@ -45,10 +45,16 @@ export const deleteHaiku = (id: number) => del(`/haikus/${id}`);
 export const growHaikus = (n: number) => post('/haikus/grow', { n });
 
 export type Models = {
-	current: Record<string, string | null>;
-	default: Record<string, string | null>;
+	// Strings for models and prompts, null for an unset effort, a number for mycelium.daily_calls.
+	current: Record<string, string | number | null>;
+	default: Record<string, string | number | null>;
 	efforts: string[];
 	known_models: string[];
+	purposes: string[];
+	providers: string[];
+	// Providers with a key in the worker's env; null until the worker reports them.
+	keyed: string[] | null;
+	calls_today: number;
 };
 export const models = () => get<Models>('/models');
 export const putSetting = (key: string, value: unknown) => call('PUT', '/models', { key, value });

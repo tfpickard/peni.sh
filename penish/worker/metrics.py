@@ -7,6 +7,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import DictRow
 from psycopg_pool import AsyncConnectionPool
 
+from penish.mycelium import facets
 from penish.mycelium import store as mycelium
 
 Pool = AsyncConnectionPool[AsyncConnection[DictRow]]
@@ -42,60 +43,122 @@ async def refresh_corpus_stats(pool: Pool, *, kind: str, model: str) -> None:
 
     temperature is the mean pairwise cosine distance between live images: how
     spread out the corpus is. Null below two images.
+
+    A refresh of `description` also refreshes every facet kind that has vectors (or a
+    row) under the same model, since whatever changed the live set changed their means
+    too, and each facet layer is centered on its own. A facet kind alone refreshes
+    just that kind.
     """
-    params = {"kind": kind, "model": model}
     async with pool.connection() as conn:
-        cur = await conn.execute(f"select count(*) as n {_LIVE}".encode(), params)
-        row = await cur.fetchone()
-        n = int(row["n"]) if row else 0
-
-        temperature: float | None = None
-        if 2 <= n <= EXACT_TEMPERATURE_MAX_N:
-            cur = await conn.execute(
-                f"""
-                with live as (select e.image_id, e.vec {_LIVE})
-                select avg(a.vec <=> b.vec) as t
-                from live a join live b on a.image_id < b.image_id
-                """.encode(),
-                params,
-            )
-            row = await cur.fetchone()
-            temperature = float(row["t"]) if row and row["t"] is not None else None
-        elif n > EXACT_TEMPERATURE_MAX_N:
-            cur = await conn.execute(f"select e.vec {_LIVE} order by e.image_id".encode(), params)
-            vecs = np.stack([r["vec"].to_numpy() for r in await cur.fetchall()]).astype(np.float64)
-            temperature = _sampled_mean_pairwise_distance(
-                vecs, TEMPERATURE_SAMPLE_PAIRS, TEMPERATURE_SEED
-            )
-
-        # avg(vector) accumulates in double precision, so the mean is exact up to
-        # the final float4 store, not drifted by incremental updates.
-        await conn.execute(
-            f"""
-            insert into corpus_stats (kind, model, mean, n, temperature, updated_at)
-            select %(kind)s, %(model)s, avg(e.vec), count(*), %(t)s, now()
-            {_LIVE}
-            on conflict (kind, model) do update set
-              mean = excluded.mean,
-              n = excluded.n,
-              temperature = excluded.temperature,
-              updated_at = excluded.updated_at
-            """.encode(),
-            {**params, "t": temperature},
-        )
-        # Same transaction as the upsert, so the history never disagrees with the current row.
-        await conn.execute(
-            "insert into corpus_stats_history (kind, model, n, temperature)"
-            " values (%(kind)s, %(model)s, %(n)s, %(t)s)",
-            {**params, "n": n, "t": temperature},
-        )
+        if facets.is_kind(kind):
+            await _refresh_mean(conn, kind=kind, model=model)
+        else:
+            await _refresh_full(conn, kind=kind, model=model)
         if kind == mycelium.KIND:
-            # The candidate graph is centered on this mean, and the writer that marked
+            for k in await _facet_kinds(conn, model):
+                await _refresh_mean(conn, kind=k, model=model)
+        if kind == mycelium.KIND or facets.is_kind(kind):
+            # The candidate graph is centered on these means, and the writer that marked
             # it dirty committed before this refresh, so a tick between the two may
             # have rebuilt on the old mean and cleared the mark. Last, not first: the
             # tick never locks corpus_stats, so this order cannot deadlock with it, and
             # the state row is not held across the pairwise average.
             await mycelium.mark_dirty(conn)
+
+
+async def refresh_facet_stats(pool: Pool, *, model: str, recipe: str | None = None) -> None:
+    """Every facet mean of one recipe (or both) in one transaction, with one dirty mark,
+    for a job that has just embedded a batch of facets.
+
+    Kinds go in sorted order, as in refresh_corpus_stats: each upsert row-locks its
+    corpus_stats row until commit, and two refreshers walking the same rows in different
+    orders deadlock.
+    """
+    async with pool.connection() as conn:
+        for k in sorted(facets.kinds(recipe)):
+            await _refresh_mean(conn, kind=k, model=model)
+        await mycelium.mark_dirty(conn)
+
+
+async def _facet_kinds(conn: AsyncConnection[DictRow], model: str) -> list[str]:
+    # A kind whose last vector went away still has a row whose mean must follow.
+    cur = await conn.execute(
+        """
+        select kind from embeddings where model = %(m)s and kind like 'facet:%%' group by kind
+        union
+        select kind from corpus_stats where model = %(m)s and kind like 'facet:%%'
+        """,
+        {"m": model},
+    )
+    # Sorted here rather than by the database's collation, so refresh_facet_stats can
+    # lock in exactly the same order.
+    return sorted(str(r["kind"]) for r in await cur.fetchall() if facets.is_kind(str(r["kind"])))
+
+
+async def _refresh_mean(conn: AsyncConnection[DictRow], *, kind: str, model: str) -> None:
+    """Mean and n only. Nothing reads a facet space's temperature or charts its history,
+    and eight pairwise averages per publish would cost seconds for no reader."""
+    await conn.execute(
+        f"""
+        insert into corpus_stats (kind, model, mean, n, temperature, updated_at)
+        select %(kind)s, %(model)s, avg(e.vec), count(*), null, now()
+        {_LIVE}
+        on conflict (kind, model) do update set
+          mean = excluded.mean,
+          n = excluded.n,
+          temperature = excluded.temperature,
+          updated_at = excluded.updated_at
+        """.encode(),
+        {"kind": kind, "model": model},
+    )
+
+
+async def _refresh_full(conn: AsyncConnection[DictRow], *, kind: str, model: str) -> None:
+    params = {"kind": kind, "model": model}
+    cur = await conn.execute(f"select count(*) as n {_LIVE}".encode(), params)
+    row = await cur.fetchone()
+    n = int(row["n"]) if row else 0
+
+    temperature: float | None = None
+    if 2 <= n <= EXACT_TEMPERATURE_MAX_N:
+        cur = await conn.execute(
+            f"""
+            with live as (select e.image_id, e.vec {_LIVE})
+            select avg(a.vec <=> b.vec) as t
+            from live a join live b on a.image_id < b.image_id
+            """.encode(),
+            params,
+        )
+        row = await cur.fetchone()
+        temperature = float(row["t"]) if row and row["t"] is not None else None
+    elif n > EXACT_TEMPERATURE_MAX_N:
+        cur = await conn.execute(f"select e.vec {_LIVE} order by e.image_id".encode(), params)
+        vecs = np.stack([r["vec"].to_numpy() for r in await cur.fetchall()]).astype(np.float64)
+        temperature = _sampled_mean_pairwise_distance(
+            vecs, TEMPERATURE_SAMPLE_PAIRS, TEMPERATURE_SEED
+        )
+
+    # avg(vector) accumulates in double precision, so the mean is exact up to
+    # the final float4 store, not drifted by incremental updates.
+    await conn.execute(
+        f"""
+        insert into corpus_stats (kind, model, mean, n, temperature, updated_at)
+        select %(kind)s, %(model)s, avg(e.vec), count(*), %(t)s, now()
+        {_LIVE}
+        on conflict (kind, model) do update set
+          mean = excluded.mean,
+          n = excluded.n,
+          temperature = excluded.temperature,
+          updated_at = excluded.updated_at
+        """.encode(),
+        {**params, "t": temperature},
+    )
+    # Same transaction as the upsert, so the history never disagrees with the current row.
+    await conn.execute(
+        "insert into corpus_stats_history (kind, model, n, temperature)"
+        " values (%(kind)s, %(model)s, %(n)s, %(t)s)",
+        {**params, "n": n, "t": temperature},
+    )
 
 
 async def surprise_at_arrival(pool: Pool, image_id: int, *, kind: str, model: str) -> float | None:

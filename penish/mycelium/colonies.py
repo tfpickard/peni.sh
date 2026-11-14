@@ -545,11 +545,21 @@ def _membership(
         _note_size(c, t)
 
 
-def _fruit(state: ColoniesState, tick: int, t: Tunables, log: _Log) -> dict[str, list[Colony]]:
+def _fruit(
+    state: ColoniesState,
+    tick: int,
+    t: Tunables,
+    log: _Log,
+    layers: Sequence[str] = LAYERS,
+) -> dict[str, list[Colony]]:
     recent = [x for x in state.recent_fruitings if x > tick - FRUIT_WINDOW]
     order = {name: i for i, name in enumerate(LAYERS)}
     cands = sorted(
-        (c for c in state.colonies if c.state == FORMING and c.held >= t.fruit_ticks),
+        (
+            c
+            for c in state.colonies
+            if c.state == FORMING and c.held >= t.fruit_ticks and c.layer in layers
+        ),
         key=lambda c: (c.born, min(c.images()), order[c.layer], c.id),
     )
     out: dict[str, list[Colony]] = {}
@@ -626,6 +636,7 @@ def step(
     edges: Mapping[str, Sequence[Edge]],
     live: AbstractSet[int],
     tunables: Tunables = DEFAULTS,
+    layers: Iterable[str] | None = None,
 ) -> tuple[ColoniesState, list[Event]]:
     """One tick over every layer. `prev` is not modified.
 
@@ -633,12 +644,22 @@ def step(
     missing layer has none. Events come out in the order the rules apply:
     steps 0 to 5 layer by layer, then fruiting, then steps 6 and 7 layer by
     layer.
+
+    `layers` steps only those layers (a layer-scoped genesis): the others' colonies
+    stay exactly as they are and still block duplicates, and only the stepped layers
+    may fruit. The fruit cap counts `recent_fruitings` as given, so the caller decides
+    whose fruitings count.
     """
     if prev.tick is not None and tick <= prev.tick:
         raise ValueError(f"tick {tick} is not after {prev.tick}")
-    unknown = sorted(set(edges) - set(LAYERS))
+    chosen = set(LAYERS) if layers is None else set(layers)
+    stepped = tuple(n for n in LAYERS if n in chosen)
+    unknown = sorted((set(edges) | chosen) - set(LAYERS))
     if unknown:
         raise ValueError(f"unknown layer {unknown[0]}")
+    idle = sorted(set(edges) - set(stepped))
+    if idle:
+        raise ValueError(f"edges for {idle[0]}, which does not step")
     state = copy.deepcopy(prev)
     state.canonicalize()
     state.tick = tick
@@ -647,10 +668,10 @@ def step(
         layer: _phase_a(
             state, layer, groups(edges.get(layer, ()), live, tunables), live, tick, tunables, log
         )
-        for layer in LAYERS
+        for layer in stepped
     }
-    fruited = _fruit(state, tick, tunables, log)
-    for layer in LAYERS:
+    fruited = _fruit(state, tick, tunables, log, stepped)
+    for layer in stepped:
         _phase_b(state, works[layer], fruited.get(layer, []), tick, tunables, log)
     state.colonies.sort(key=lambda c: c.id)
     return state, log.items

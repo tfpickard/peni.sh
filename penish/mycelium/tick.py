@@ -16,7 +16,7 @@ import asyncio
 import contextlib
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -26,8 +26,8 @@ from psycopg_pool import AsyncConnectionPool
 
 from penish.config import Settings, get_settings
 from penish.mycelium import colonies as colony
-from penish.mycelium import engine, store
-from penish.mycelium.graph import Edge, candidate_edges
+from penish.mycelium import engine, facets, store
+from penish.mycelium.graph import Edge, candidate_edges, facet_graphs
 from penish.mycelium.tunables import LAYERS, Tunables
 
 log = logging.getLogger(__name__)
@@ -36,8 +36,9 @@ Conn = AsyncConnection[DictRow]
 Pool = AsyncConnectionPool[AsyncConnection[DictRow]]
 Latched = dict[str, list[tuple[int, int, float]]]
 
-# The only layer with vectors until facets arrive.
 WHOLE = "whole"
+# Every layer that has vectors today; `need` arrives with its phrases.
+ACTIVE_LAYERS: tuple[str, ...] = (WHOLE, *facets.LAYERS)
 # A day of ticks; more than that behind and the clock jumps instead of replaying.
 CATCH_UP_MAX = 144
 WAKE_SECONDS = 30.0
@@ -53,6 +54,39 @@ def build_graph(
     """
     mean = inputs.mean if len(inputs.vectors) >= centered_min else None
     return candidate_edges(layer, inputs.vectors, mean, tunables)
+
+
+def build_facet_graphs(
+    inputs: Mapping[str, store.GraphInputs], tunables: Tunables, *, centered_min: int
+) -> dict[str, list[Edge]]:
+    """Candidate edges for the facet layers, each centered on its own mean under the same
+    size rule as the whole layer, built together because each one's bonus reads the
+    others."""
+    vectors = {name: inp.vectors for name, inp in inputs.items()}
+    means = {
+        name: inp.mean if len(inp.vectors) >= centered_min else None for name, inp in inputs.items()
+    }
+    return facet_graphs(vectors, means, tunables)
+
+
+def build_graphs(
+    whole: store.GraphInputs,
+    facet_inputs: Mapping[str, store.GraphInputs],
+    tunables: Tunables,
+    *,
+    centered_min: int,
+) -> dict[str, list[Edge]]:
+    """Every active layer's candidates, empty lists included, in layer order."""
+    out = {WHOLE: build_graph(whole, tunables, centered_min=centered_min)}
+    out.update(build_facet_graphs(facet_inputs, tunables, centered_min=centered_min))
+    return {name: out.get(name, []) for name in ACTIVE_LAYERS}
+
+
+def stepping(graphs: Mapping[str, Sequence[Edge]]) -> dict[str, Sequence[Edge]]:
+    """The graphs a tick steps: the whole layer always, a facet layer once it has
+    edges. A layer with no edges but old state still steps, since the engine runs
+    every layer that has state or a graph, so its strengths decay."""
+    return {n: g for n, g in graphs.items() if n == WHOLE or g}
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,11 +107,20 @@ def step(
     seed: int,
     tick: int,
     prev: colony.ColoniesState,
+    layers: Collection[str] | None = None,
 ) -> Stepped:
-    """Engine then colonies for one tick. Pure; genesis calls it too."""
+    """Engine then colonies for one tick. Pure; genesis calls it too.
+
+    `layers` limits the colonies to those layers (a layer-scoped genesis); the
+    engine steps whatever it is given.
+    """
     result = engine.run_tick(states, graphs, traffic, live, base, tunables, seed, tick)
-    latched = {n: engine.latched_edges(s) for n, s in result.states.items() if n in LAYERS}
-    col, events = colony.step(prev, tick, latched, set(live), tunables)
+    latched = {
+        n: engine.latched_edges(s)
+        for n, s in result.states.items()
+        if n in LAYERS and (layers is None or n in layers)
+    }
+    col, events = colony.step(prev, tick, latched, set(live), tunables, layers)
     return Stepped(result, col, events, latched)
 
 
@@ -150,16 +193,23 @@ async def run_one(
         rebuilt = stored is None or _stale(stored, slugs)
         if rebuilt:
             inputs = await store.load_graph_inputs(conn, model=cfg.embed_model, dim=cfg.embed_dim)
-            edges = await asyncio.to_thread(
-                build_graph, inputs, tunables, centered_min=cfg.centered_min_images
+            facet_inputs = await store.load_facet_inputs(
+                conn, recipe=st.facet_recipe, model=cfg.embed_model, dim=cfg.embed_dim
             )
-            await store.replace_candidate_edges(conn, WHOLE, edges)
+            built = await asyncio.to_thread(
+                build_graphs,
+                inputs,
+                facet_inputs,
+                tunables,
+                centered_min=cfg.centered_min_images,
+            )
+            for name in ACTIVE_LAYERS:
+                await store.replace_candidate_edges(conn, name, built[name])
             graph_version += 1
-            graphs: dict[str, list[Edge]] = {WHOLE: edges}
+            graphs = stepping(built)
         else:
             assert stored is not None
-            graphs = stored
-            graphs.setdefault(WHOLE, [])
+            graphs = stepping({WHOLE: [], **stored})
 
         traffic = await store.consume_traffic(conn, scheduled_at + store.TICK)
         states = await store.load_edge_states(conn)

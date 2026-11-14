@@ -18,6 +18,7 @@ from penish.worker.admin_jobs import make_handlers
 from penish.worker.categorize import enqueue_uncategorized, handle_categorize
 from penish.worker.embed import Embedder
 from penish.worker.embed_server import serve as serve_embed
+from penish.worker.facet_jobs import enqueue_unsplit
 from penish.worker.heartbeat import run_heartbeat
 from penish.worker.ingest import handle_haiku, handle_ingest
 from penish.worker.jobs import Job
@@ -95,6 +96,9 @@ async def main() -> None:
         n = await enqueue_uncategorized(pool)
         if n:
             log.info("enqueued %d pictures to categorize", n)
+        n = await enqueue_unsplit(pool, settings)
+        if n:
+            log.info("enqueued %d pictures to split into facets", n)
 
         watcher = InboxWatcher(settings, enqueue, has_job=has_job)
         await watcher.recover()

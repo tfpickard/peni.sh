@@ -1,5 +1,5 @@
 """Jobs the admin panel enqueues: per-image regen and crop, bulk re-embed and re-describe,
-haiku growth and mycelium genesis.
+haiku growth and mycelium genesis, plus the facet jobs (registered here for the embedder).
 
 Same contract as ingest: SoftError retries, HardError fails, and an image deleted while its
 job waited is a quiet no-op rather than an error.
@@ -23,6 +23,7 @@ from penish.config import Settings
 from penish.mycelium import genesis
 from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
+from penish.worker import facet_jobs
 from penish.worker.derive import (
     Public,
     UndecodableImage,
@@ -190,6 +191,7 @@ async def _apply_described(
                 await conn.execute(
                     "delete from embeddings where image_id = %s and kind = %s", (image_id, KIND)
                 )
+                await facet_jobs.invalidate_split(conn, image_id)
                 await mycelium.mark_dirty(conn)
                 changed = True
         if "tags" in want and d.tags:
@@ -417,6 +419,9 @@ async def _crop_locked(
 
     old = str(row["pub_sha"])
     async with conn.transaction():
+        if pub.pub_sha != old:
+            # First, as the tick takes the state row before the image rows it key-shares.
+            await mycelium.mark_dirty(conn)
         await conn.execute(
             """
             update images set pub_sha = %s, width = %s, height = %s, blurhash = %s, palette = %s,
@@ -433,6 +438,10 @@ async def _crop_locked(
                 image_id,
             ),
         )
+        if pub.pub_sha != old:
+            # The extract read the old pixels. The split follows the analysis, which the
+            # regen below rewrites (and invalidates) only if the model's reading changed.
+            await facet_jobs.invalidate_extract(conn, image_id)
         cur = await conn.execute(
             "select exists (select 1 from images where pub_sha = %s and id <> %s) as shared",
             (old, image_id),
@@ -597,6 +606,20 @@ def _genesis_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder)
     return go
 
 
+def _split_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await facet_jobs.handle_split(job, pool=pool, settings=settings, embedder=embedder)
+
+    return go
+
+
+def _extract_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await facet_jobs.handle_extract(job, pool=pool, settings=settings, embedder=embedder)
+
+    return go
+
+
 HANDLERS: dict[str, HandlerFactory] = {
     "regen": _regen_handler,
     "crop": _crop_handler,
@@ -604,6 +627,8 @@ HANDLERS: dict[str, HandlerFactory] = {
     "redescribe_all": _redescribe_all_handler,
     "grow_haikus": _grow_handler,
     genesis.JOB: _genesis_handler,
+    facet_jobs.SPLIT_JOB: _split_handler,
+    facet_jobs.EXTRACT_JOB: _extract_handler,
 }
 
 

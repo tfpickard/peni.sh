@@ -1,5 +1,5 @@
-"""Admin for the organism: start and pause, tunables, regrow, reset, genesis, and what
-it has grown.
+"""Admin for the organism: start and pause, tunables, regrow, reset, genesis, the facet
+source, and what it has grown.
 
 Every route answers with the whole page state, so the client never has to guess
 what an action changed. State changes are POSTs, which `_gate` checks for the
@@ -14,11 +14,14 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from penish import runtime
 from penish.api.admin import _gate, require_admin
+from penish.config import get_settings
 from penish.mycelium import genesis, store
 from penish.mycelium.tunables import DEFAULTS, SPECS, TunableError, Tunables
 from penish.text import no_em_dash
-from penish.worker.jobs import enqueue
+from penish.worker import facet_jobs
+from penish.worker.jobs import Pool, enqueue
 
 router = APIRouter(
     prefix="/api/admin/mycelium",
@@ -73,7 +76,29 @@ async def _genesis(conn: store.Conn) -> dict[str, Any]:
     }
 
 
-async def _payload(conn: store.Conn) -> dict[str, Any]:
+async def _facets(pool: Pool, conn: store.Conn, active: str) -> dict[str, Any]:
+    s = get_settings()
+    cur = await conn.execute(
+        "select type, count(*)::int as n from jobs where type = any(%s)"
+        " and status in ('queued', 'running') group by type",
+        ([facet_jobs.SPLIT_JOB, facet_jobs.EXTRACT_JOB],),
+    )
+    queued = {r["type"]: r["n"] for r in await cur.fetchall()}
+    return {
+        "active": active,
+        "counts": await store.facet_counts(conn, model=s.embed_model, dim=s.embed_dim),
+        "queued": {
+            "split": queued.get(facet_jobs.SPLIT_JOB, 0),
+            "extract": queued.get(facet_jobs.EXTRACT_JOB, 0),
+        },
+        "cap": {
+            "used_today": await runtime.calls_today(pool),
+            "daily_calls": int(await runtime.get(pool, "mycelium.daily_calls")),
+        },
+    }
+
+
+async def _payload(pool: Pool, conn: store.Conn) -> dict[str, Any]:
     st = await store.read_state(conn)
     current, version, _ = await store.current_tunables(conn)
     return {
@@ -92,27 +117,28 @@ async def _payload(conn: store.Conn) -> dict[str, Any]:
         "series": await store.series(conn, "whole", SERIES),
         "colonies": await store.colonies_listing(conn),
         "events": await store.recent_events(conn, EVENTS),
+        "facets": await _facets(pool, conn, st.facet_recipe),
     }
 
 
 @router.get("")
 async def overview(request: Request) -> dict[str, Any]:
     async with _pool(request).connection() as conn:
-        return await _payload(conn)
+        return await _payload(_pool(request), conn)
 
 
 @router.post("/start")
 async def start(request: Request) -> dict[str, Any]:
     async with _pool(request).connection() as conn:
         await store.start(conn)
-        return await _payload(conn)
+        return await _payload(_pool(request), conn)
 
 
 @router.post("/pause")
 async def pause(request: Request) -> dict[str, Any]:
     async with _pool(request).connection() as conn:
         await store.pause(conn)
-        return await _payload(conn)
+        return await _payload(_pool(request), conn)
 
 
 class TunablesPost(BaseModel):
@@ -133,34 +159,69 @@ async def tunables(body: TunablesPost, request: Request) -> dict[str, Any]:
             await store.set_tunables(conn, body.values, note or None)
         except TunableError as e:
             raise HTTPException(status_code=400, detail=str(e)) from None
-        return await _payload(conn)
+        return await _payload(_pool(request), conn)
 
 
 @router.post("/regrow")
 async def regrow(request: Request) -> dict[str, Any]:
     async with _pool(request).connection() as conn:
         await store.regrow(conn)
-        return await _payload(conn)
+        return await _payload(_pool(request), conn)
 
 
 @router.post("/reset")
 async def reset(request: Request) -> dict[str, Any]:
     async with _pool(request).connection() as conn:
         await store.reset(conn)
-        return await _payload(conn)
+        return await _payload(_pool(request), conn)
+
+
+class GenesisPost(BaseModel):
+    # Absent, or every active layer, is a full genesis; only facet layers replay just
+    # those, which stays allowed after galleries are public.
+    layers: list[str] | None = None
 
 
 @router.post("/genesis")
-async def start_genesis(request: Request) -> dict[str, Any]:
+async def start_genesis(request: Request, body: GenesisPost | None = None) -> dict[str, Any]:
     pool = _pool(request)
+    try:
+        scoped = genesis.scope(body.layers if body else None)
+    except genesis.GenesisRefused as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
     async with pool.connection() as conn:
         st = await store.read_state(conn)
     # The job checks again under the lock; this only spares a doomed job.
     if st.running:
         raise HTTPException(status_code=409, detail="running")
-    if st.public:
+    if scoped is None and st.public:
         raise HTTPException(status_code=409, detail="public")
-    # A second press while one waits or runs collapses into it.
-    await enqueue(pool, genesis.JOB, {}, dedupe_key=genesis.JOB)
+    # A second press while one waits or runs collapses into it, whatever its layers.
+    payload = {} if scoped is None else {"layers": list(scoped)}
+    await enqueue(pool, genesis.JOB, payload, dedupe_key=genesis.JOB)
     async with pool.connection() as conn:
-        return await _payload(conn)
+        return await _payload(pool, conn)
+
+
+@router.post("/extract_all")
+async def extract_all(request: Request) -> dict[str, Any]:
+    pool = _pool(request)
+    # Staggered and deduped in the sweep itself; jobs over the daily cap wait for midnight.
+    await facet_jobs.enqueue_unextracted(pool, get_settings())
+    async with pool.connection() as conn:
+        return await _payload(pool, conn)
+
+
+class FacetSourcePost(BaseModel):
+    recipe: str
+
+
+@router.post("/facet_source")
+async def facet_source(body: FacetSourcePost, request: Request) -> dict[str, Any]:
+    s = get_settings()
+    async with _pool(request).connection() as conn:
+        try:
+            await store.set_facet_recipe(conn, body.recipe, model=s.embed_model, dim=s.embed_dim)
+        except store.FacetSourceRefused as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
+        return await _payload(_pool(request), conn)

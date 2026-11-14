@@ -12,6 +12,7 @@ from penish import runtime
 from penish.config import Settings
 from penish.runtime import Getter, Pool, UsageRecorder
 from penish.text import no_em_dash
+from penish.worker import providers
 
 log = logging.getLogger(__name__)
 
@@ -155,10 +156,21 @@ async def call_text(
     create_kwargs: dict[str, Any],
     record: UsageRecorder | None = None,
 ) -> str:
+    """One model call. `client` is the caller's Anthropic client or a test fake; a model id
+    with a provider prefix swaps a real Anthropic client for that provider's adapter, so
+    every caller can be pointed at another provider from admin without knowing it."""
+    try:
+        other = providers.prefixed(model)
+    except ValueError as exc:
+        raise DescribeError(str(exc), retryable=False) from exc
+    if other and (client is None or isinstance(client, anthropic.AsyncAnthropic)):
+        client = providers.client_for(model)
     try:
         resp = await client.messages.create(model=model, **create_kwargs)
     except anthropic.APIError as exc:
         raise map_api_error(exc) from exc
+    except providers.ProviderError as exc:
+        raise DescribeError(str(exc), retryable=exc.retryable) from exc
     if record is not None:
         try:
             await record(model, getattr(resp, "usage", None))

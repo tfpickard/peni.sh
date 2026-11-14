@@ -17,7 +17,16 @@ from tests.test_admin import PW, XHR, _build, _login
 from tests.test_mycelium_tick import DIM, FAST, MODEL, T0, TICK, corpus, sql
 
 URL = "/api/admin/mycelium"
-POSTS = ("start", "pause", "tunables", "regrow", "reset", "genesis")
+POSTS = (
+    "start",
+    "pause",
+    "tunables",
+    "regrow",
+    "reset",
+    "genesis",
+    "extract_all",
+    "facet_source",
+)
 KEYS = {
     "running",
     "tick",
@@ -34,6 +43,7 @@ KEYS = {
     "series",
     "colonies",
     "events",
+    "facets",
 }
 
 

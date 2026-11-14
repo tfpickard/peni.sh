@@ -2,10 +2,13 @@
 	import { onMount } from 'svelte';
 	import {
 		ApiError,
+		facetGenesis,
 		getMycelium,
 		myceliumAction,
+		setFacetSource,
 		setTunables,
 		type ColonyRow,
+		type FacetRecipe,
 		type Mycelium,
 		type MyceliumAction,
 		type TickPoint
@@ -138,6 +141,16 @@
 	const genesisOpen = $derived(
 		m ? !m.running && !m.public && m.genesis.status !== 'queued' && m.genesis.status !== 'running' : false
 	);
+	const FACET_LAYERS = ['facet:subject', 'facet:setting', 'facet:style', 'facet:mood'];
+	// The switch only opens once every live picture has the other recipe in full; the
+	// server refuses otherwise, this just keeps the button honest.
+	const other = $derived<FacetRecipe>(m?.facets.active === 'split' ? 'extract' : 'split');
+	const switchOpen = $derived(m ? m.facets.counts[other] >= m.facets.counts.live && m.facets.counts.live > 0 : false);
+	const extractOpen = $derived(m ? m.facets.counts.extract < m.facets.counts.live : false);
+	// Unlike a full genesis, a facet replay is allowed once galleries are public.
+	const facetGenesisOpen = $derived(
+		m ? !m.running && m.genesis.status !== 'queued' && m.genesis.status !== 'running' : false
+	);
 	const name = (c: ColonyRow) => c.title ?? (c.serial !== null ? `gallery ${c.serial}` : `colony ${c.id}`);
 </script>
 
@@ -163,6 +176,27 @@
 		{/if}
 	</div>
 	{#if note}<p class="dim">{note}</p>{/if}
+
+	<h2>facets</h2>
+	<div class="row">
+		<span>source {m.facets.active}</span>
+		{#each ['split', 'extract'] as const as r (r)}
+			<span class="dim">{r} {m.facets.counts[r]} of {m.facets.counts.live}</span>
+			{#if m.facets.queued[r]}<span class="dim">{m.facets.queued[r]} queued</span>{/if}
+		{/each}
+		<span class="dim" class:hot={m.facets.cap.used_today >= m.facets.cap.daily_calls}
+			>{m.facets.cap.used_today} of {m.facets.cap.daily_calls} calls today</span
+		>
+	</div>
+	<div class="row acts">
+		<button class="link" disabled={busy || !switchOpen} onclick={() => run(() => setFacetSource(other))}
+			>use {other}</button
+		>
+		<button class="link" disabled={busy || !extractOpen} onclick={() => act('extract_all')}>extract all</button>
+		<button class="link" disabled={busy || !facetGenesisOpen} onclick={() => run(() => facetGenesis(FACET_LAYERS))}
+			>genesis facets</button
+		>
+	</div>
 
 	<h2>ticks</h2>
 	{#if m.series.length > 1}

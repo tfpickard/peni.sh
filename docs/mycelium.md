@@ -54,6 +54,7 @@ defaults.
 |---|---|---|
 | `candidates` | 8 | Nearest neighbors per picture per layer |
 | `affinity_floor` | 0.05 | Lowest affinity after rescale |
+| `facet_bonus` | 0.15 | Score bonus in a facet layer for a pair close in that facet and far apart in another (Increment 3) |
 | `walkers` | 1 | Walkers released per picture per layer per tick |
 | `steps` | 3 | Steps per walker |
 | `alpha` | 1.0 | Weight on existing strength |
@@ -492,3 +493,415 @@ phrases cannot reach it. Empty before the first tick; frozen while paused.
   the old state back. Only tunables the owner typed in survive a refresh; the
   rest follow the server, so a value saved elsewhere is never posted back.
   Save and undo start the draft over.
+
+## Increment 3
+
+### Providers (`penish/worker/providers.py`)
+
+A model id may carry a provider: `openai:<id>`, `openrouter:<vendor/id>`,
+`xai:<id>`. `runtime.split_model` splits on the first colon only (OpenRouter
+variants such as `vendor/model:free` keep theirs); a bare id is Anthropic, so
+every id stored before this increment still means what it meant.
+`runtime.validate` rejects an unknown prefix or an empty id on every
+`*.model` key, which is what the admin `PUT /api/admin/models` answers 422
+with (`unknown provider mistral`). Whitespace around the id after the prefix
+is stripped too (`openai: gpt-6-astra` is stored as `openai:gpt-6-astra`), and
+`split_model` strips it from ids stored before that: a provider takes the
+space as part of the id and refuses every call.
+
+The seam is `describe.call_text`. When the id has a prefix and the client it
+was given is `None` or a real `anthropic.AsyncAnthropic`, it swaps in
+`providers.client_for(model)`; a test fake is kept, so tests that inject
+`FakeClient` stay off the network whatever model the runtime returns. The
+adapter exposes `.messages.create(model=..., **kwargs)` and returns
+`.content = [TextBlock(type="text", text=...)]` and `.usage` with
+`input_tokens` and `output_tokens`, so callers and `api_usage` (recorded under
+the full prefixed id) are unchanged. `ProviderError(retryable)` becomes
+`DescribeError` with the same retryability.
+
+| Provider | Endpoint | Wire | Images sent as is | Effort |
+|---|---|---|---|---|
+| openai | `https://api.openai.com/v1/responses` | Responses | png, jpeg, webp, gif | `reasoning.effort`; `gpt-6*` and later take low..max, `gpt-5*` and `o*` clamp to high, `gpt-4*` and older get none |
+| xai | `https://api.x.ai/v1/responses` | Responses | png, jpeg | `reasoning.effort`; grok-4.5 up to high, 4.6 and 4.7 (and any grok-5+) up to xhigh, everything else (grok-4.20 included) none |
+| openrouter | `https://openrouter.ai/api/v1/chat/completions` | Chat completions | png, jpeg | `reasoning.effort` always, max..low passed through |
+
+Translation: `system` (string or text blocks; `cache_control` dropped) goes to
+`instructions` (Responses) or a leading system message (chat). Text blocks
+become `input_text` / `text` parts, base64 image blocks become `input_image`
+with a data URL / `image_url: {url}`. A media type the provider does not list
+is re-encoded to jpeg (q 90, alpha flattened on white) with pyvips in a
+thread; the describer sends webp, so xAI and OpenRouter always get jpeg.
+`output_config.format` json_schema becomes `text.format = {type:
+json_schema, name: output, schema, strict: true}` (Responses) or
+`response_format = {type: json_schema, json_schema: {name: output, strict:
+true, schema}}` (chat). `max_tokens` becomes `max_output_tokens` (Responses)
+or `max_tokens` (chat). Responses requests set `store: false`. Any other
+kwarg except `temperature` is refused rather than silently dropped. No
+OpenRouter attribution headers (`HTTP-Referer`, `X-OpenRouter-Title`): they
+are optional and would name the site.
+
+Responses: Responses-wire text is every `output_text` part of every `message`
+item; chat text is `choices[0].message.content` (string or text parts). A
+refusal or null content is no text, as an empty Anthropic answer is, and the
+caller's validation retries it. Usage maps `input_tokens/output_tokens` or
+`prompt_tokens/completion_tokens`; missing counts are 0.
+
+Errors: 408 (the provider's own timeout), 429 and 5xx, timeouts and
+transport errors are retryable; other 4xx are not. The message is `<provider> <status>: <provider message>` capped at
+300 characters, never the request body or the key. OpenRouter's 200 with an
+`error` object and no choices uses the error's code (502 when absent). A call
+to a provider with no key fails without a request: `no key for openai`, not
+retryable.
+
+Keys: `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY` in `Settings`
+and the worker's compose env (the api never calls a model). The heartbeat
+info gains `providers`, the names of the keyed ones (`anthropic` first);
+`GET /api/admin/models` returns it as `keyed` (null until a worker reports).
+
+Verified on 2026-11-14 against:
+
+- OpenAI: https://developers.openai.com/api/reference/resources/responses/methods/create,
+  https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create,
+  https://developers.openai.com/api/docs/guides/structured-outputs (strict
+  needs every property required and `additionalProperties: false`, both
+  already true of every schema here; `minItems`/`maxItems` supported),
+  https://developers.openai.com/api/docs/guides/images-vision (png, jpeg,
+  webp, non-animated gif), https://developers.openai.com/api/docs/models
+  (gpt-6-astra, gpt-6.1-sol, gpt-6.1-terra, gpt-6-luna; all take images and
+  reasoning effort up to max).
+- xAI: https://docs.x.ai/docs/api-reference (Responses: `instructions`,
+  `reasoning.effort`, `max_output_tokens`, `store`, usage
+  `input_tokens/output_tokens`), https://docs.x.ai/docs/guides/chat-completions
+  ("offered as a legacy endpoint", hence Responses),
+  https://docs.x.ai/docs/guides/structured-outputs (`text.format` json_schema
+  strict; `minItems`/`maxItems` accepted), https://docs.x.ai/docs/guides/image-understanding
+  (jpg/jpeg and png only, 20 MiB), https://docs.x.ai/docs/guides/reasoning
+  (grok-4.5, 4.6, 4.7 take effort; xhigh from 4.6), https://docs.x.ai/docs/models.
+- OpenRouter: https://openrouter.ai/docs/api-reference/overview,
+  https://openrouter.ai/docs/features/structured-outputs (strict json_schema;
+  some upstreams treat it as a hint),
+  https://openrouter.ai/docs/use-cases/reasoning-tokens (`reasoning.effort`
+  max..none), https://openrouter.ai/docs/guides/routing/provider-selection
+  (upstreams ignore unknown parameters unless `require_parameters`; the
+  response format routes to supporting upstreams on its own),
+  https://openrouter.ai/docs/guides/overview/multimodal/image-understanding
+  (png, jpeg, webp, gif; the batch page names an upstream that rejects webp),
+  and the public model list `GET https://openrouter.ai/api/v1/models` for
+  which ids take images and structured outputs.
+
+`admin_ops.KNOWN_MODELS` adds `openai:gpt-6-astra`, `openai:gpt-6.1-sol`,
+`openai:gpt-6.1-terra`, `openai:gpt-6-luna`, `xai:grok-4.7`, `xai:grok-4.6`,
+`openrouter:google/gemini-4-carbon`, `openrouter:qwen/qwen3.8-max-prime`,
+`openrouter:mistralai/mistral-large-4-0`. Any other valid `provider:id`
+typed by hand is accepted and then listed.
+
+### Runtime keys and the daily cap
+
+| Key | Default | Validation |
+|---|---|---|
+| `extract.model` | `describe_model` | non-empty, known prefix or bare |
+| `extract.effort` | null | one of `EFFORTS` or null |
+| `extract.prompt` | `penish/prompts/mycelium_extract.md` | non-empty |
+| `name.model` | `describe_model` | as `extract.model` |
+| `name.prompt` | `penish/prompts/mycelium_name.md` (Increment 6 fills its use) | non-empty |
+| `mycelium.daily_calls` | 400 | int (not bool), 0..100000 |
+
+`PURPOSES` gains `extract` and `name`; `runtime.CAPPED_PURPOSES` is those two.
+`runtime.calls_today(pool, now=None)` counts `api_usage` rows of capped
+purposes since UTC midnight. `providers.check_daily_cap(pool, now=None)` is
+called by a job before every capped call: at or over the cap it raises
+`SoftError("daily cap used/cap", run_after=next UTC midnight)`. Describe,
+haiku, grow and categorize are never capped. The count is read, not
+reserved, so concurrent jobs can overrun the cap by the job loop's
+concurrency; it bounds spend, it is not a quota.
+
+`jobs.SoftError` takes an optional `run_after`. With it, `_run_one` calls
+`jobs.defer`: the job is queued for exactly that time with its attempt handed
+back (`attempts - 1`), so waiting on the cap never reaches `MAX_ATTEMPTS`.
+Without it nothing changes.
+
+`GET /api/admin/models` adds `purposes`, `providers` (all four names),
+`keyed` and `calls_today`. The models page shows `keyed`, an effort row for
+describe and extract, blocks for extract and name, and `daily calls` with
+`n today`.
+
+### Facet tables (`migrations/008_facets.sql`)
+
+| Table or column | Shape | Notes |
+|---|---|---|
+| `image_facets` | `image_id` (cascade), `facet` in (subject, setting, style, mood), `recipe` in (split, extract), `body text not null`, `model text null`, `created_at`; pk `(image_id, facet, recipe)` | `split` bodies are cut from the analysis (model null), or from one extract call when it has no labels (model set). No owner source yet, so no source column |
+| `image_extracts` | `image_id` pk (cascade), `model`, `body jsonb`, `created_at` | The whole raw extract response; Increment 5 reads offers and needs from it |
+| `embeddings.kind` | check: `description`, `image`, or `^facet:(subject\|setting\|style\|mood)/(split\|extract)$` | One kind per facet and recipe, e.g. `facet:mood/split`, under the embed model |
+| `mycelium_state.facet_recipe` | `text not null default 'split'`, check in (split, extract) | Which recipe's vectors the facet layers grow on |
+
+Both tables are in the `tests/conftest.py` truncate list. Down deletes facet
+vectors and facet corpus rows before restoring the old kind check.
+
+### Facet names and the splitter (`penish/mycelium/facets.py`)
+
+Pure. `FACETS` is `describe.ANALYSIS_LABELS` lowercased; `RECIPES = (split,
+extract)`; `LAYERS` the four `facet:<name>`; `kind(facet, recipe)`,
+`kinds(recipe=None)`, `is_kind(name)`, `layer(facet)`, `facet_of(layer)`.
+
+`split(analysis) -> {subject, setting, style, mood} | None`: a label is the
+word at the start of a line (any leading whitespace, case exact), optional
+whitespace, then a colon: the same pattern, `\s` and all, as
+`describe.check_analysis`, so an analysis that passed validation always splits
+rather than buying a capped fallback call. The four
+labels must appear exactly once each, in order; a body is the text up to the
+next label, stripped, and must not be empty. Text before the first label is
+dropped. Anything else (owner free text, a missing, repeated, reordered or
+lowercase label) is None, and the caller falls back to the extract call.
+
+### Facet means (`penish/worker/metrics.py`)
+
+`refresh_corpus_stats(kind='description')` also refreshes every facet kind that
+has vectors or a corpus row under the same model, in the same transaction:
+whatever changed the live set (go-live, delete) moved those means too. A facet
+kind passed directly refreshes only itself. Facet kinds get `mean` and `n`
+only: temperature is null and no history row is written, since nothing reads
+or charts them and eight pairwise averages per publish would cost seconds.
+`refresh_facet_stats(pool, model=, recipe=None)` refreshes one recipe's four
+(or all eight) in one transaction for a job that has embedded a batch. Both
+walk the facet kinds in sorted order (sorted in Python, not by collation):
+each upsert holds its `corpus_stats` row to commit, and a description refresh
+racing a facet job's refresh in opposite orders would deadlock. Any
+refresh that touches `description` or a facet kind marks the graph dirty last,
+as before.
+
+### Facet layers and the bonus (`graph.py`, `tick.py`, `store.py`)
+
+`tick.ACTIVE_LAYERS = (whole, facet:subject, facet:setting, facet:style,
+facet:mood)`. A rebuild reads the whole layer as before and
+`store.load_facet_inputs(recipe=state.facet_recipe)`: one `GraphInputs` per
+facet layer, live pictures with that facet's vector of the active recipe, and
+that kind's own corpus mean, applied under the same `centered_min_images`
+rule as the whole layer. A picture without the vector is absent from that
+layer and nowhere else. Candidates are written for all five layers (an empty
+layer clears its rows). A tick steps the whole layer and every facet layer
+that has candidates; a layer with old state and no candidates still steps (the
+engine runs every layer with state) and decays, which is what a recipe switch
+leaves behind. Tick stats carry each stepped layer.
+
+The bonus (`graph.facet_bonuses`, applied through `candidate_edges`'
+`bonus`, so the neighbor choice, the stored `raw` and the affinity quantile
+all include it): for facet layer f and pair (i, j),
+
+```
+bonus_f(i, j) = facet_bonus * max(0, max over g != f of q_f(i, j) - q_g(i, j))
+```
+
+where `q_x(i, j)` is the pair's centered score as a quantile among all
+unordered pairs of layer x (`graph.quantiles`, ties averaged). Quantiles, not
+raw cosines, because the facets' cosines sit at different heights. A layer
+missing i or j sits out for that pair; with no other layer, no bonus. This is
+the exact formula, not an approximation: every layer's full pair matrix,
+O(n^2) memory and an n^2 log n sort per layer. Measured with 1024-dim vectors
+and four layers: `facet_bonuses` about 0.5 s and 0.25 GB at 1500 pictures,
+about 2.4 s and 0.9 GB at 3000; `facet_graphs` about 0.9 s and 3.9 s. The live
+tick pays it once per rebuild; a full genesis pays it on every tick with an
+arrival while it holds the state row, so a genesis over a few thousand
+pictures holds it for minutes longer than a whole-layer replay would. The gap per layer is computed as
+`q_f - min over g of q_g`, which equals the max of the differences exactly
+(rounded subtraction is monotone) with one n x n temporary per layer. Cheaper
+forms (bonus only for each row's top candidates, float32) would change the
+graph, so they wait for a gallery large enough to need them. `graph.BonusMatrix` holds it as a matrix over
+the union of ids, so `candidate_edges` adds it in one step. `facet_bonus`
+joins `store.GRAPH_TUNABLES`, so changing it rebuilds the graph.
+`graph.facet_graphs` builds all four together, since each one's bonus reads
+the others.
+
+`store.facet_counts(conn, model=, dim=) -> {split, extract, live}`: live
+pictures with all four bodies and all four vectors of each recipe.
+`store.set_facet_recipe(conn, recipe, model=, dim=)` takes the state row,
+refuses with `FacetSourceRefused("not every live picture has <recipe>
+facets")` while the target count is below live, else sets `facet_recipe` and
+marks dirty; a switch to the active recipe is a no-op.
+
+### Layer-scoped genesis (`genesis.py`)
+
+`genesis.run(conn, layers=None)`; the job reads `payload.layers` (a list of
+names or absent; anything else fails the job: `layers must be a list of
+names`). `genesis.scope(layers)`:
+
+- absent, or every active layer: the full genesis. It now replays all five
+  layers: the facet graphs are rebuilt (all four together) whenever a picture
+  with any facet vector of the active recipe arrives, and the final check
+  compares every layer with a live rebuild. Still refused once public.
+- only facet layers: a scoped run. `whole` with some facets is refused
+  (`whole replays with every layer`): the whole layer defines the clock the
+  others replay on. Unknown names: `unknown layer <x>`.
+
+A scoped run, in one transaction under the state row:
+
+- Refused when running, when any colony in those layers ever had a serial
+  (`<layer> has galleries`, checked in the state and the table), or when no
+  tick is stored (`nothing to replay`). Allowed before or after
+  `public_since`.
+- Deletes those layers' candidates, edge state and colonies (their members,
+  events and colony ticks go by cascade). Ticks, clicks and other layers stay.
+- Replays over the stored tick rows in order at their recorded
+  `scheduled_at`, so a pause is a gap as it was live. A picture enters at the
+  tick whose window holds its publish time, or the first tick after it; before
+  the first tick or with no publish time at the first; after the last window
+  at the last (`genesis.entries_at`), so the replay ends on today's corpus.
+- Graphs use today's facet vectors and means, all four facets read for the
+  bonus whether replayed or not. No clicks.
+- Other layers' colonies are held as they are now: they never step, still
+  block duplicates (`duplicate_jaccard`), and serials and colony ids continue
+  from the current counters. During the replay the fruit cap counts only the
+  replayed layers' fruitings; at the end the held and replayed fruiting ticks
+  are merged inside the rolling window.
+- Each replayed tick's figures are merged into its stored row
+  (`stats || {layer: ...}`); the row's hashes stay those of the run that wrote
+  it. `last_tick`, `next_due`, `simulated_through` and the dirty mark are not
+  touched; `graph_version` moves on by one.
+- Neighbor levels are recomputed at the last tick over every layer's state.
+- Ends by comparing the replayed graphs with a live rebuild of those layers
+  (`GenesisMismatch` rolls everything back).
+
+Each layer draws from its own random stream, so a scoped replay of a layer
+over the same ticks and corpus grows exactly the edge state the full run grew
+for it; only its colonies can differ, through the held galleries.
+
+`colonies.step(..., layers=None)` and `tick.step(..., layers=None)` take the
+layers to step; `store.apply_colonies(..., layers=None)` limits the per-tick
+colony rows to those layers. New store helpers: `wipe_layers`, `tick_times`,
+`merge_tick_stats`.
+
+### Facet jobs (`penish/worker/facet_jobs.py`)
+
+Two worker jobs, registered in `admin_jobs.HANDLERS` (they need the embedder),
+dedupe key `<type>:<image_id>`, payload `{image_id}`. Both skip a picture that is
+gone or not live, and return at once when the picture already has all four
+facets of their recipe with vectors under today's embed model and dim.
+
+`mycelium_extract`, inserted in the go-live transaction beside `haiku` and
+`categorize` (so it never delays the publish and a crash cannot lose it):
+
+- One vision call (`facet_jobs.extract`, purpose `extract`, runtime keys
+  `extract.model`, `extract.effort`, `extract.prompt`), the displayed pixels as
+  the describer sees them (crop applied, webp). Strict schema `{subject,
+  setting, style, mood: string, offers: string[], needs: string[]}`, every key
+  required, `additionalProperties: false`. No `maxItems`: not every provider's
+  strict mode takes array bounds, so `clean` trims.
+- `clean`: each facet through `no_em_dash`, stripped, not empty, and not
+  opening with a facet label; offers and needs through `no_em_dash`, spaces
+  collapsed, lowercased, trailing period dropped, deduped, five at most. A bad
+  answer is asked once more (two calls, like describe), then a retryable error.
+- `providers.check_daily_cap` runs before each attempt. Over the cap the job is
+  deferred to the next UTC midnight plus `EXTRACT_STEP` (30 s) times the number
+  of `mycelium_extract` and `mycelium_split` jobs already waiting for that
+  reset, so a capped sweep comes due spaced for vision calls rather than all at
+  midnight in front of the day's uploads. A split reaches the cap only on its
+  paid fallback, so it shares the same line and step. The attempt is handed
+  back (`jobs.defer`).
+- Stores the raw parsed response in `image_extracts.body` as returned (not
+  cleaned: Increment 5 reads offers and needs through `facet_jobs.clean`), the
+  four cleaned bodies in `image_facets` under `extract` with the model, and
+  four vectors under `facet:<name>/extract`.
+- A stored extract whose vectors are missing (a new embed model) is re-embedded
+  without a call.
+
+`mycelium_split`:
+
+- Inserted in the go-live transaction too, by every split invalidation of a
+  live picture, and by the startup sweep `enqueue_unsplit` (worker start,
+  beside `enqueue_uncategorized`): live pictures lacking any of the four split
+  bodies or vectors, deduped, so a second sweep enqueues nothing. Spacing
+  follows the cost: a picture that will need the paid fallback (no stored
+  split bodies, an analysis that does not split, no stored or queued extract
+  to borrow) goes at `now + EXTRACT_STEP x its rank among those` (30 s), every
+  other one at `now + SPLIT_STEP x its rank among those` (3 s). The queue
+  orders by `run_after`, so jobs that come due faster than they run become a
+  past-due backlog claimed before a fresh upload; on its own grid each kind
+  comes due about as fast as it runs, and none is due now.
+- Bodies, in order of preference: split rows already stored (they belong to the
+  current analysis, since an analysis change deletes them), `facets.split` of
+  the analysis (model null), the picture's stored extract (copied, model set),
+  and last one extract call. While the picture's own `mycelium_extract` job is
+  queued or running the split waits for it (deferred to that job's
+  `run_after`, or now, plus 1 min) instead of paying for the same call twice.
+  A fallback call is stored as the extract recipe too, raw response included.
+  Bodies with a model (a fallback, a stored one or a borrowed one) are a
+  reading of the pixels, so their write checks `pub_sha` as an extract's does.
+- Embeds the four bodies under `facet:<name>/split`.
+
+Writes, both jobs: one transaction that locks the image row `for share` (a
+crop's `pub_sha` update waits for it, or it sees the new value) and, for a
+split, the analysis row `for share`; it refuses with a retryable
+`picture changed while extracting` / `analysis changed while splitting` when
+what it read has moved, because the invalidation that came with the change may
+have collapsed into this very job's dedupe key. The transaction takes the state row first (`mark_dirty`), as every other
+embedding write does, then images, then the analysis row. A genesis holds the
+state row for its whole replay and compares the replay with a fresh read of
+the facet vectors at the end, so a facet write committing mid-replay would
+fail the run with `GenesisMismatch`; it waits instead. Holding the mark to commit
+also keeps a tick from clearing it before the vectors are visible.
+
+After the write and the means refresh, each job reads its recipe's
+completeness again and raises a plain retryable `SoftError` (`<recipe> facets
+invalidated while writing`) when it is gone. An invalidation that commits
+after the write but before the job is marked done finds this job still
+`running`, so its re-enqueue collapses into the dedupe key and would be lost;
+the re-read turns it into a retry of the same job. The gap left between that
+read and `jobs.complete` is a few statements wide, and the startup sweep
+(split) or `extract all` (extract) make it good.
+
+Facet means: after a write, `refresh_facet_stats` for the recipes written runs
+when no job of the same type is still queued, or when the live vector count of
+the recipe's first kind is at least `max(25, n/10)` away from the stored `n`.
+A sweep therefore refreshes every few dozen pictures and once at the end, and a
+single upload refreshes at once, as ingest does for the description.
+
+`tests/integration/fake_worker.py` sets the `extractor=` keyword default of
+both handlers to a fake. Its fake analysis has one label, so its splits wait
+for the extract job and take that recipe's bodies.
+
+### Invalidation
+
+| Where | What changes | Facets |
+|---|---|---|
+| `ingest._write_text` (sidecar or model analysis) | analysis | split rows and split vectors deleted; split job if live |
+| `admin_jobs._apply_described` (regen, redescribe all, after a crop) | analysis | same |
+| `admin_pictures.edit_picture` (owner analysis) | analysis | same |
+| `admin_jobs._crop_locked`, only when `pub_sha` changes | pixels | `image_extracts`, extract rows and extract vectors deleted; extract job if live. Split rows with a model set (the fallback call's reading of the old pixels) and the split vectors go too, with a split job if live; split rows cut from the analysis (model null) stay |
+
+All in the transaction that changes the text or the image, so no facet outlives
+what it was read from. Each of those transactions marks the graph dirty: the
+three text writers already did; the crop now marks first, before the image
+update, the order the tick takes. A re-describe that leaves the analysis as it
+was touches nothing, and a re-describe never touches the extract recipe. A
+picture that is not live yet gets no job; go-live queues both. Delete cascades.
+
+### Admin (`penish/api/admin_mycelium.py`)
+
+`GET` (and every POST) gains:
+
+```
+facets: {active: 'split'|'extract',
+         counts: {split: int, extract: int, live: int},   store.facet_counts
+         queued: {split: int, extract: int},              queued or running jobs
+         cap: {used_today: int, daily_calls: int}}        runtime.calls_today, mycelium.daily_calls
+```
+
+`queued` is an addition to the pinned shape, so `extract all` shows that it did
+something.
+
+| Path | Body | Does | Errors |
+|---|---|---|---|
+| `/extract_all` | none | `facet_jobs.enqueue_unextracted`: one `mycelium_extract` per live picture without the full extract recipe, `run_after = now + 30 s x rank`, deduped; jobs over the cap wait for midnight | |
+| `/facet_source` | `{recipe}` | `store.set_facet_recipe`: sets `facet_recipe` and marks dirty; the active recipe again is a no-op | 400 `not every live picture has <recipe> facets`, 400 `unknown recipe <x>` |
+| `/genesis` | `{layers?: string[]}` | absent or every active layer: the full genesis as before; only facet layers: payload `{layers}` in layer order for the scoped replay | 400 from `genesis.scope` (`unknown layer x`, `no layers`, `whole replays with every layer`), 409 `running`, 409 `public` for a full one only |
+
+A second genesis press while one waits or runs still collapses into it,
+whatever layers either named; the status line shows the job that will run.
+
+### Web (`/admin/mycelium`)
+
+A `facets` block above `ticks`: `source split`, `split 140 of 142`,
+`extract 12 of 142`, `n queued` when jobs wait, `37 of 400 calls today` (accent
+colour at the cap). Links: `use extract` (or `use split`), disabled until every
+live picture has that recipe; `extract all`, disabled when nothing lacks it;
+`genesis facets`, a replay of the four facet layers, open while stopped and no
+genesis waits, public or not (the server refuses a layer with galleries).
