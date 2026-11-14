@@ -436,6 +436,7 @@ async def test_make_handlers(p: Any, settings: Settings) -> None:
             "reembed_all",
             "redescribe_all",
             "grow_haikus",
+            "mycelium_genesis",
         }
     )
     await handlers["reembed_all"](job("reembed_all", {}))

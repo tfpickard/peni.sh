@@ -1,8 +1,10 @@
-<script lang="ts">
+<script lang="ts" generics="T extends Tile">
+	import type { Snippet } from 'svelte';
 	import Hyphae from './Hyphae.svelte';
-	import type { Neighbor } from '../api';
+	import type { Tile } from '../api';
 
-	let { label, items }: { label: string; items: Neighbor[] } = $props();
+	// foot replaces the score under each tile, for strips whose items carry something else.
+	let { label, items, foot }: { label: string; items: T[]; foot?: Snippet<[T]> } = $props();
 </script>
 
 {#if items.length}
@@ -17,7 +19,11 @@
 							<Hyphae slug={n.slug} level={n.overgrowth} />
 						</span>
 					</a>
-					<span class="score">{n.score.toFixed(2)}</span>
+					{#if foot}
+						{@render foot(n)}
+					{:else if n.score !== undefined}
+						<span class="score">{n.score.toFixed(2)}</span>
+					{/if}
 				</li>
 			{/each}
 		</ul>

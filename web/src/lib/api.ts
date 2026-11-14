@@ -26,13 +26,17 @@ export type ImagePage = { items: ImageItem[]; next_cursor: string | null; count?
 export type TagCount = { tag: string; n: number };
 export type SearchResult = { q: string; tags: TagCount[]; items: ImageItem[] };
 export type Text = { body: string; source: string; model: string | null };
-export type Neighbor = {
+// What a strip tile needs. score is the similarity for similar and dissimilar.
+export type Tile = {
 	slug: string;
-	score: number;
 	blurhash: string;
 	src: string;
 	overgrowth: number;
+	score?: number;
 };
+export type Neighbor = Tile & { score: number };
+// An edge this picture has grown to, the stronger direction of the pair.
+export type Hypha = Tile & { strength: number; layer: string };
 export type Votes = { up: number; down: number; net: number; mine: -1 | 0 | 1 };
 export type Comment = { name: string | null; body: string; created_at: string };
 // The picture being looked at is the one a view clears, so the detail carries no level.
@@ -44,6 +48,7 @@ export type ImageDetail = Omit<ImageItem, 'overgrowth'> & {
 	categories: { slug: string; label: string }[];
 	similar: Neighbor[];
 	dissimilar: Neighbor[];
+	hyphae: Hypha[];
 	mode: 'raw' | 'centered';
 	metrics: { loneliness: number | null; typicality: number | null; surprise: number | null };
 	published_at: string;
@@ -97,8 +102,12 @@ export const getImages = (
 };
 
 export class ApiError extends Error {
-	constructor(public status: number) {
-		super(`${status}`);
+	// detail is the server's own message, when it sent one worth showing.
+	constructor(
+		public status: number,
+		public detail: string | null = null
+	) {
+		super(detail ?? `${status}`);
 	}
 }
 
@@ -140,3 +149,98 @@ export const postView = (slug: string, from: string | null) =>
 	}).then((r) => r.ok);
 
 export const getConfig = () => get<{ turnstile_site_key: string | null }>('/api/config');
+
+// Admin: the organism. Every call answers with the full state, so the page just swaps it in.
+export type GenesisStatus = 'none' | 'queued' | 'running' | 'failed' | 'done';
+export type Tunable = {
+	name: string;
+	value: number;
+	default: number;
+	lo: number;
+	hi: number;
+	meaning: string;
+	int: boolean;
+};
+export type TunablesVersion = {
+	version: number;
+	created_at: string;
+	values: Record<string, number>;
+	note: string | null;
+};
+export type TickPoint = {
+	tick: number;
+	scheduled_at: string;
+	simulated: boolean;
+	live: number;
+	in_gallery: number;
+	visible: number;
+	latched: number;
+	mean_strength: number;
+	crossings: number;
+	traffic: number;
+};
+export type ColonyRow = {
+	id: number;
+	layer: string;
+	state: string;
+	serial: number | null;
+	title: string | null;
+	size: number;
+	born_tick: number;
+	fruited_tick: number | null;
+	members: { slug: string; founder: boolean }[];
+};
+export type ColonyEvent = {
+	tick: number;
+	scheduled_at: string;
+	kind: string;
+	colony_id: number;
+	layer: string;
+	slug: string | null;
+	other_colony_id: number | null;
+	simulated: boolean;
+};
+export type Mycelium = {
+	running: boolean;
+	tick: number | null;
+	next_due: string | null;
+	behind: number;
+	graph_version: number;
+	graph_dirty: boolean;
+	public: boolean;
+	simulated_through: number | null;
+	genesis: { status: GenesisStatus; error: string | null };
+	tunables: Tunable[];
+	tunables_version: number | null;
+	history: TunablesVersion[];
+	series: TickPoint[];
+	colonies: { forming: ColonyRow[]; living: ColonyRow[] };
+	events: ColonyEvent[];
+};
+export type MyceliumAction = 'start' | 'pause' | 'regrow' | 'reset' | 'genesis';
+
+async function mycelium(path: string, body?: unknown): Promise<Mycelium> {
+	const res = await fetch(`/api/admin/mycelium${path}`, {
+		method: body === undefined ? 'GET' : 'POST',
+		credentials: 'same-origin',
+		headers: { 'X-Requested-With': 'penish', 'Content-Type': 'application/json' },
+		body: body === undefined ? undefined : JSON.stringify(body)
+	});
+	if (!res.ok) {
+		// A refused tunable or genesis says why in detail; anything else is just a status.
+		let detail: string | null = null;
+		try {
+			const j = await res.json();
+			if (typeof j?.detail === 'string') detail = j.detail;
+		} catch {
+			detail = null;
+		}
+		throw new ApiError(res.status, detail);
+	}
+	return res.json();
+}
+
+export const getMycelium = () => mycelium('');
+export const myceliumAction = (a: MyceliumAction) => mycelium(`/${a}`, {});
+export const setTunables = (values: Record<string, number>, note: string | null) =>
+	mycelium('/tunables', note ? { values, note } : { values });

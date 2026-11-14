@@ -1,5 +1,5 @@
 """Jobs the admin panel enqueues: per-image regen and crop, bulk re-embed and re-describe,
-and haiku growth.
+haiku growth and mycelium genesis.
 
 Same contract as ingest: SoftError retries, HardError fails, and an image deleted while its
 job waited is a quiet no-op rather than an error.
@@ -20,6 +20,8 @@ import pyvips
 from psycopg.types.json import Jsonb
 
 from penish.config import Settings
+from penish.mycelium import genesis
+from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
 from penish.worker.derive import (
     Public,
@@ -188,6 +190,7 @@ async def _apply_described(
                 await conn.execute(
                     "delete from embeddings where image_id = %s and kind = %s", (image_id, KIND)
                 )
+                await mycelium.mark_dirty(conn)
                 changed = True
         if "tags" in want and d.tags:
             if "tags" in force:
@@ -250,6 +253,8 @@ async def _embed(pool: Pool, image_id: int, settings: Settings, embedder: Docume
             if await _row(conn, image_id) is None:
                 return
             raise SoftError("analysis changed while embedding")
+        # Same transaction as the vector, committed when the connection is returned.
+        await mycelium.mark_dirty(conn)
     await refresh_corpus_stats(pool, kind=KIND, model=settings.embed_model)
     if prev is not None and prev["model"] != settings.embed_model:
         # The row moved spaces, so the old space's mean and n are now stale too.
@@ -585,12 +590,20 @@ def _grow_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) ->
     return go
 
 
+def _genesis_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await genesis.handle(job, pool=pool, settings=settings)
+
+    return go
+
+
 HANDLERS: dict[str, HandlerFactory] = {
     "regen": _regen_handler,
     "crop": _crop_handler,
     "reembed_all": _reembed_all_handler,
     "redescribe_all": _redescribe_all_handler,
     "grow_haikus": _grow_handler,
+    genesis.JOB: _genesis_handler,
 }
 
 

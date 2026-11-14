@@ -7,6 +7,8 @@ from psycopg import AsyncConnection
 from psycopg.rows import DictRow
 from psycopg_pool import AsyncConnectionPool
 
+from penish.mycelium import store as mycelium
+
 Pool = AsyncConnectionPool[AsyncConnection[DictRow]]
 
 # Up to here the exact all-pairs average in SQL is about a million cosines,
@@ -87,6 +89,13 @@ async def refresh_corpus_stats(pool: Pool, *, kind: str, model: str) -> None:
             " values (%(kind)s, %(model)s, %(n)s, %(t)s)",
             {**params, "n": n, "t": temperature},
         )
+        if kind == mycelium.KIND:
+            # The candidate graph is centered on this mean, and the writer that marked
+            # it dirty committed before this refresh, so a tick between the two may
+            # have rebuilt on the old mean and cleared the mark. Last, not first: the
+            # tick never locks corpus_stats, so this order cannot deadlock with it, and
+            # the state row is not held across the pairwise average.
+            await mycelium.mark_dirty(conn)
 
 
 async def surprise_at_arrival(pool: Pool, image_id: int, *, kind: str, model: str) -> float | None:

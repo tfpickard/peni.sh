@@ -1,53 +1,536 @@
-"""The only module of the organism that touches Postgres."""
+"""The only module of the organism that touches Postgres.
+
+Everything here takes a connection and leaves transactions to the caller, except
+the few admin actions (start, pause, set_tunables, reset) that must lock the state
+row themselves. Lock order is always `mycelium_state` first: the tick holds it for
+its whole transaction, so anything else that touches the network takes it before
+any other row, or a delete and a tick could wait on each other.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import copy
+import logging
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any
 
+import numpy as np
+from numpy.typing import NDArray
 from psycopg import AsyncConnection
 from psycopg.rows import DictRow
+from psycopg.types.json import Jsonb
 
+from penish.mycelium import colonies as colony
 from penish.mycelium import overgrowth
-from penish.mycelium.tunables import DEFAULTS, Tunables
+from penish.mycelium.engine import EdgeState, LayerState, Pair, layer_order
+from penish.mycelium.graph import Edge
+from penish.mycelium.tunables import (
+    DEFAULTS,
+    LAYERS,
+    SPECS,
+    TICK_SECONDS,
+    TunableError,
+    Tunables,
+    with_overrides,
+)
+
+log = logging.getLogger(__name__)
+
+Conn = AsyncConnection[DictRow]
+FloatArray = NDArray[np.float64]
+
+# The embedding kind the whole layer grows on.
+KIND = "description"
+TICK = timedelta(seconds=TICK_SECONDS)
+
+# Not a colonies-module cause: only the admin kills a colony this way, outside a tick.
+RESET = "reset"
+
+# A change to any of these changes who may grow toward whom, so the graph is rebuilt.
+GRAPH_TUNABLES = frozenset({"candidates", "affinity_floor", "min_size"})
+
+# Network and colony tables a full wipe empties. Tunables are settings, not network.
+NETWORK_TABLES = (
+    "candidate_edges",
+    "edge_state",
+    "mycelium_traffic",
+    "mycelium_ticks",
+    "colony_ticks",
+    "colony_events",
+    "colony_members",
+    "colonies",
+)
+
+_STATE_COLUMNS = frozenset(
+    {
+        "running",
+        "seed",
+        "next_due",
+        "last_tick",
+        "graph_version",
+        "graph_dirty",
+        "tunables_version",
+        "colonies",
+        "public_since",
+        "simulated_through",
+    }
+)
 
 
-async def overgrowth_by_id(
-    conn: AsyncConnection[DictRow], ids: Sequence[int], tunables: Tunables = DEFAULTS
-) -> dict[int, float]:
-    """Overgrowth in 0..1 per picture, rounded to 3 places; ids not found are absent.
+def _iso(v: datetime | None) -> str | None:
+    return None if v is None else v.isoformat()
 
-    One query for the whole batch. Time is the database clock, the same one a view
-    writes with, so a picture viewed in this instant reads exactly 0.
+
+# -- state -------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class State:
+    running: bool
+    seed: int
+    next_due: datetime | None
+    last_tick: int | None
+    graph_version: int
+    graph_dirty: bool
+    tunables_version: int | None
+    colonies: dict[str, Any] | None
+    public_since: datetime | None
+    simulated_through: int | None
+    # The database clock when this was read: the transaction's start inside one.
+    now: datetime
+
+    @property
+    def public(self) -> bool:
+        return self.public_since is not None
+
+    @property
+    def next_tick(self) -> int:
+        return 0 if self.last_tick is None else self.last_tick + 1
+
+    def behind(self, now: datetime | None = None) -> int:
+        """Ticks due and not yet run; 0 while stopped."""
+        clock = self.now if now is None else now
+        if not self.running or self.next_due is None or self.next_due > clock:
+            return 0
+        return int((clock - self.next_due) // TICK) + 1
+
+    def colonies_state(self) -> colony.ColoniesState:
+        if not self.colonies:
+            return colony.ColoniesState()
+        return colony.ColoniesState.from_dict(self.colonies)
+
+
+async def read_state(conn: Conn, *, lock: bool = False) -> State:
+    """The singleton row. `lock` takes it `for update`, which only means something
+    inside a transaction."""
+    sql = "select *, now() as db_now from mycelium_state where id = 1"
+    cur = await conn.execute(sql + (" for update" if lock else ""))
+    row = await cur.fetchone()
+    if row is None:
+        # The migration inserts it; a hand-wiped table should not take the worker down.
+        await conn.execute(
+            "insert into mycelium_state (id, seed)"
+            " values (1, floor(random() * 4294967296)::bigint) on conflict (id) do nothing"
+        )
+        cur = await conn.execute(sql + (" for update" if lock else ""))
+        row = await cur.fetchone()
+        assert row is not None
+    return State(
+        running=bool(row["running"]),
+        seed=int(row["seed"]),
+        next_due=row["next_due"],
+        last_tick=None if row["last_tick"] is None else int(row["last_tick"]),
+        graph_version=int(row["graph_version"]),
+        graph_dirty=bool(row["graph_dirty"]),
+        tunables_version=row["tunables_version"],
+        colonies=row["colonies"],
+        public_since=row["public_since"],
+        simulated_through=row["simulated_through"],
+        now=row["db_now"],
+    )
+
+
+async def save_state(conn: Conn, **values: Any) -> None:
+    """Update the named columns of the singleton row; `colonies` takes a dict."""
+    unknown = set(values) - _STATE_COLUMNS
+    if unknown:
+        raise ValueError(f"unknown state column {sorted(unknown)[0]}")
+    if not values:
+        return
+    params = dict(values)
+    if "colonies" in params and params["colonies"] is not None:
+        params["colonies"] = Jsonb(params["colonies"])
+    sets = ", ".join(f"{k} = %({k})s" for k in sorted(params))
+    await conn.execute(
+        f"update mycelium_state set {sets}, updated_at = now() where id = 1".encode(), params
+    )
+
+
+async def mark_dirty(conn: Conn) -> None:
+    """The candidate graph is stale; the next tick rebuilds it.
+
+    Unconditional on purpose: `where not graph_dirty` would skip the row while a
+    tick that is about to clear the flag still holds it, and the change would be
+    lost. Callers run this first in their transaction (see the module docstring).
     """
-    if not ids:
-        return {}
-    # The pace is one row computed once, not per picture.
+    await conn.execute("update mycelium_state set graph_dirty = true where id = 1")
+
+
+async def start(conn: Conn, now: datetime | None = None) -> State:
+    """Running from now. The first tick is one tick length away, or sooner when a
+    genesis run has already set it inside that window."""
+    async with conn.transaction():
+        st = await read_state(conn, lock=True)
+        clock = st.now if now is None else now
+        due = st.next_due
+        if due is None or not clock < due <= clock + TICK:
+            due = clock + TICK
+        await save_state(conn, running=True, next_due=due)
+    return await read_state(conn)
+
+
+async def pause(conn: Conn) -> State:
+    """Stopped. Waits for a tick in progress, which then commits as usual."""
+    async with conn.transaction():
+        await read_state(conn, lock=True)
+        await save_state(conn, running=False)
+    return await read_state(conn)
+
+
+async def regrow(conn: Conn) -> State:
+    async with conn.transaction():
+        await mark_dirty(conn)
+    return await read_state(conn)
+
+
+async def shift_due(conn: Conn, now: datetime | None = None) -> int:
+    """Drop a backlog the catch-up could not clear: the next tick is due at once.
+
+    Returns the number of ticks skipped, 0 when nothing was behind.
+    """
+    async with conn.transaction():
+        st = await read_state(conn, lock=True)
+        clock = st.now if now is None else now
+        skipped = st.behind(clock)
+        if skipped:
+            await save_state(conn, next_due=clock)
+    return skipped
+
+
+# -- tunables ----------------------------------------------------------------
+
+
+def _known(values: Mapping[str, Any] | None) -> dict[str, Any]:
+    # A tunable removed from code may still sit in an old version; it means nothing now.
+    return {k: v for k, v in (values or {}).items() if k in SPECS}
+
+
+async def current_tunables(conn: Conn) -> tuple[Tunables, int | None, dict[str, Any]]:
+    """Tunables in force, the version they come from (None before any) and its overrides."""
+    cur = await conn.execute(
+        'select version, "values" from mycelium_tunables order by version desc limit 1'
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return DEFAULTS, None, {}
+    version = int(row["version"])
+    overrides = _known(row["values"])
+    try:
+        return with_overrides(DEFAULTS, overrides), version, overrides
+    except TunableError as e:
+        # Bounds tightened in code after the version was saved. Defaults keep the
+        # organism alive; the admin page still shows the stored version to fix.
+        log.warning("tunables version %d no longer valid (%s); using defaults", version, e)
+        return DEFAULTS, version, {}
+
+
+async def load_tunables(conn: Conn) -> Tunables:
+    """`with_overrides(DEFAULTS, latest values)`."""
+    t, _, _ = await current_tunables(conn)
+    return t
+
+
+async def set_tunables(conn: Conn, values: Mapping[str, Any], note: str | None = None) -> int:
+    """Append a version: the current overrides with `values` applied. Raises TunableError.
+
+    Only what differs from the defaults is stored. Returns the new version.
+    """
+    async with conn.transaction():
+        _, _, current = await current_tunables(conn)
+        merged = {**current, **values}
+        t = with_overrides(DEFAULTS, merged)
+        defaults = DEFAULTS.as_dict()
+        clean = {k: v for k, v in t.as_dict().items() if v != defaults[k]}
+        before = with_overrides(DEFAULTS, current).as_dict()
+        if any(before[k] != t.as_dict()[k] for k in GRAPH_TUNABLES):
+            await mark_dirty(conn)
+        cur = await conn.execute(
+            'insert into mycelium_tunables ("values", note) values (%s, %s) returning version',
+            (Jsonb(clean), note),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    return int(row["version"])
+
+
+async def tunables_history(conn: Conn, limit: int = 20) -> list[dict[str, Any]]:
+    """Newest first: `{version, created_at (iso), values, note}`."""
+    cur = await conn.execute(
+        'select version, created_at, "values", note from mycelium_tunables'
+        " order by version desc limit %s",
+        (limit,),
+    )
+    return [
+        {
+            "version": int(r["version"]),
+            "created_at": _iso(r["created_at"]),
+            "values": r["values"],
+            "note": r["note"],
+        }
+        for r in await cur.fetchall()
+    ]
+
+
+# -- pictures and vectors ----------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class GraphInputs:
+    """Live pictures with a vector in one (kind, model, dim) space, and that space's mean."""
+
+    vectors: dict[int, FloatArray]
+    mean: FloatArray | None
+    published: dict[int, datetime] = field(default_factory=dict)
+
+
+async def load_graph_inputs(conn: Conn, *, model: str, dim: int, kind: str = KIND) -> GraphInputs:
+    """The same corpus and mean similarity.py reads: live, filtered by kind, model and dim.
+
+    Vectors come back as float32 widened to float64, so every reader of the same rows
+    builds the same graph.
+    """
     cur = await conn.execute(
         """
-        with pace as (
+        select i.id, i.published_at, e.vec::real[] as vec
+          from images i
+          join embeddings e on e.image_id = i.id
+         where i.status = 'live' and e.kind = %(kind)s and e.model = %(model)s
+           and e.dim = %(dim)s
+         order by i.id
+        """,
+        {"kind": kind, "model": model, "dim": dim},
+    )
+    vectors: dict[int, FloatArray] = {}
+    published: dict[int, datetime] = {}
+    for r in await cur.fetchall():
+        pid = int(r["id"])
+        vectors[pid] = np.asarray(r["vec"], dtype=np.float64)
+        if r["published_at"] is not None:
+            published[pid] = r["published_at"]
+    cur = await conn.execute(
+        "select mean::real[] as mean from corpus_stats where kind = %s and model = %s",
+        (kind, model),
+    )
+    row = await cur.fetchone()
+    mean: FloatArray | None = None
+    if row is not None and row["mean"] is not None and len(row["mean"]) == dim:
+        mean = np.asarray(row["mean"], dtype=np.float64)
+    return GraphInputs(vectors, mean, published)
+
+
+async def live_slugs(conn: Conn) -> dict[int, str]:
+    """Every live picture, id to slug, in id order."""
+    cur = await conn.execute("select id, slug from images where status = 'live' order by id")
+    return {int(r["id"]): str(r["slug"] or r["id"]) for r in await cur.fetchall()}
+
+
+async def live_published(conn: Conn) -> dict[int, datetime | None]:
+    """Every live picture's publish time, id order; genesis replays arrivals from it."""
+    cur = await conn.execute(
+        "select id, published_at from images where status = 'live' order by id"
+    )
+    return {int(r["id"]): r["published_at"] for r in await cur.fetchall()}
+
+
+# -- candidate edges and edge state ------------------------------------------
+
+
+async def replace_candidate_edges(conn: Conn, layer: str, edges: Sequence[Edge]) -> None:
+    await conn.execute("delete from candidate_edges where layer = %s", (layer,))
+    if not edges:
+        return
+    async with (
+        conn.cursor() as cur,
+        cur.copy("copy candidate_edges (layer, src, dst, raw, affinity) from stdin") as cp,
+    ):
+        for e in edges:
+            if e.layer != layer:
+                raise ValueError(f"edge for {e.layer} in {layer}")
+            await cp.write_row((layer, e.src, e.dst, float(e.raw), float(e.affinity)))
+
+
+async def load_candidate_edges(conn: Conn) -> dict[str, list[Edge]]:
+    """Every layer's candidates, sorted by (src, dst) as graph.candidate_edges returns them."""
+    cur = await conn.execute(
+        "select layer, src, dst, raw, affinity from candidate_edges order by layer, src, dst"
+    )
+    out: dict[str, list[Edge]] = {}
+    for r in await cur.fetchall():
+        out.setdefault(r["layer"], []).append(
+            Edge(r["layer"], int(r["src"]), int(r["dst"]), float(r["raw"]), float(r["affinity"]))
+        )
+    return out
+
+
+async def load_edge_states(conn: Conn) -> dict[str, LayerState]:
+    cur = await conn.execute(
+        "select layer, src, dst, strength, latched, fatigue, fused, idle"
+        " from edge_state order by layer, src, dst"
+    )
+    edges: dict[str, dict[Pair, EdgeState]] = {}
+    for r in await cur.fetchall():
+        edges.setdefault(r["layer"], {})[(int(r["src"]), int(r["dst"]))] = EdgeState(
+            float(r["strength"]),
+            bool(r["latched"]),
+            float(r["fatigue"]),
+            bool(r["fused"]),
+            int(r["idle"]),
+        )
+    return {name: LayerState(name, edges[name]) for name in layer_order(edges)}
+
+
+async def replace_edge_states(conn: Conn, states: Mapping[str, LayerState]) -> None:
+    """A rewrite of the given layers. Nearly every row changes every tick (decay), so a
+    diff would write almost as much."""
+    names = list(layer_order(states))
+    if not names:
+        return
+    await conn.execute("delete from edge_state where layer = any(%s)", (names,))
+    async with (
+        conn.cursor() as cur,
+        cur.copy(
+            "copy edge_state (layer, src, dst, strength, latched, fatigue, fused, idle) from stdin"
+        ) as cp,
+    ):
+        for name in names:
+            edges = states[name].edges
+            for src, dst in sorted(edges):
+                es = edges[(src, dst)]
+                await cp.write_row(
+                    (
+                        name,
+                        src,
+                        dst,
+                        float(es.strength),
+                        es.latched,
+                        float(es.fatigue),
+                        es.fused,
+                        es.idle,
+                    )
+                )
+
+
+# -- traffic -----------------------------------------------------------------
+
+
+async def click_feeds(conn: Conn, src: int, dst: int) -> bool:
+    """Whether a click from `src` to `dst` would feed the organism right now."""
+    cur = await conn.execute(
+        """
+        select (select running from mycelium_state where id = 1)
+           and exists (select 1 from candidate_edges where src = %(s)s and dst = %(d)s) as ok
+        """,
+        {"s": src, "d": dst},
+    )
+    row = await cur.fetchone()
+    return bool(row and row["ok"])
+
+
+async def record_click(conn: Conn, src: int, dst: int) -> bool:
+    """Queue one click for the next tick; True if queued.
+
+    The checks repeat inside the insert, so a pause or a rebuild between the caller's
+    check and this write still drops the click.
+    """
+    cur = await conn.execute(
+        """
+        insert into mycelium_traffic (src, dst)
+        select %(s)s, %(d)s
+         where (select running from mycelium_state where id = 1)
+           and exists (select 1 from candidate_edges where src = %(s)s and dst = %(d)s)
+        returning id
+        """,
+        {"s": src, "d": dst},
+    )
+    return await cur.fetchone() is not None
+
+
+async def consume_traffic(conn: Conn, before: datetime) -> dict[Pair, int]:
+    """Take every committed click older than `before`; counts per (src, dst).
+
+    A click committed while the tick runs is not visible to this delete, and one
+    stamped after `before` is left alone; either way the next tick takes it.
+    """
+    cur = await conn.execute(
+        "delete from mycelium_traffic where created_at < %s returning src, dst", (before,)
+    )
+    out: dict[Pair, int] = {}
+    for r in await cur.fetchall():
+        pair = (int(r["src"]), int(r["dst"]))
+        out[pair] = out.get(pair, 0) + 1
+    return {p: out[p] for p in sorted(out)}
+
+
+# -- overgrowth --------------------------------------------------------------
+
+
+async def _attention(conn: Conn, ids: Sequence[int], at: datetime | None) -> list[DictRow]:
+    # The pace is one row computed once, not per picture. `at` None is the database
+    # clock, the same one a view writes with, so a picture viewed in this instant reads 0.
+    cur = await conn.execute(
+        """
+        with clock as (select coalesce(%(at)s::timestamptz, now()) as t),
+        pace as (
           select (select count(*) from images
                    where status = 'live' and published_at is not null)::int as live,
-                 (select coalesce(sum(n), 0) from view_days
-                   where day > current_date - 7)::float8 as views
+                 (select coalesce(sum(n), 0) from view_days, clock
+                   where day > clock.t::date - 7 and day <= clock.t::date)::float8 as views
         )
         select i.id,
-               extract(epoch from now() - coalesce(a.last_viewed_at, i.published_at))::float8
+               extract(epoch from clock.t - coalesce(a.last_viewed_at, i.published_at))::float8
                  / 3600.0 as hours,
                coalesce(a.neighbor_level, 0)::float8 as neighbor_level,
                pace.live, pace.views
           from images i
           left join picture_attention a on a.image_id = i.id
           cross join pace
+          cross join clock
          where i.id = any(%(ids)s)
         """,
-        {"ids": list(ids)},
+        {"ids": list(ids), "at": at},
     )
-    rows = await cur.fetchall()
+    return await cur.fetchall()
+
+
+async def overgrowth_by_id(
+    conn: Conn, ids: Sequence[int], tunables: Tunables | None = None
+) -> dict[int, float]:
+    """Overgrowth in 0..1 per picture, rounded to 3 places; ids not found are absent.
+
+    One query for the whole batch, plus one for the tunables when none are given.
+    """
+    if not ids:
+        return {}
+    t = await load_tunables(conn) if tunables is None else tunables
+    rows = await _attention(conn, ids, None)
     if not rows:
         return {}
     # The last seven days, today included.
     vpd = overgrowth.views_per_day(rows[0]["views"])
-    tau = overgrowth.tau_hours(rows[0]["live"], vpd, tunables)
+    tau = overgrowth.tau_hours(rows[0]["live"], vpd, t)
     out: dict[int, float] = {}
     for r in rows:
         # Never seen and never published: nothing to have neglected yet.
@@ -55,7 +538,7 @@ async def overgrowth_by_id(
             out[r["id"]] = 0.0
             continue
         base = overgrowth.base_from_hours(r["hours"], tau)
-        lvl = overgrowth.level(base, r["neighbor_level"], tunables)
+        lvl = overgrowth.level(base, r["neighbor_level"], t)
         out[r["id"]] = round(min(1.0, max(0.0, lvl)), 3)
     return out
 
@@ -89,3 +572,484 @@ async def record_view(conn: AsyncConnection[DictRow], image_id: int) -> bool:
             """
         )
     return True
+
+
+async def base_overgrowth(
+    conn: Conn, ids: Sequence[int], at: datetime, tunables: Tunables
+) -> dict[int, float]:
+    """Base overgrowth (no neighbor spread) at a tick's scheduled time, unrounded."""
+    if not ids:
+        return {}
+    rows = await _attention(conn, ids, at)
+    if not rows:
+        return {}
+    tau = overgrowth.tau_hours(
+        rows[0]["live"], overgrowth.views_per_day(rows[0]["views"]), tunables
+    )
+    return {
+        int(r["id"]): 0.0 if r["hours"] is None else overgrowth.base_from_hours(r["hours"], tau)
+        for r in rows
+    }
+
+
+async def write_neighbor_levels(conn: Conn, levels: Mapping[int, float]) -> None:
+    if not levels:
+        return
+    ids = sorted(levels)
+    # Only rows that change, so a quiet network does not rewrite every attention row.
+    await conn.execute(
+        """
+        update picture_attention a set neighbor_level = v.lvl
+          from unnest(%(ids)s::bigint[], %(lvls)s::float8[]) as v(id, lvl)
+         where a.image_id = v.id and a.neighbor_level is distinct from v.lvl
+        """,
+        {"ids": ids, "lvls": [float(levels[i]) for i in ids]},
+    )
+
+
+# -- colonies projection -----------------------------------------------------
+
+
+def _colony_row(c: colony.Colony) -> tuple[Any, ...]:
+    return (
+        c.state,
+        c.serial,
+        c.fruited,
+        c.faded,
+        c.died,
+        c.cause,
+        c.parent,
+        c.absorbed_by,
+        c.peak,
+    )
+
+
+def colony_strengths(
+    state: colony.ColoniesState, latched: Mapping[str, Sequence[tuple[int, int, float]]]
+) -> dict[int, float]:
+    """Mean strength of the latched edges inside each forming or living colony; 0 with none."""
+    out: dict[int, float] = {}
+    for c in state.colonies:
+        if c.state not in (colony.FORMING, colony.ALIVE, colony.FADING):
+            continue
+        mine = c.images()
+        values = [s for a, b, s in latched.get(c.layer, ()) if a in mine and b in mine]
+        out[c.id] = math.fsum(values) / len(values) if values else 0.0
+    return out
+
+
+async def apply_colonies(
+    conn: Conn,
+    prev: colony.ColoniesState,
+    new: colony.ColoniesState,
+    events: Sequence[colony.Event],
+    *,
+    tick: int,
+    scheduled_at: datetime,
+    simulated: bool,
+    slugs: Mapping[int, str],
+    latched: Mapping[str, Sequence[tuple[int, int, float]]],
+) -> None:
+    """Write the difference between two colony states into the colony tables.
+
+    `slugs` names pictures joining a colony; `latched` gives the per-tick strength.
+    Colony rows are upserted when they change and never deleted.
+    """
+    prev_by = {c.id: c for c in prev.colonies}
+
+    rows = []
+    for c in new.colonies:
+        p = prev_by.get(c.id)
+        if p is not None and _colony_row(p) == _colony_row(c):
+            continue
+        rows.append(
+            {
+                "id": c.id,
+                "layer": c.layer,
+                "state": c.state,
+                "serial": c.serial,
+                "born": c.born,
+                "fruited": c.fruited,
+                "faded": c.faded,
+                "died": c.died,
+                "cause": c.cause,
+                "parent": c.parent,
+                "absorbed_by": c.absorbed_by,
+                "peak": c.peak,
+                "simulated": simulated,
+            }
+        )
+    if rows:
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                """
+                insert into colonies (id, layer, state, serial, born_tick, fruited_tick,
+                                      faded_tick, died_tick, cause, parent_id, absorbed_by,
+                                      peak, simulated)
+                values (%(id)s, %(layer)s, %(state)s, %(serial)s, %(born)s, %(fruited)s,
+                        %(faded)s, %(died)s, %(cause)s, %(parent)s, %(absorbed_by)s,
+                        %(peak)s, %(simulated)s)
+                on conflict (id) do update set
+                  state = excluded.state, serial = excluded.serial,
+                  fruited_tick = excluded.fruited_tick, faded_tick = excluded.faded_tick,
+                  died_tick = excluded.died_tick, cause = excluded.cause,
+                  parent_id = excluded.parent_id, absorbed_by = excluded.absorbed_by,
+                  peak = excluded.peak, updated_at = now()
+                """,
+                rows,
+            )
+
+    closes: list[dict[str, Any]] = []
+    opens: list[dict[str, Any]] = []
+    founders: list[dict[str, Any]] = []
+    for c in new.colonies:
+        p = prev_by.get(c.id)
+        before = {m.image: m for m in p.members} if p is not None else {}
+        after = {m.image: m for m in c.members}
+        gone = sorted(set(before) - set(after))
+        if gone:
+            closes.append({"c": c.id, "ids": gone, "tick": tick})
+        for image in sorted(set(after) - set(before)):
+            m = after[image]
+            opens.append(
+                {
+                    "c": c.id,
+                    "image": image,
+                    "slug": slugs.get(image, str(image)),
+                    "founder": m.founder,
+                    "joined": m.joined,
+                }
+            )
+        for image in sorted(set(after) & set(before)):
+            if after[image].founder != before[image].founder:
+                founders.append({"c": c.id, "image": image, "founder": after[image].founder})
+    async with conn.cursor() as cur:
+        if closes:
+            # A deleted picture's rows lost their image_id to the foreign key; it is
+            # certainly not a member any more, so its open rows close with the rest.
+            await cur.executemany(
+                """
+                update colony_members set left_tick = %(tick)s
+                 where colony_id = %(c)s and left_tick is null
+                   and (image_id = any(%(ids)s) or image_id is null)
+                """,
+                closes,
+            )
+        if opens:
+            await cur.executemany(
+                """
+                insert into colony_members (colony_id, image_id, slug, founder, joined_tick)
+                select %(c)s, (select id from images where id = %(image)s), %(slug)s,
+                       %(founder)s, %(joined)s
+                """,
+                opens,
+            )
+        if founders:
+            await cur.executemany(
+                """
+                update colony_members set founder = %(founder)s
+                 where colony_id = %(c)s and image_id = %(image)s and left_tick is null
+                """,
+                founders,
+            )
+        if events:
+            await cur.executemany(
+                """
+                insert into colony_events (tick, scheduled_at, kind, colony_id, layer, image_id,
+                                           other_colony_id, simulated)
+                select %(tick)s, %(at)s, %(kind)s, %(c)s, %(layer)s,
+                       (select id from images where id = %(image)s), %(other)s, %(sim)s
+                """,
+                [
+                    {
+                        "tick": ev.tick,
+                        "at": scheduled_at,
+                        "kind": ev.kind,
+                        "c": ev.colony,
+                        "layer": ev.layer,
+                        "image": ev.image,
+                        "other": ev.other,
+                        "sim": simulated,
+                    }
+                    for ev in events
+                ],
+            )
+        strengths = colony_strengths(new, latched)
+        if strengths:
+            sizes = {c.id: len(c.members) for c in new.colonies}
+            await cur.executemany(
+                "insert into colony_ticks (colony_id, tick, size, mean_strength)"
+                " values (%(c)s, %(tick)s, %(size)s, %(s)s)"
+                " on conflict (colony_id, tick) do update"
+                " set size = excluded.size, mean_strength = excluded.mean_strength",
+                [
+                    {"c": cid, "tick": tick, "size": sizes[cid], "s": strengths[cid]}
+                    for cid in sorted(strengths)
+                ],
+            )
+
+
+# -- ticks -------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TickRow:
+    tick: int
+    scheduled_at: datetime
+    simulated: bool
+    state_hash: str
+    colonies_hash: str
+    # Per layer: live, in_gallery, edges, visible, latched, fused, mean_strength,
+    # crossings, traffic, clicks.
+    stats: Mapping[str, Mapping[str, float | int]]
+    tunables_version: int | None
+    graph_version: int | None
+
+
+async def insert_tick(conn: Conn, row: TickRow) -> None:
+    """The primary key on tick is what turns a second run of the same tick into an error."""
+    await conn.execute(
+        """
+        insert into mycelium_ticks (tick, scheduled_at, ran_at, simulated, state_hash,
+                                    colonies_hash, stats, tunables_version, graph_version)
+        values (%s, %s, clock_timestamp(), %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            row.tick,
+            row.scheduled_at,
+            row.simulated,
+            row.state_hash,
+            row.colonies_hash,
+            Jsonb({k: dict(v) for k, v in row.stats.items()}),
+            row.tunables_version,
+            row.graph_version,
+        ),
+    )
+
+
+# -- wipe and reset ----------------------------------------------------------
+
+
+async def wipe_network(conn: Conn, *, levels: bool = True) -> None:
+    """Empty every network and colony table and forget the run; keeps running, seed,
+    next_due and tunables. The caller holds the state lock.
+
+    Delete, not truncate: truncate's access exclusive lock would stop every reader of
+    these tables (each image page reads edge_state, each click candidate_edges) until
+    the caller commits, which for genesis is minutes. Deleted rows stay visible to
+    other transactions until then. Children before `colonies`, for the foreign keys.
+
+    `levels=False` leaves neighbor levels to the caller, so a long transaction does
+    not hold attention rows that every view of those pictures writes.
+    """
+    for table in NETWORK_TABLES:
+        await conn.execute(f"delete from {table}".encode())
+    if levels:
+        await clear_neighbor_levels(conn)
+    await save_state(conn, last_tick=None, colonies=None, simulated_through=None, graph_dirty=True)
+
+
+async def clear_neighbor_levels(conn: Conn, keep: Sequence[int] = ()) -> None:
+    """Every neighbor level outside `keep` back to 0."""
+    await conn.execute(
+        """
+        update picture_attention set neighbor_level = 0
+         where neighbor_level <> 0 and image_id <> all(%s::bigint[])
+        """,
+        (list(keep),),
+    )
+
+
+async def reset(conn: Conn) -> str:
+    """Start the network over. Returns "full" or "public".
+
+    Before any gallery address is public it is a full wipe. After, galleries have
+    addresses people may hold, so tombstones and serials stay: edges and waiting
+    clicks go, and every forming or living colony dies with cause `reset`.
+    """
+    async with conn.transaction():
+        st = await read_state(conn, lock=True)
+        if not st.public:
+            await wipe_network(conn)
+            return "full"
+        await conn.execute("delete from edge_state")
+        await conn.execute("delete from mycelium_traffic")
+        await clear_neighbor_levels(conn)
+        prev = st.colonies_state()
+        new = copy.deepcopy(prev)
+        tick = st.last_tick if st.last_tick is not None else 0
+        events: list[colony.Event] = []
+        for c in new.colonies:
+            if c.state == colony.FORMING:
+                c.state = colony.FAILED
+            elif c.state in colony.LIVING:
+                c.state = colony.DEAD
+            else:
+                continue
+            c.cause = RESET
+            c.died = tick
+            c.pending = []
+            events.append(colony.Event(tick, RESET, c.layer, c.id))
+        await apply_colonies(
+            conn,
+            prev,
+            new,
+            events,
+            tick=tick,
+            scheduled_at=st.now,
+            simulated=False,
+            slugs={},
+            latched={},
+        )
+        await save_state(conn, colonies=new.to_dict(), graph_dirty=True)
+    return "public"
+
+
+# -- reads for the admin page ------------------------------------------------
+
+
+async def series(conn: Conn, layer: str = "whole", limit: int = 1008) -> list[dict[str, Any]]:
+    """The last `limit` ticks of one layer, oldest first, JSON-ready."""
+    cur = await conn.execute(
+        """
+        select * from (
+          select tick, scheduled_at, simulated, stats -> %(layer)s as s
+            from mycelium_ticks order by tick desc limit %(limit)s
+        ) t order by tick
+        """,
+        {"layer": layer, "limit": limit},
+    )
+    keys = ("live", "in_gallery", "visible", "latched", "mean_strength", "crossings", "traffic")
+    out = []
+    for r in await cur.fetchall():
+        s = r["s"] or {}
+        item: dict[str, Any] = {
+            "tick": int(r["tick"]),
+            "scheduled_at": _iso(r["scheduled_at"]),
+            "simulated": bool(r["simulated"]),
+        }
+        for k in keys:
+            item[k] = s.get(k, 0)
+        out.append(item)
+    return out
+
+
+async def colonies_listing(conn: Conn) -> dict[str, list[dict[str, Any]]]:
+    """Forming and living colonies with their current live members, JSON-ready.
+
+    `{forming: [colony], living: [colony]}` where colony is `{id, layer, state,
+    serial, title, size, born_tick, fruited_tick, members: [{slug, founder}]}`.
+    """
+    cur = await conn.execute(
+        """
+        select id, layer, state, serial, title, born_tick, fruited_tick
+          from colonies where state in ('forming', 'alive', 'fading')
+         order by serial nulls last, born_tick, id
+        """
+    )
+    cols = await cur.fetchall()
+    ids = [int(c["id"]) for c in cols]
+    members: dict[int, list[dict[str, Any]]] = {}
+    if ids:
+        cur = await conn.execute(
+            """
+            select m.colony_id, i.slug, m.founder
+              from colony_members m
+              join images i on i.id = m.image_id and i.status = 'live'
+             where m.colony_id = any(%s) and m.left_tick is null
+             order by m.colony_id, i.slug
+            """,
+            (ids,),
+        )
+        for r in await cur.fetchall():
+            members.setdefault(int(r["colony_id"]), []).append(
+                {"slug": r["slug"], "founder": bool(r["founder"])}
+            )
+    out: dict[str, list[dict[str, Any]]] = {"forming": [], "living": []}
+    for c in cols:
+        ms = members.get(int(c["id"]), [])
+        item = {
+            "id": int(c["id"]),
+            "layer": c["layer"],
+            "state": c["state"],
+            "serial": c["serial"],
+            "title": c["title"],
+            "size": len(ms),
+            "born_tick": int(c["born_tick"]),
+            "fruited_tick": c["fruited_tick"],
+            "members": ms,
+        }
+        out["forming" if c["state"] == colony.FORMING else "living"].append(item)
+    return out
+
+
+async def recent_events(conn: Conn, limit: int = 50) -> list[dict[str, Any]]:
+    """Newest first: `{tick, scheduled_at, kind, colony_id, layer, slug, other_colony_id,
+    simulated}`, JSON-ready."""
+    cur = await conn.execute(
+        """
+        select e.tick, e.scheduled_at, e.kind, e.colony_id, e.layer, i.slug,
+               e.other_colony_id, e.simulated
+          from colony_events e
+          left join images i on i.id = e.image_id
+         order by e.tick desc, e.id desc
+         limit %s
+        """,
+        (limit,),
+    )
+    return [
+        {
+            "tick": int(r["tick"]),
+            "scheduled_at": _iso(r["scheduled_at"]),
+            "kind": r["kind"],
+            "colony_id": int(r["colony_id"]),
+            "layer": r["layer"],
+            "slug": r["slug"],
+            "other_colony_id": r["other_colony_id"],
+            "simulated": bool(r["simulated"]),
+        }
+        for r in await cur.fetchall()
+    ]
+
+
+# -- public reads ------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Hypha:
+    image_id: int
+    slug: str
+    strength: float
+    layer: str
+
+
+HYPHAE_MAX = 8
+
+
+async def hyphae_for(
+    conn: Conn, image_id: int, tunables: Tunables | None = None, limit: int = HYPHAE_MAX
+) -> list[Hypha]:
+    """Visible hyphae of one picture: the strongest edge per neighbor over both
+    directions and every layer, to live pictures only, strongest first then by slug.
+
+    Reads only edge state, so need phrases (Increment 5) can never leak through here.
+    """
+    t = await load_tunables(conn) if tunables is None else tunables
+    cur = await conn.execute(
+        """
+        select distinct on (o.other) o.other, i.slug, o.strength, o.layer
+          from (select dst as other, strength, layer from edge_state where src = %(id)s
+                union all
+                select src as other, strength, layer from edge_state where dst = %(id)s) o
+          join images i on i.id = o.other and i.status = 'live'
+         where o.strength >= %(vis)s and o.other <> %(id)s
+         order by o.other, o.strength desc, array_position(%(layers)s::text[], o.layer), o.layer
+        """,
+        {"id": image_id, "vis": t.hypha_visible, "layers": list(LAYERS)},
+    )
+    found = [
+        Hypha(int(r["other"]), str(r["slug"]), float(r["strength"]), str(r["layer"]))
+        for r in await cur.fetchall()
+    ]
+    found.sort(key=lambda h: (-h.strength, h.slug))
+    return found[:limit]

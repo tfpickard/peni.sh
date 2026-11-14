@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from penish.api import (
     admin,
+    admin_mycelium,
     admin_ops,
     admin_pictures,
     attention,
@@ -39,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router)
     app.include_router(admin_ops.router)
     app.include_router(admin_pictures.router)
+    app.include_router(admin_mycelium.router)
     app.include_router(social.router)
     app.include_router(attention.router)
     app.middleware("http")(admin.no_store)

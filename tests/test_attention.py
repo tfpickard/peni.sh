@@ -21,6 +21,7 @@ ONE_TAU = 0.632
 @pytest.fixture(autouse=True)
 def _fresh() -> None:
     attention.view_limit.clear()
+    attention.click_limit.clear()
     routes_search.search_limit.clear()
     routes_search._vectors.clear()
 
@@ -402,3 +403,106 @@ async def test_og_neighbor_spread_and_clamp(pool: object, clean_db: str) -> None
     got = await _og(p, [a, b])
     assert got[a] == round((1 - 2.718281828459045**-1) * (1 + DEFAULTS.overgrowth_sigma), 3)
     assert got[b] == 1.0
+
+
+# -- clicks become traffic --------------------------------------------------
+
+
+def organism(dsn: str, *, running: bool, edges: list[tuple[int, int]]) -> None:
+    with psycopg.connect(dsn) as conn:
+        conn.execute("update mycelium_state set running = %s", (running,))
+        for src, dst in edges:
+            conn.execute(
+                "insert into candidate_edges (layer, src, dst, raw, affinity)"
+                " values ('whole', %s, %s, 0.5, 0.5)",
+                (src, dst),
+            )
+        conn.commit()
+
+
+def traffic(dsn: str) -> list[tuple[int, int]]:
+    with psycopg.connect(dsn) as conn:
+        rows = conn.execute("select src, dst from mycelium_traffic order by id").fetchall()
+    return [(int(a), int(b)) for a, b in rows]
+
+
+async def test_click_needs_a_candidate_edge(client: httpx.AsyncClient, clean_db: str) -> None:  # noqa: F811
+    a, b, c = (add_image(clean_db, n) for n in (1, 2, 3))
+    add_image(clean_db, 4, status="queued")
+    organism(clean_db, running=True, edges=[(a, b)])
+    for slug, src in (
+        ("img-2", "img-1"),  # the candidate
+        ("img-3", "img-1"),  # no edge
+        ("img-1", "img-2"),  # the reverse is not an edge
+        ("img-2", "img-2"),  # itself
+        ("img-2", "nope"),  # unknown
+        ("img-2", "img-4"),  # not live
+    ):
+        r = await view(client, slug, json={"from": src})
+        assert r.status_code == 204, (slug, src)
+    assert traffic(clean_db) == [(a, b)]
+    # No `from`, no click; the view still counts.
+    assert (await view(client, "img-3")).status_code == 204
+    assert traffic(clean_db) == [(a, b)]
+    got = attention_of(clean_db, c)
+    assert got is not None and got[0] == 1
+
+
+async def test_click_from_an_old_slug(client: httpx.AsyncClient, clean_db: str) -> None:  # noqa: F811
+    a, b = (add_image(clean_db, n) for n in (1, 2))
+    with psycopg.connect(clean_db) as conn:
+        conn.execute("insert into slug_aliases (slug, image_id) values ('old-one', %s)", (a,))
+        conn.commit()
+    organism(clean_db, running=True, edges=[(a, b)])
+    assert (await view(client, "img-2", json={"from": "old-one"})).status_code == 204
+    assert traffic(clean_db) == [(a, b)]
+
+
+async def test_clicks_dropped_while_stopped(client: httpx.AsyncClient, clean_db: str) -> None:  # noqa: F811
+    a, b = (add_image(clean_db, n) for n in (1, 2))
+    organism(clean_db, running=False, edges=[(a, b)])
+    assert (await view(client, "img-2", json={"from": "img-1"})).status_code == 204
+    assert traffic(clean_db) == []
+    # Views still count while the organism sleeps.
+    got = attention_of(clean_db, b)
+    assert got is not None and got[0] == 1
+    assert today_views(clean_db) == 1
+
+
+async def test_click_budget_per_client(client: httpx.AsyncClient, clean_db: str) -> None:  # noqa: F811
+    a, b, _ = (add_image(clean_db, n) for n in (1, 2, 3))
+    organism(clean_db, running=True, edges=[(a, b)])
+    # Browsing that is not a click never spends the budget.
+    for _ in range(attention.CLICK_LIMIT + 2):
+        assert (await view(client, "img-3", json={"from": "img-1"})).status_code == 204
+    for _ in range(attention.CLICK_LIMIT + 3):
+        assert (await view(client, "img-2", json={"from": "img-1"})).status_code == 204
+    assert traffic(clean_db) == [(a, b)] * attention.CLICK_LIMIT
+    # Another reader has a budget of their own.
+    other = {"CF-Connecting-IP": "198.51.100.9"}
+    r = await client.post("/api/images/img-2/view", headers={**H, **other}, json={"from": "img-1"})
+    assert r.status_code == 204
+    assert len(traffic(clean_db)) == attention.CLICK_LIMIT + 1
+
+
+async def test_traffic_stores_nothing_about_the_visitor(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+) -> None:
+    a, b = (add_image(clean_db, n) for n in (1, 2))
+    organism(clean_db, running=True, edges=[(a, b)])
+    ip = "203.0.113.77"
+    await client.post(
+        "/api/images/img-2/view",
+        headers={**H, "CF-Connecting-IP": ip},
+        json={"from": "img-1"},
+    )
+    with psycopg.connect(clean_db) as conn:
+        cols = conn.execute(
+            "select column_name from information_schema.columns"
+            " where table_name = 'mycelium_traffic'"
+        ).fetchall()
+        dump = str(conn.execute("select * from mycelium_traffic").fetchall())
+    assert {c for (c,) in cols} == {"id", "src", "dst", "created_at"}
+    assert traffic(clean_db) == [(a, b)]
+    assert ip not in dump

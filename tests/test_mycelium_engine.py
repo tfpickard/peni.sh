@@ -162,6 +162,14 @@ def test_state_hash_covers_every_field() -> None:
     assert len(seen) == len(changes) + 3
 
 
+def test_state_hash_ignores_empty_layers() -> None:
+    # A reload from edge_state cannot tell an empty layer from an absent one.
+    edge = EdgeState(strength=0.4, latched=False, fatigue=0.0, fused=False, idle=0)
+    full = LayerState("facet:mood", {(1, 2): edge})
+    assert state_hash({L: LayerState(L, {})}) == state_hash({})
+    assert state_hash({L: LayerState(L, {}), full.layer: full}) == state_hash({full.layer: full})
+
+
 def test_strength_bounded_and_budget_held() -> None:
     t = with_overrides(
         DEFAULTS, {"rho": 0.2, "walkers": 8, "steps": 12, "budget": 0.6, "colony_leave": 0.2}

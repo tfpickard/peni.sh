@@ -17,6 +17,7 @@ from penish.api import embed_client
 from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for, variants_for_many
 from penish.config import get_settings
+from penish.mycelium import store as mycelium
 from penish.worker.admin_jobs import (
     ORIG_TYPES,
     find_original,
@@ -338,6 +339,11 @@ async def edit_picture(request: Request, image_id: int, body: Edit) -> dict[str,
     given = body.model_fields_set
     try:
         async with _pool(request).connection() as conn, conn.transaction():
+            if EMBED_FIELD in given:
+                # Before the images row lock: a tick holds the state row while its edge
+                # inserts take key share locks on images, so the other order deadlocks.
+                # A mark for an analysis that turns out unchanged costs one rebuild.
+                await mycelium.mark_dirty(conn)
             cur = await conn.execute(
                 "select id, slug, status from images where id = %s for update", (image_id,)
             )
@@ -482,6 +488,9 @@ async def delete_picture(request: Request, image_id: int) -> dict[str, bool]:
         await conn.execute("select pg_advisory_lock(hashtextextended(%s, 0))", (sha,))
         try:
             async with conn.transaction():
+                # First: the cascade below deletes edge rows a tick may be writing, and
+                # the tick holds the state row while it does.
+                await mycelium.mark_dirty(conn)
                 cur = await conn.execute(
                     "select distinct model from embeddings where image_id = %s and kind = %s",
                     (image_id, KIND),

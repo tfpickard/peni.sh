@@ -23,6 +23,7 @@ from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
 from penish.config import Settings
+from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
 from penish.text import slugify
 from penish.worker.derive import (
@@ -190,6 +191,7 @@ async def _write_text(
             await conn.execute(
                 "delete from embeddings where image_id = %s and kind = %s", (image_id, KIND)
             )
+            await mycelium.mark_dirty(conn)
 
 
 async def _apply_owner(conn: Conn, image_id: int, group: Group) -> bool:
@@ -291,15 +293,18 @@ async def _ensure_embedding(
         vec = np.asarray(out[0], dtype=np.float32)
     if vec.shape != (settings.embed_dim,):
         raise HardError(f"embedding has shape {vec.shape}, want ({settings.embed_dim},)")
-    await conn.execute(
-        """
-        insert into embeddings (image_id, kind, vec, model, dim, created_at)
-        values (%s, %s, %s, %s, %s, now())
-        on conflict (image_id, kind) do update set
-          vec = excluded.vec, model = excluded.model, dim = excluded.dim, created_at = now()
-        """,
-        (image_id, KIND, vec, settings.embed_model, settings.embed_dim),
-    )
+    async with conn.transaction():
+        # The state row first, as the tick takes it, so the two never wait on each other.
+        await mycelium.mark_dirty(conn)
+        await conn.execute(
+            """
+            insert into embeddings (image_id, kind, vec, model, dim, created_at)
+            values (%s, %s, %s, %s, %s, now())
+            on conflict (image_id, kind) do update set
+              vec = excluded.vec, model = excluded.model, dim = excluded.dim, created_at = now()
+            """,
+            (image_id, KIND, vec, settings.embed_model, settings.embed_dim),
+        )
 
 
 # -- publish --------------------------------------------------------------
@@ -340,6 +345,9 @@ async def _go_live(conn: Conn, image_id: int, base: str, surprise: float | None)
     for _ in range(_SLUG_RETRIES):
         try:
             async with conn.transaction():
+                # First, as the tick takes the state row first: a new picture changes who
+                # may grow toward whom, and this waits out a tick in progress.
+                await mycelium.mark_dirty(conn)
                 slug = await _free_slug(conn, base, image_id)
                 await conn.execute(
                     "delete from slug_aliases where slug = %s and image_id = %s",

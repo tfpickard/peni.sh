@@ -8,6 +8,7 @@ disagree with the run it replays.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -123,6 +124,10 @@ def coerce(name: str, value: Any) -> float | int:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise TunableError(f"{name} must be a number")
     out: float | int = float(value)
+    # JSON bodies may carry NaN or Infinity, and int() of either raises a plain
+    # ValueError or OverflowError, which would surface as a 500 rather than a 400.
+    if not math.isfinite(out):
+        raise TunableError(f"{name} must be a number")
     if name in _INTS:
         if out != int(value):
             raise TunableError(f"{name} must be a whole number")

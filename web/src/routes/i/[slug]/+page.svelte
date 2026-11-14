@@ -3,6 +3,7 @@
 	import { tick } from 'svelte';
 	import Picture from '../../../lib/components/Picture.svelte';
 	import Strip from '../../../lib/components/Strip.svelte';
+	import Reach from '../../../lib/components/Reach.svelte';
 	import Votes from '../../../lib/components/Votes.svelte';
 	import Comments from '../../../lib/components/Comments.svelte';
 	import { postView } from '../../../lib/api';
@@ -283,6 +284,9 @@
 	{/if}
 	<Strip label="similar" items={image.similar} />
 	<Strip label="dissimilar" items={image.dissimilar} />
+	<Strip label="reaching" items={image.hyphae ?? []}>
+		{#snippet foot(h)}<Reach strength={h.strength} layer={h.layer} />{/snippet}
+	</Strip>
 	{#if metrics.length}
 		<dl>
 			{#each metrics as [k, v]}

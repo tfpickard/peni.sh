@@ -352,11 +352,17 @@ def _encode(state: LayerState) -> bytes:
 
 
 def state_hash(state: LayerState | Mapping[str, LayerState]) -> str:
-    """sha256 over the sorted edge state, floats written exactly with float.hex."""
+    """sha256 over the sorted edge state, floats written exactly with float.hex.
+
+    In a mapping a layer with no edges is skipped: an empty layer and an absent one
+    step the same, and a reload from edge_state, which has no rows to name an empty
+    layer by, must hash as the state that was saved.
+    """
     h = hashlib.sha256()
     if isinstance(state, LayerState):
         h.update(_encode(state))
     else:
         for name in layer_order(state):
-            h.update(_encode(state[name]))
+            if state[name].edges:
+                h.update(_encode(state[name]))
     return h.hexdigest()

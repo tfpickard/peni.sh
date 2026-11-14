@@ -323,3 +323,172 @@ edge rather than dying), so a level covers the same share of every picture;
 ### Deferred
 
 - The `most overgrown` sort.
+
+## Increment 2
+
+The network on the whole layer: persistence, the live tick, traffic, genesis,
+admin, and the public `reaching` strip. Colonies are detected and stored from
+here on, admin-only until Increment 4.
+
+### Tables (`migrations/007_mycelium.sql`)
+
+| Table | Columns | Notes |
+|---|---|---|
+| `mycelium_state` | `id` (check 1), `running`, `seed bigint >= 0`, `next_due`, `last_tick`, `graph_version`, `graph_dirty`, `tunables_version`, `colonies jsonb`, `public_since`, `simulated_through`, `updated_at` | One row, inserted by the migration with a random seed. Ships stopped. `colonies` is `ColoniesState.to_dict()`, so a restore is exact. Lock order: anyone who touches a row the tick writes or key-share locks (images, network tables, attention) takes this row before it |
+| `candidate_edges` | `layer, src, dst, raw, affinity`, pk `(layer, src, dst)` | Image FKs cascade. Indexed on `(src, dst)` (the click check) and `dst` |
+| `edge_state` | `layer, src, dst, strength, latched, fatigue, fused, idle`, pk `(layer, src, dst)` | `engine.EdgeState` field for field; `double precision` round trips float64 exactly, so a restored state hashes as it was saved. `engine.state_hash` skips a layer with no edges, since a reload cannot name an empty layer |
+| `mycelium_traffic` | `id, src, dst, created_at` | Clicks waiting for a tick. Nothing about the visitor, of any kind |
+| `mycelium_ticks` | `tick` pk, `scheduled_at, ran_at, simulated, state_hash, colonies_hash, stats jsonb, tunables_version, graph_version` | The pk is what makes a second commit of one tick fail. `stats` per layer: `live, in_gallery, edges, visible, latched, fused, mean_strength, crossings, traffic, clicks` |
+| `mycelium_tunables` | `version serial, "values" jsonb, created_at, note` | Append only, newest is current. Only values that differ from the defaults are stored. `"values"` is quoted (reserved word); every read goes through `store` |
+| `colonies` | `id` (= colonies-module id), `layer, state, serial unique, title, title_source (model, owner), born_tick, fruited_tick, faded_tick, died_tick, cause, parent_id, absorbed_by, cover_image_id, peak, simulated, updated_at` | Never deleted outside a full wipe. `cause` adds `reset` to the module's causes |
+| `colony_members` | `id, colony_id, image_id (set null), slug, founder, joined_tick, left_tick` | One row per stint; the slug stays for a tombstone of a deleted picture |
+| `colony_events` | `id, tick, scheduled_at, kind, colony_id, layer, image_id (set null), other_colony_id, simulated` | `kind` adds `reset` |
+| `colony_ticks` | `colony_id, tick, size, mean_strength`, pk both | Forming and living colonies each tick; mean of latched strengths inside, else 0 |
+
+All of them are in the truncate list of `tests/conftest.py`, which then
+reinserts the state row with seed 1.
+
+### The tick (`penish/mycelium/tick.py`, SQL in `store.py`)
+
+A loop beside the heartbeat wakes every 30 s and runs what is due, catching
+and logging every exception. One tick is one transaction: lock the state row,
+return if stopped or not due, rebuild the whole-layer candidates when
+`graph_dirty` is set (or a stored edge has an endpoint that is no longer live),
+take the clicks with `delete ... where created_at < scheduled_at + 10 min
+returning`, step the engine and the colonies on the persisted seed, write edge
+state, the colony projection, `neighbor_level` and the tick row, and move
+`next_due` on by one tick. Base overgrowth is computed at the tick's scheduled
+time. Catch-up runs at most 144 ticks per wake, re-checking `running` under
+the lock each time; a backlog left after that moves `next_due` to now. Start
+sets `next_due = now + 10 min`, keeping a `next_due` already inside that
+window (one genesis left).
+
+The graph is centered with `corpus_stats.mean` for (`description`, embed
+model) once the live corpus has `centered_min_images` vectors, the rule
+`similarity.py` uses for its auto mode. The dirty mark is the first statement
+of the go-live, admin delete, admin analysis edit and `ingest._ensure_embedding`
+transactions, since those take locks on `images` (or rows the tick's foreign
+keys key-share lock) that a tick holding the state row would wait on. The other
+description-embedding writers (`ingest._write_text`, `admin_jobs._apply_described`,
+`admin_jobs._embed`) mark after their write: they lock only texts and
+embeddings, which the tick never locks. `refresh_corpus_stats` for
+`description` marks once more at the end of its own transaction, because the
+writer's mark commits before the new mean does and a tick in between would
+rebuild on the old mean and clear the mark; it marks last so the state row is
+not held across the pairwise average, which is safe because the tick only
+reads `corpus_stats`.
+
+### Traffic
+
+`POST /api/images/{slug}/view` with `from`: when the organism is running,
+`from` resolves (slug or old alias) to a live picture other than this one and
+`(from, this)` is a candidate edge in any layer, one row goes into
+`mycelium_traffic`. A second `RateLimit`, 6 per 10 minutes per `ip_hash`, in
+memory, is spent only on clicks that would count. Views count as before
+whether or not the click does; the response is still 204. The view commits
+before the click check, so its attention row lock never waits on network
+tables.
+
+### Genesis (`penish/mycelium/genesis.py`)
+
+Worker job `mycelium_genesis` (dedupe key the same), registered in
+`admin_jobs.HANDLERS`. Never retried: any failure is a `HardError`.
+
+- Refuses (`running`, `public`, `no publish dates`, `fewer than N pictures`,
+  `nothing to replay`)
+  before touching anything.
+- Tick 0 is the publish time of the `centered_min_images`-th live picture with
+  a vector (ties by id). Every live picture enters at
+  `max(0, floor((published_at - tick 0) / 10 min))`; one with no publish time
+  enters at 0. A picture without a vector is live and has no edges.
+- The graph is rebuilt, with today's mean, whenever a picture with a vector
+  arrives. No clicks. Base overgrowth only for the last tick, since it feeds
+  nothing but the stored neighbor level.
+- Each tick writes its colony projection and its tick row with the tick's
+  `scheduled_at` and `simulated = true`. The fruiting cap is the colonies
+  module's own rolling 144 ticks.
+- Ends at the last tick scheduled at or before now: `last_tick` and
+  `simulated_through` set to it, `next_due` the tick after, graph clean, still
+  stopped.
+- Before committing it rebuilds the graph from a fresh read of the live corpus
+  and raises `GenesisMismatch` if that differs from the replay's last graph.
+- One transaction from the refusal checks through the wipe to the commit, so a
+  failure leaves the network as it was. Publishes, deletes and embedding writes
+  wait on the state row meanwhile. About 8 ms of CPU per tick at 300 pictures,
+  so a year of history takes some minutes.
+- Readers never wait on it. The wipe (`store.wipe_network`, shared with the
+  full reset) deletes rather than truncates: truncate's access exclusive lock
+  would hold every image page (`hyphae_for` reads `edge_state`) and every click
+  check (`candidate_edges`) for the whole replay and drain the api pool. Until
+  the commit other transactions see the old network. Neighbor levels are not
+  touched until the final statements, so a view of a picture with a level does
+  not wait on the replay either.
+
+### Admin API (`penish/api/admin_mycelium.py`)
+
+Prefix `/api/admin/mycelium`, `Depends(_gate)` and `Depends(require_admin)`.
+Every route returns the payload below.
+
+`GET ""`:
+
+```
+{running, tick: int|null, next_due: iso|null, behind: int, graph_version: int,
+ graph_dirty, public, simulated_through: int|null,
+ genesis: {status: none|queued|running|failed|done, error: str|null},
+ tunables: [{name, value, default, lo, hi, meaning, int}],
+ tunables_version: int|null,
+ history: [{version, created_at, values, note}],          newest first, 20
+ series: [{tick, scheduled_at, simulated, live, in_gallery, visible, latched,
+           mean_strength, crossings, traffic}],          whole layer, 1008, oldest first
+ colonies: {forming: [colony], living: [colony]},
+ events: [{tick, scheduled_at, kind, colony_id, layer, slug|null,
+           other_colony_id|null, simulated}]}             newest first, 50
+colony = {id, layer, state, serial|null, title|null, size, born_tick,
+          fruited_tick|null, members: [{slug, founder}]}  live open members only
+```
+
+`tunables` is in field order; `lo` and `hi` are ints for an integer tunable.
+`genesis` is the newest `mycelium_genesis` job; `error` is its `last_error`
+only when it failed.
+
+POSTs:
+
+| Path | Body | Does | Errors |
+|---|---|---|---|
+| `/start` | none | running; `next_due` as above | |
+| `/pause` | none | stopped, after any tick in progress commits | |
+| `/tunables` | `{values: {name: number}, note?: string}` | appends a version: current overrides with these applied, only non-defaults stored; `candidates`, `affinity_floor` or `min_size` changing marks the graph dirty | 400 with the `TunableError` text, `nothing to change` for `{}`, `note too long` past 200 |
+| `/regrow` | none | `graph_dirty = true` | |
+| `/reset` | none | before `public_since`: full wipe of network and colony tables, numbering restarts at 0; after: edge state, waiting clicks and neighbor levels cleared, forming colonies `failed` and living ones `dead`, cause `reset`, `died_tick = last_tick`, a `reset` event each, serials and tombstones kept. Both keep running, seed, clock and tunables and mark the graph dirty | |
+| `/genesis` | none | enqueues the job; a second press collapses into a queued or running one | 409 `running`, 409 `public` |
+
+### Public
+
+`GET /api/images/{slug}` gains `hyphae`: at most 8 items of the `similar`
+shape plus `strength` and `layer`, `{slug, score, blurhash, src, overgrowth,
+strength, layer}`. One item per neighbor: the strongest edge over both
+directions and every layer, strength at least `hypha_visible`, live
+neighbors only, by strength desc then slug. `score` is the strength, since a
+hypha has no similarity of its own. Read from `edge_state` only, so need
+phrases cannot reach it. Empty before the first tick; frozen while paused.
+
+### Web
+
+- Image page: a `reaching` strip under `dissimilar`, the same `Strip` with a
+  `Reach` mark under each tile; hidden when `hyphae` is empty. `Reach` is a row
+  of dots on a 112 by 6 box: the kind sets dot radius and spacing (`whole`
+  1.1 every 4.5, `facet:*` 0.6 every 2.4, `need` 1.7 every 8), never colour or
+  a label, so kinds read apart in greyscale. Strength sets how far the row runs
+  across the tile and its opacity (0.35 to 1).
+- Admin `mycelium` page, nav entry `mycelium`: a state line, start and pause,
+  regrow, reset and genesis as links, sparklines per series metric (genesis
+  ticks drawn dim before the lived ones), forming and living colonies with
+  members (non-founders dim), the tunables table with history, recent events.
+- Reset is armed by the first click: the label turns to `sure` in the accent
+  colour, and a second click within 5 s resets. No browser dialog.
+- The page refreshes every 30 s while visible and idle. Responses carry the
+  order their requests were sent in, and one older than what is on screen is
+  dropped, so a refresh that was in flight when an action answered cannot put
+  the old state back. Only tunables the owner typed in survive a refresh; the
+  rest follow the server, so a value saved elsewhere is never posted back.
+  Save and undo start the draft over.

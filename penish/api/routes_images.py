@@ -10,7 +10,7 @@ from penish.api.media import variants_for, variants_for_many
 from penish.api.social import approved_comments, vote_summary, voter_for
 from penish.categories import LABELS, SLUGS
 from penish.config import get_settings
-from penish.mycelium.store import overgrowth_by_id
+from penish.mycelium.store import hyphae_for, overgrowth_by_id
 from penish.similarity import Mode, image_metrics, neighbors
 from penish.sort import EMBEDDED, SEEDED, SORTS, OrderCache, Row, Sort, order
 
@@ -355,12 +355,13 @@ async def image_detail(
         votes = await vote_summary(conn, img["id"], voter_for(request))
         comments = await approved_comments(conn, img["id"])
         prev, nxt = await _adjacent(conn, img)
+        hyphae = await hyphae_for(conn, img["id"])
 
     mode: Mode = sim or "auto"
     nb = await neighbors(pool, img["id"], k=_K, mode=mode)
     metrics = await image_metrics(pool, img["id"])
 
-    ids = [n.image_id for n in (*nb.similar, *nb.dissimilar)]
+    ids = [n.image_id for n in (*nb.similar, *nb.dissimilar)] + [h.image_id for h in hyphae]
     meta: dict[int, dict[str, Any]] = {}
     og: dict[int, float] = {}
     if ids:
@@ -373,23 +374,29 @@ async def image_detail(
             og = await overgrowth_by_id(conn, ids)
     nb_variants = variants_for_many((m["pub_sha"], m["width"], m["height"]) for m in meta.values())
 
+    def card(image_id: int, slug: str, score: float) -> dict[str, Any]:
+        m = meta[image_id]
+        vs = nb_variants[m["pub_sha"]]
+        # 480 is the grid size; a small source may only have its native width.
+        pick = next((v for v in vs if v["w"] == 480), vs[0] if vs else None)
+        return {
+            "slug": slug,
+            "score": round(score, 3),
+            "blurhash": m["blurhash"],
+            "src": (pick["webp"] or pick["avif"]) if pick else None,
+            "overgrowth": og.get(image_id, 0.0),
+        }
+
     def strip(neighbor_list: list[Any]) -> list[dict[str, Any]]:
-        out = []
-        for n in neighbor_list:
-            m = meta[n.image_id]
-            vs = nb_variants[m["pub_sha"]]
-            # 480 is the grid size; a small source may only have its native width.
-            pick = next((v for v in vs if v["w"] == 480), vs[0] if vs else None)
-            out.append(
-                {
-                    "slug": n.slug,
-                    "score": round(n.score, 3),
-                    "blurhash": m["blurhash"],
-                    "src": (pick["webp"] or pick["avif"]) if pick else None,
-                    "overgrowth": og.get(n.image_id, 0.0),
-                }
-            )
-        return out
+        return [card(n.image_id, n.slug, n.score) for n in neighbor_list]
+
+    # A hypha has no similarity of its own to show, so its score is its strength. A
+    # neighbor deleted since the edge was read is skipped rather than failing the page.
+    reaching = [
+        {**card(h.image_id, h.slug, h.strength), "strength": round(h.strength, 3), "layer": h.layer}
+        for h in hyphae
+        if h.image_id in meta
+    ]
 
     return {
         "slug": img["slug"],
@@ -405,6 +412,7 @@ async def image_detail(
         "categories": categories,
         "similar": strip(nb.similar),
         "dissimilar": strip(nb.dissimilar),
+        "hyphae": reaching,
         "mode": nb.mode,
         "metrics": {
             "loneliness": metrics.loneliness,
