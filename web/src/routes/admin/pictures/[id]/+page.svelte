@@ -231,6 +231,7 @@
 			{:else}
 				<p class="dim">0 jobs</p>
 			{/if}
+			<p class="logs"><a href="/admin/logs?image={id}">logs</a></p>
 
 			<div class="del">
 				{#if confirming}
@@ -372,6 +373,10 @@
 		display: flex;
 		gap: 0.75rem;
 		flex-wrap: wrap;
+	}
+	.logs {
+		margin: 0.5rem 0 0;
+		font-size: 0.875rem;
 	}
 	.del {
 		display: flex;

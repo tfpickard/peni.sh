@@ -2,13 +2,14 @@ import base64
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import anthropic
 import jsonschema
 
-from penish import runtime
+from penish import logs, runtime
 from penish.config import Settings
 from penish.runtime import Getter, Pool, UsageRecorder
 from penish.text import no_em_dash
@@ -28,6 +29,12 @@ _TELLS = re.compile(
 _FENCE = re.compile(r"^\s*```[a-zA-Z]*\s*\n?(.*?)\n?```\s*$", re.S)
 _TAG_BAD = re.compile(r"[^a-z0-9]+")
 MIN_TAGS, MAX_TAGS = 6, 14
+# Raw model text kept in a log record, and in an error message (jobs.last_error, the system
+# page), where a whole reply would bury the reason.
+RAW_LOG = 8000
+RAW_ERR = 200
+# Stop reasons that mean the reply was cut off, so unparseable JSON is a budget problem.
+OUT_OF_TOKENS = frozenset({"max_tokens", "model_context_window_exceeded"})
 
 
 class DescribeError(Exception):
@@ -169,35 +176,189 @@ class LazyAnthropic:
         return self._client.messages
 
 
+class Reply(str):
+    """call_text's text, carrying what a caller needs to say why it would not validate.
+
+    A str so every caller and test that treats the reply as text keeps working."""
+
+    stop_reason: str
+    model: str
+    purpose: str | None
+    max_tokens: int | None
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        stop_reason: str = "end_turn",
+        model: str = "",
+        purpose: str | None = None,
+        max_tokens: int | None = None,
+    ) -> "Reply":
+        out = super().__new__(cls, text)
+        out.stop_reason = stop_reason
+        out.model = model
+        out.purpose = purpose
+        out.max_tokens = max_tokens
+        return out
+
+
+def _image_note(block: dict[str, Any]) -> str:
+    source = block.get("source") or {}
+    data = source.get("data")
+    # Decoded size from the base64 length, so the bytes themselves never reach a log.
+    size = len(data) * 3 // 4 - str(data).count("=", -2) if isinstance(data, str) else 0
+    return f"<image {source.get('media_type', '?')} {size} bytes>"
+
+
+def _loggable(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    out: list[Any] = []
+    for block in content or []:
+        if isinstance(block, dict) and block.get("type") == "image":
+            out.append(_image_note(block))
+        elif isinstance(block, dict) and block.get("type") == "text":
+            out.append(block.get("text", ""))
+        else:
+            out.append(
+                f"<{block.get('type') if isinstance(block, dict) else type(block).__name__}>"
+            )
+    return out
+
+
+def loggable_request(create_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """The request as it may be logged: images become a note, everything else is the
+    owner's own prompts and options. There are no keys in create_kwargs; the clients hold
+    those."""
+    out: dict[str, Any] = {}
+    for key, value in create_kwargs.items():
+        if key == "messages":
+            out[key] = [
+                {"role": m.get("role"), "content": _loggable(m.get("content"))} for m in value
+            ]
+        elif key == "system" and not isinstance(value, str):
+            out[key] = _loggable(value)
+        else:
+            out[key] = value
+    return out
+
+
+def _usage(usage: Any) -> dict[str, int] | None:
+    if usage is None:
+        return None
+    return {
+        k: int(getattr(usage, k, 0) or 0)
+        for k in ("input_tokens", "output_tokens")
+        if getattr(usage, k, None) is not None
+    }
+
+
 async def call_text(
     client: Any,
     *,
     model: str,
     create_kwargs: dict[str, Any],
     record: UsageRecorder | None = None,
-) -> str:
+    purpose: str | None = None,
+) -> Reply:
     """One model call. `client` is the caller's Anthropic client or a test fake; a model id
     with a provider prefix swaps a real Anthropic client for that provider's adapter, so
-    every caller can be pointed at another provider from admin without knowing it."""
+    every caller can be pointed at another provider from admin without knowing it.
+
+    A refusal raises a non-retryable DescribeError: the same prompt gets the same answer,
+    so neither the caller's loop nor the job queue should pay for it again."""
     try:
         other = providers.prefixed(model)
     except ValueError as exc:
         raise DescribeError(str(exc), retryable=False) from exc
     if other and (client is None or isinstance(client, LazyAnthropic | anthropic.AsyncAnthropic)):
         client = providers.client_for(model)
-    try:
-        resp = await client.messages.create(model=model, **create_kwargs)
-    except anthropic.APIError as exc:
-        raise map_api_error(exc) from exc
-    except providers.ProviderError as exc:
-        raise DescribeError(str(exc), retryable=exc.retryable) from exc
-    if record is not None:
+    max_tokens = create_kwargs.get("max_tokens")
+    with logs.model_context(purpose, model):
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "model request %s %s: %s",
+                purpose,
+                model,
+                json.dumps(loggable_request(create_kwargs), default=str)[: RAW_LOG * 4],
+            )
+        started = time.monotonic()
         try:
-            await record(model, getattr(resp, "usage", None))
-        except Exception:
-            # Accounting must not throw away a response that was already paid for.
-            log.exception("could not record api usage for %s", model)
-    return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+            resp = await client.messages.create(model=model, **create_kwargs)
+        except anthropic.APIError as exc:
+            log.warning("model call %s %s failed: %s", purpose, model, exc)
+            raise map_api_error(exc) from exc
+        except providers.ProviderError as exc:
+            log.warning("model call %s %s failed: %s", purpose, model, exc)
+            raise DescribeError(str(exc), retryable=exc.retryable) from exc
+        took = time.monotonic() - started
+        if record is not None:
+            try:
+                await record(model, getattr(resp, "usage", None))
+            except Exception:
+                # Accounting must not throw away a response that was already paid for.
+                log.exception("could not record api usage for %s", model)
+        blocks = list(getattr(resp, "content", None) or [])
+        text = "".join(b.text for b in blocks if getattr(b, "type", None) == "text")
+        # Test fakes and older adapters carry no stop reason; they mean a normal finish.
+        stop = str(getattr(resp, "stop_reason", None) or "end_turn")
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "model reply %s %s: stop_reason %s, blocks %s, usage %s, %.2fs\n%s",
+                purpose,
+                model,
+                stop,
+                [getattr(b, "type", None) for b in blocks],
+                _usage(getattr(resp, "usage", None)),
+                took,
+                text[:RAW_LOG],
+                extra={"stop_reason": stop},
+            )
+        if stop == "refusal":
+            details = getattr(resp, "stop_details", None)
+            category = getattr(details, "category", None)
+            note = getattr(resp, "refusal", None)
+            log.warning(
+                "model refused %s %s (category %s)%s\npartial text: %s",
+                purpose,
+                model,
+                category,
+                f"\nrefusal: {note}" if note else "",
+                text[:RAW_LOG],
+                extra={"stop_reason": stop},
+            )
+            raise DescribeError(f"model refused ({model})", retryable=False)
+    return Reply(text, stop_reason=stop, model=model, purpose=purpose, max_tokens=max_tokens)
+
+
+def rejected(reply: str, exc: BaseException, *, attempt: int, purpose: str, model: str) -> None:
+    """The WARNING for one reply that failed a caller's validation, with the raw text, so a
+    vague parse error can be read against what the model actually sent."""
+    stop = getattr(reply, "stop_reason", "end_turn")
+    with logs.model_context(purpose, model):
+        log.warning(
+            "invalid %s output from %s (attempt %d, stop_reason %s): %s\nraw: %s",
+            purpose,
+            model,
+            attempt,
+            stop,
+            exc,
+            str(reply)[:RAW_LOG],
+            extra={"stop_reason": stop},
+        )
+
+
+def invalid(prefix: str, reply: str | None, exc: BaseException | None) -> DescribeError:
+    """The retryable error after the last rejected reply. It names the stop reason, the token
+    budget when that ran out, and the start of the raw text, so jobs.last_error says what
+    happened instead of only where the JSON parser gave up."""
+    stop = getattr(reply, "stop_reason", "end_turn")
+    head = f"{prefix}: "
+    if stop in OUT_OF_TOKENS:
+        head += f"ran out of tokens at max_tokens {getattr(reply, 'max_tokens', None)}: "
+    raw = str(reply or "")[:RAW_ERR]
+    return DescribeError(f"{head}{exc} (stop_reason {stop}; raw {raw!r})", retryable=True)
 
 
 def output_config(schema: dict[str, Any], effort: str | None) -> dict[str, Any]:
@@ -260,12 +421,16 @@ async def describe(
     }
 
     last: Exception | None = None
-    for _ in range(2):
-        text = await call_text(client, model=model, create_kwargs=kwargs, record=record)
+    text: str | None = None
+    for attempt in (1, 2):
+        text = await call_text(
+            client, model=model, create_kwargs=kwargs, record=record, purpose="describe"
+        )
         try:
             out = _validate(text, want)
         except (ValueError, jsonschema.ValidationError) as exc:
             last = exc
+            rejected(text, exc, attempt=attempt, purpose="describe", model=model)
             continue
         return Described(
             caption=out.get("caption"),
@@ -274,4 +439,4 @@ async def describe(
             model=model,
             analysis=out.get("analysis"),
         )
-    raise DescribeError(f"invalid describer output: {last}", retryable=True)
+    raise invalid("invalid describer output", text, last)

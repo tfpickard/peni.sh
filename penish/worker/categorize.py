@@ -21,8 +21,10 @@ from penish.worker.describe import (
     DescribeError,
     LazyAnthropic,
     call_text,
+    invalid,
     output_config,
     parse_json,
+    rejected,
 )
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 
@@ -94,13 +96,17 @@ async def classify(
     }
     record = runtime.usage_recorder(pool, "describe")
     last: Exception | None = None
-    for _ in range(2):
-        text = await call_text(client, model=model, create_kwargs=kwargs, record=record)
+    text: str | None = None
+    for attempt in (1, 2):
+        text = await call_text(
+            client, model=model, create_kwargs=kwargs, record=record, purpose="categorize"
+        )
         try:
             return clean(parse_json(text)), model
         except (ValueError, jsonschema.ValidationError) as exc:
             last = exc
-    raise DescribeError(f"invalid categories: {last}", retryable=True)
+            rejected(text, exc, attempt=attempt, purpose="categorize", model=model)
+    raise invalid("invalid categories", text, last)
 
 
 async def handle_categorize(

@@ -131,7 +131,7 @@ width. Every query filters on both. Changing the model needs no migration.
     tests/           pytest, against a throwaway pgvector container
     scripts/         bootstrap, deploy and backup scripts for the host
     ops/             systemd units, host hardening
-    docs/            ops.md, hardening.md, admin-spec.md
+    docs/            ops.md, hardening.md, admin-spec.md, logs.md
 
 
 ## ⎔ running it

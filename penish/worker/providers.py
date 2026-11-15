@@ -103,6 +103,11 @@ class TextBlock:
 class Response:
     content: list[TextBlock] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
+    # Anthropic's vocabulary (end_turn, max_tokens, refusal), so describe.call_text reads
+    # one set of stop reasons whichever provider answered.
+    stop_reason: str = "end_turn"
+    # The provider's own refusal text, when it sends one; only ever logged.
+    refusal: str | None = None
 
 
 def keyed(settings: Settings | None = None) -> list[str]:
@@ -299,29 +304,54 @@ def _int(v: Any) -> int:
         return 0
 
 
+# Why a reply stopped short, mapped onto Anthropic's stop reasons. OpenAI and xAI report
+# it in incomplete_details.reason, OpenRouter in finish_reason (normalized across upstreams).
+_INCOMPLETE = {"max_output_tokens": "max_tokens", "content_filter": "refusal"}
+_FINISH = {"length": "max_tokens", "content_filter": "refusal"}
+
+
 def parse_response(spec: Spec, data: dict[str, Any]) -> Response:
     usage = data.get("usage") or {}
+    refusals: list[str] = []
+    stop = "end_turn"
     if spec.wire == "responses":
-        texts = [
-            part.get("text", "")
-            for item in data.get("output") or []
-            if item.get("type") == "message"
-            for part in item.get("content") or []
-            if part.get("type") == "output_text"
-        ]
+        texts: list[str] = []
+        for item in data.get("output") or []:
+            if item.get("type") != "message":
+                continue
+            for part in item.get("content") or []:
+                if part.get("type") == "output_text":
+                    texts.append(part.get("text", ""))
+                elif part.get("type") == "refusal":
+                    refusals.append(str(part.get("refusal") or ""))
         u = Usage(_int(usage.get("input_tokens")), _int(usage.get("output_tokens")))
+        if data.get("status") == "incomplete":
+            reason = (data.get("incomplete_details") or {}).get("reason")
+            # An unknown reason passes through by name, so an error message still shows it.
+            stop = _INCOMPLETE.get(str(reason), str(reason or "incomplete"))
     else:
         choices = data.get("choices") or []
-        msg = (choices[0].get("message") or {}) if choices else {}
+        first = choices[0] if choices else {}
+        msg = first.get("message") or {}
         content = msg.get("content")
         if isinstance(content, list):
             texts = [p.get("text", "") for p in content if p.get("type") == "text"]
+            refusals += [str(p.get("refusal") or "") for p in content if p.get("type") == "refusal"]
         else:
             texts = [content] if isinstance(content, str) else []
+        if msg.get("refusal"):
+            refusals.append(str(msg["refusal"]))
+        finish = first.get("finish_reason")
+        stop = _FINISH.get(str(finish), "end_turn" if finish in (None, "stop") else str(finish))
         u = Usage(_int(usage.get("prompt_tokens")), _int(usage.get("completion_tokens")))
-    # A refusal or an empty answer comes back as no text, as it does from Anthropic, and
-    # the caller's validation retries it.
-    return Response(content=[TextBlock(t) for t in texts if t], usage=u)
+    if refusals:
+        stop = "refusal"
+    return Response(
+        content=[TextBlock(t) for t in texts if t],
+        usage=u,
+        stop_reason=stop,
+        refusal="\n".join(r for r in refusals if r) or None,
+    )
 
 
 def _message(resp: httpx.Response) -> str:

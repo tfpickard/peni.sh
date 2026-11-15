@@ -10,6 +10,7 @@ import signal
 from datetime import timedelta
 from pathlib import Path
 
+from penish import logs
 from penish.config import get_settings
 from penish.db import make_pool
 from penish.mycelium.tick import run_loop as run_mycelium
@@ -60,9 +61,11 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
+    # Before the pool, so a failure to open it is in the table once the database is back.
+    logs.install(settings.database_url, "worker", secrets=logs.secrets_from(settings))
     pool = make_pool(settings.database_url)
-    await pool.open(wait=True)
     try:
+        await pool.open(wait=True)
         # This is the only worker process, so anything still running belongs to a
         # previous life of it; waiting out the usual 30 minutes would just stall those jobs.
         n = await jobs.recover_stale(pool, older_than=timedelta(0))
@@ -125,12 +128,14 @@ async def main() -> None:
             run_heartbeat(pool, stop, version=settings.git_sha),
             run_mycelium(pool, stop),
             run_naming(pool, stop),
+            logs.run_prune_loop(pool, stop),
             serve_embed(embedder, stop, port=settings.embed_server_port),
         )
         warm.cancel()
     finally:
         await pool.close()
-    log.info("worker stopped")
+        log.info("worker stopped")
+        logs.uninstall()
 
 
 if __name__ == "__main__":

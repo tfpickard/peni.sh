@@ -16,6 +16,8 @@ from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from penish import logs
+
 log = logging.getLogger(__name__)
 
 Pool = AsyncConnectionPool[AsyncConnection[DictRow]]
@@ -161,25 +163,44 @@ async def recover_stale(pool: Pool, older_than: timedelta = timedelta(minutes=30
         return cur.rowcount
 
 
+def _image_id(payload: dict[str, Any]) -> int | None:
+    raw = payload.get("image_id")
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return None
+
+
 async def _run_one(pool: Pool, job: Job, handler: Callable[[Job], Awaitable[None]]) -> None:
-    try:
-        await handler(job)
-    except HardError as e:
-        log.error("job %s (%s) failed permanently: %s", job.id, job.type, e, exc_info=True)
-        await fail(pool, job, repr(e), retry=False)
-    except SoftError as e:
-        if e.run_after is None:
+    # Every line the handler logs, and the failure lines below, can then be found from the
+    # job on the system page and from the picture in its editor.
+    with logs.context(
+        job_id=job.id,
+        job_type=job.type,
+        attempt=job.attempts,
+        image_id=_image_id(job.payload),
+    ):
+        try:
+            await handler(job)
+        except HardError as e:
+            log.error("job %s (%s) failed permanently: %s", job.id, job.type, e, exc_info=True)
+            await fail(pool, job, repr(e), retry=False)
+        except SoftError as e:
+            if e.run_after is None:
+                log.error("job %s (%s) failed, will retry: %s", job.id, job.type, e, exc_info=True)
+                await fail(pool, job, repr(e), retry=True)
+            else:
+                log.info("job %s (%s) waits until %s: %s", job.id, job.type, e.run_after, e)
+                await defer(pool, job, repr(e), e.run_after)
+        except Exception as e:
+            # Anything unexpected: a bug in a handler should not drop the job.
             log.error("job %s (%s) failed, will retry: %s", job.id, job.type, e, exc_info=True)
             await fail(pool, job, repr(e), retry=True)
         else:
-            log.info("job %s (%s) waits until %s: %s", job.id, job.type, e.run_after, e)
-            await defer(pool, job, repr(e), e.run_after)
-    except Exception as e:
-        # Anything unexpected: a bug in a handler should not drop the job.
-        log.error("job %s (%s) failed, will retry: %s", job.id, job.type, e, exc_info=True)
-        await fail(pool, job, repr(e), retry=True)
-    else:
-        await complete(pool, job.id)
+            await complete(pool, job.id)
 
 
 async def _worker(

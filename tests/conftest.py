@@ -91,7 +91,8 @@ def clean_db(database_url: str) -> str:
             "truncate jobs, corpus_stats, corpus_stats_history, settings, api_usage, heartbeats,"
             " picture_attention, view_days, candidate_edges, edge_state, mycelium_traffic,"
             " mycelium_ticks, mycelium_tunables, colony_ticks, colony_events, colony_members,"
-            " image_facets, image_extracts, served_media, offers_needs restart identity"
+            " image_facets, image_extracts, served_media, offers_needs, app_log"
+            " restart identity"
         )
         # haikus references colonies (gallery haikus, gone with the delete above), and
         # truncate refuses a referenced table without a cascade into the deck.

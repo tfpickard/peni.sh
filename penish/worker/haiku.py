@@ -8,11 +8,12 @@ from penish.config import Settings
 from penish.runtime import Getter, Pool
 from penish.text import no_em_dash
 from penish.worker.describe import (
-    DescribeError,
     LazyAnthropic,
     call_text,
+    invalid,
     output_config,
     parse_json,
+    rejected,
 )
 
 Haiku = tuple[str, str, str]
@@ -88,10 +89,14 @@ async def haiku_from(
     }
     record = runtime.usage_recorder(pool, "haiku")
     last: Exception | None = None
-    for _ in range(2):
-        text = await call_text(client, model=model, create_kwargs=kwargs, record=record)
+    text: str | None = None
+    for attempt in (1, 2):
+        text = await call_text(
+            client, model=model, create_kwargs=kwargs, record=record, purpose="haiku"
+        )
         try:
             return _validate(text)
         except (ValueError, json.JSONDecodeError, jsonschema.ValidationError) as exc:
             last = exc
-    raise DescribeError(f"invalid haiku output: {last}", retryable=True)
+            rejected(text, exc, attempt=attempt, purpose="haiku", model=model)
+    raise invalid("invalid haiku output", text, last)

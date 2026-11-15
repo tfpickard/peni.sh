@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import random
 import re
 from dataclasses import dataclass, field
@@ -21,8 +22,18 @@ from psycopg.rows import tuple_row
 from penish import runtime
 from penish.config import Settings
 from penish.runtime import Getter, Pool, UsageRecorder
-from penish.worker.describe import LazyAnthropic, call_text, output_config, parse_json
+from penish.worker.describe import (
+    RAW_LOG,
+    DescribeError,
+    LazyAnthropic,
+    call_text,
+    output_config,
+    parse_json,
+    rejected,
+)
 from penish.worker.haiku import _validate as validate_haiku
+
+log = logging.getLogger(__name__)
 
 _SCHEMA = {
     "type": "object",
@@ -46,6 +57,9 @@ class Stats:
     dup: int = 0
     invalid: int = 0
     haikus: list[Haiku] = field(default_factory=list)
+    # Why the run ended before n: a refusal or another error that will not change on
+    # the next batch, after some haikus were already accepted.
+    stopped: str | None = None
 
 
 def normalize(h: Haiku) -> str:
@@ -100,7 +114,7 @@ async def grow(
     if embedder is not None and pool:
         vecs = _unit(await embedder.embed_documents([_flat(h) for h in pool]))
 
-    for _ in range(max(1, -(-n // batch)) * _MAX_BATCH_FACTOR):
+    for attempt in range(1, max(1, -(-n // batch)) * _MAX_BATCH_FACTOR + 1):
         if stats.accepted >= n:
             break
         ask = min(batch, n - stats.accepted)
@@ -112,12 +126,24 @@ async def grow(
             "output_config": output_config(_SCHEMA, None),
             "messages": [{"role": "user", "content": f"Write {ask} haikus."}],
         }
-        text = await call_text(client, model=model, create_kwargs=kwargs, record=record)
+        try:
+            text = await call_text(
+                client, model=model, create_kwargs=kwargs, record=record, purpose="grow"
+            )
+        except DescribeError as exc:
+            # A refusal (or a bad key) will say the same on every batch. What the run has
+            # already accepted was paid for and is returned for the caller to insert.
+            if exc.retryable or not stats.haikus:
+                raise
+            stats.stopped = str(exc)
+            log.warning("grow stopped after %d accepted: %s", stats.accepted, exc)
+            break
         try:
             data = parse_json(text)
             jsonschema.validate(data, _SCHEMA)
-        except (ValueError, jsonschema.ValidationError):
+        except (ValueError, jsonschema.ValidationError) as exc:
             stats.invalid += 1
+            rejected(text, exc, attempt=attempt, purpose="grow", model=model)
             continue
 
         fresh: list[Haiku] = []
@@ -125,8 +151,15 @@ async def grow(
             try:
                 # Reuses haiku.py's line checks and em dash fix; its input is the JSON text.
                 h = validate_haiku(json.dumps({"lines": entry}))
-            except (ValueError, jsonschema.ValidationError):
+            except (ValueError, jsonschema.ValidationError) as exc:
                 stats.invalid += 1
+                log.warning(
+                    "invalid grow haiku from %s (batch %d): %s\nraw: %s",
+                    model,
+                    attempt,
+                    exc,
+                    json.dumps(entry)[:RAW_LOG],
+                )
                 continue
             key = normalize(h)
             if key in seen:
@@ -174,7 +207,8 @@ async def insert(conn: psycopg.AsyncConnection[Any], haikus: list[Haiku]) -> Non
 
 
 def summary(s: Stats) -> str:
-    return f"accepted {s.accepted}, rejected {s.dup + s.invalid} (dup {s.dup}, invalid {s.invalid})"
+    out = f"accepted {s.accepted}, rejected {s.dup + s.invalid} (dup {s.dup}, invalid {s.invalid})"
+    return f"{out}, stopped: {s.stopped}" if s.stopped else out
 
 
 async def grow_into(
