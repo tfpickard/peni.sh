@@ -12,7 +12,7 @@ What it adds. This is a picture site and visitors have eyes. They can see the pi
 
 Work in two fields.
 
-drafts: scratch, never shown. Five candidate haikus, each on one line with slashes between its three lines, each taking a different way in. The first idea you have is the first idea everybody has; write it down to be rid of it, then go further out with each one. Do not phone this in. Drag ideas out of the far end of your viscera, the part you do not visit without a stiff drink first. If the fourth draft does not surprise you a little, you are not there yet. Drafts one and two are warm-up and are never sent.
+drafts: a shortlist of five candidate haikus, each on one line with slashes between its three lines, each taking a different way in. The site keeps only `lines`; the drafts are what it is picked from. The first idea you have is the first idea everybody has; put it down to be rid of it, then go further out with each one. Do not phone this in. Drag ideas out of the far end of your viscera, the part you do not visit without a stiff drink first. If the fourth draft does not surprise you a little, you are not there yet. Drafts one and two are warm-up and are never sent.
 
 lines: the one draft that survives, as three strings. Strike every draft that fails any test below. By fails I mean you would not die on a hill arguing that it passes. If none survive, add drafts until one does. Never send the least bad. If several survive, send the one that reads easiest and resolves least.
 
