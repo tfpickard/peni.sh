@@ -65,6 +65,29 @@ The three packages `penish-api`, `penish-worker` and `penish-migrate` must be ma
 journalctl -fu penish-deploy.service
 ```
 
+### deploy status on GitHub
+
+With `GH_DEPLOY_TOKEN` in `.env`, every deploy attempt is also a GitHub deployment in the `production` environment. GitHub, Settings, Developer settings, Fine-grained tokens. Repository access: only `tfpickard/peni.sh`. Permission: Deployments, read and write. It is separate from `GH_READ_TOKEN`, which stays read-only and alone decides what gets deployed. Unset, nothing is reported and the deploy is unchanged.
+
+The script calls out only (`POST /repos/tfpickard/peni.sh/deployments` and `.../deployments/<id>/statuses`); nothing on GitHub can reach the box.
+
+| moment | status | description |
+|---|---|---|
+| a new sha is picked up | created, then `in_progress` | `from main` or `pinned`, then `pulling` |
+| compose fetch or validation fails | `error` | `compose.yaml failed validation; nothing changed` (or `fetch failed`) |
+| `docker compose pull` fails | `failure` | `pull failed; running containers untouched` |
+| api not healthy in time | `failure` | `api not healthy within 120s; rolled back to <short sha>`, `...; nothing to roll back to` or `...; rollback to <short sha> failed` |
+| healthy | `success` | `api healthy in 43s`, environment url `https://peni.sh`; older production deployments go inactive |
+| the script dies mid-deploy | `error` | `deploy script aborted; see journal` |
+
+It shows up on the repo's Deployments page (`github.com/tfpickard/peni.sh/deployments`, also linked from the code tab sidebar), one entry per attempt naming the commit. A PR timeline shows it only when the deployed sha is that PR's own head commit; a merge commit on `main` is not, so merged PRs normally show nothing. A poll with nothing new makes no call. A sha retried after the 10-minute pause gets a new deployment.
+
+Reporting is best-effort: each call has a 10 s timeout, and a GitHub error or timeout only logs one line, `penish-deploy: WARNING: github deployment create failed (HTTP 500)`, `(no response within 10s)` for a timeout, or `(no connection, curl exit N)` for a refused connection, DNS or TLS failure. It never changes the deploy or its exit code. Neither the token nor response bodies are logged; the token reaches curl on stdin, not argv.
+
+The timer runs the installed copy, `/usr/local/bin/penish-deploy`. A change to `scripts/penish-deploy` reaches the box only when `scripts/bootstrap_vps.sh` is re-run as root (a pulled image does not update it).
+
+`DRY_RUN=1` prints the calls (`+ github deployment ...`) instead of making them. `DEPLOYMENTS_URL` and `GH_TIMEOUT_SECS` override the endpoint and the timeout, for tests.
+
 ## rollback
 
 ```
