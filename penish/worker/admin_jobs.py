@@ -573,6 +573,10 @@ async def handle_grow_haikus(
         raise _soft_or_hard("grow", e) from e
     except ValueError as e:
         raise HardError(f"grow: {e}") from e
+    if stats.stopped:
+        # The accepted haikus are already in; the job still fails so the refusal shows in
+        # the system page's recent errors, and a retry would only be refused again.
+        raise HardError(f"grow: {summary(stats)}")
     log.info("grow_haikus: %s", summary(stats))
 
 

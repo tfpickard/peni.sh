@@ -10,6 +10,8 @@ import psycopg
 import pytest
 
 from penish.config import Settings
+from penish.worker.describe import DescribeError
+from penish.worker.grow import grow_into
 
 _spec = importlib.util.spec_from_file_location(
     "grow_haikus", Path(__file__).resolve().parent.parent / "scripts" / "grow_haikus.py"
@@ -156,3 +158,70 @@ async def test_semantic_dedupe() -> None:
     # "close" hits the pool; "closer" hits the haiku accepted earlier in this run.
     assert [h[0] for h in stats.haikus] == ["far"]
     assert stats.dup == 2
+
+
+class RefusesAfter:
+    """Answers with `replies` in order, then refuses every call after them."""
+
+    def __init__(self, *replies: str) -> None:
+        self.replies = list(replies)
+        self.calls = 0
+        self.messages = self
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.calls += 1
+        if self.replies:
+            text = self.replies.pop(0)
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text=text)], stop_reason="end_turn"
+            )
+        return SimpleNamespace(content=[], stop_reason="refusal")
+
+
+async def _grow_one_per_batch(pool: Any, client: Any, n: int) -> Any:
+    return await gh.grow(
+        pool=pool,
+        n=n,
+        batch=1,
+        model="m",
+        settings=SETTINGS,
+        client=client,
+        rng=random.Random(0),
+    )
+
+
+async def test_refusal_keeps_what_was_accepted(clean_db: str) -> None:
+    pool = await _pool(clean_db)
+    h = ["the fern on the stair", "has opinions about rent", "we let it vote"]
+    client = RefusesAfter(reply(h))
+    stats = await _grow_one_per_batch(pool, client, n=3)
+    # One refusal ends the run: the next batch would be refused the same way.
+    assert client.calls == 2
+    assert stats.haikus == [tuple(h)]
+    assert stats.stopped == "model refused (m)"
+    assert gh.summary(stats).endswith("stopped: model refused (m)")
+
+
+async def test_refusal_with_nothing_accepted_raises(clean_db: str) -> None:
+    pool = await _pool(clean_db)
+    client = RefusesAfter()
+    with pytest.raises(DescribeError) as err:
+        await _grow_one_per_batch(pool, client, n=3)
+    assert err.value.retryable is False
+    assert client.calls == 1
+
+
+async def test_grow_into_inserts_before_a_refusal(pool: Any, clean_db: str) -> None:
+    h = ("a hinge in the loaf", "the baker oils it nightly", "bread opens on time")
+    stats = await grow_into(
+        pool,
+        3,
+        settings=SETTINGS,
+        batch=1,
+        client=RefusesAfter(reply(list(h))),
+        rng=random.Random(0),
+    )
+    assert stats.stopped and stats.accepted == 1
+    async with await psycopg.AsyncConnection.connect(clean_db) as conn:
+        cur = await conn.execute("select source::text from haikus where l1 = %s", (h[0],))
+        assert await cur.fetchall() == [("model",)]

@@ -49,6 +49,8 @@ KEYS = (
     "name.model",
     "name.prompt",
     "mycelium.daily_calls",
+    "log.level",
+    "log.keep_days",
 )
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 PURPOSES = ("describe", "haiku", "grow", "extract", "name")
@@ -62,6 +64,12 @@ DAILY_CALLS_MAX = 100_000
 # every id stored before providers existed valid. OpenRouter ids may hold colons of their
 # own (`vendor/model:variant`), so only the first one separates.
 PROVIDERS = ("openai", "openrouter", "xai")
+# What the database log keeps (penish/logs.py). Stdout keeps its own LOG_LEVEL, so turning
+# this up fills the admin logs page without flooding docker logs.
+LOG_LEVELS = ("debug", "info", "warning", "error")
+LOG_LEVEL_DEFAULT = "info"
+LOG_KEEP_DAYS_DEFAULT = 14
+LOG_KEEP_DAYS_MAX = 365
 
 
 def split_model(model: str) -> tuple[str | None, str]:
@@ -98,6 +106,10 @@ def default(key: str, settings: Settings | None = None) -> Any:
         return None
     if key == "mycelium.daily_calls":
         return DAILY_CALLS_DEFAULT
+    if key == "log.level":
+        return LOG_LEVEL_DEFAULT
+    if key == "log.keep_days":
+        return LOG_KEEP_DAYS_DEFAULT
     return (_PROMPTS / _PROMPT_FILES[key]).read_text()
 
 
@@ -114,6 +126,16 @@ def validate(key: str, value: Any) -> Any:
             raise ValueError(f"{key} must be an integer")
         if not 0 <= value <= DAILY_CALLS_MAX:
             raise ValueError(f"{key} must be between 0 and {DAILY_CALLS_MAX}")
+        return value
+    if key == "log.level":
+        if value in LOG_LEVELS:
+            return value
+        raise ValueError(f"{key} must be one of {', '.join(LOG_LEVELS)}")
+    if key == "log.keep_days":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key} must be an integer")
+        if not 1 <= value <= LOG_KEEP_DAYS_MAX:
+            raise ValueError(f"{key} must be between 1 and {LOG_KEEP_DAYS_MAX}")
         return value
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")

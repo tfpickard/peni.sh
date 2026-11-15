@@ -39,7 +39,7 @@
 	{#if s.recent_errors.length}
 		<ul class="plain tight">
 			{#each s.recent_errors as e}<li>
-					<div class="dim">{e.type} {e.id} {e.status} {e.attempts}</div>
+					<div class="dim">{e.type} {e.id} {e.status} {e.attempts} <a href="/admin/logs?job={e.id}">logs</a></div>
 					<pre>{e.error}</pre>
 				</li>{/each}
 		</ul>

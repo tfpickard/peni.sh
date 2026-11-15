@@ -43,8 +43,10 @@ from penish.worker.describe import (
     DescribeError,
     LazyAnthropic,
     call_text,
+    invalid,
     output_config,
     parse_json,
+    rejected,
 )
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 
@@ -191,21 +193,25 @@ async def name_gallery(
         "messages": [{"role": "user", "content": message(inputs)}],
     }
     last: Exception | None = None
-    for _ in range(2):
+    text: str | None = None
+    for attempt in (1, 2):
         if pool is not None:
             # A retry is a new paid call; one the switch went off for is not made.
             async with pool.connection() as conn:
                 if not await naming_on(conn):
                     raise NamingOff
             await providers.check_daily_cap(pool)
-        text = await call_text(client, model=model, create_kwargs=kwargs, record=record)
+        text = await call_text(
+            client, model=model, create_kwargs=kwargs, record=record, purpose="name"
+        )
         try:
             title, lines = validate(parse_json(text), inputs.needs)
         except (ValueError, jsonschema.ValidationError) as exc:
             last = exc
+            rejected(text, exc, attempt=attempt, purpose="name", model=model)
             continue
         return Named(title=title, haiku=lines, model=model)
-    raise DescribeError(f"invalid name output: {last}", retryable=True)
+    raise invalid("invalid name output", text, last)
 
 
 # -- the switch and the rate ------------------------------------------------

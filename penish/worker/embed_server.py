@@ -73,13 +73,19 @@ class _Server(uvicorn.Server):
         yield
 
 
+def config(app: Starlette, host: str, port: int) -> uvicorn.Config:
+    # log_config=None: uvicorn's default runs logging.config.dictConfig, which closes every
+    # handler on the root logger, the worker's database log handler among them. Without it
+    # uvicorn still sets its own loggers' levels, and they propagate to the worker's root.
+    return uvicorn.Config(
+        app, host=host, port=port, log_level="warning", access_log=False, log_config=None
+    )
+
+
 async def serve(
     embedder: QueryEmbedder, stop: asyncio.Event, *, host: str = "0.0.0.0", port: int = PORT
 ) -> None:
-    config = uvicorn.Config(
-        make_app(embedder), host=host, port=port, log_level="warning", access_log=False
-    )
-    server = _Server(config)
+    server = _Server(config(make_app(embedder), host, port))
 
     async def watch() -> None:
         await stop.wait()

@@ -465,6 +465,15 @@ async def test_grow_haikus(p: Any, settings: Settings) -> None:
             job("grow_haikus", {"n": 1}), pool=p, settings=settings, grower=empty
         )
 
+    async def refused(db: Any, n: int, **kw: Any) -> Stats:
+        # grow_into has already inserted the one it accepted when it returns.
+        return Stats(accepted=1, stopped="model refused (m)")
+
+    with pytest.raises(HardError, match=r"accepted 1, .*stopped: model refused \(m\)"):
+        await handle_grow_haikus(
+            job("grow_haikus", {"n": 5}), pool=p, settings=settings, grower=refused
+        )
+
 
 async def test_make_handlers(p: Any, settings: Settings) -> None:
     handlers = make_handlers(p, settings, FakeEmbedder())

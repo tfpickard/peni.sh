@@ -284,7 +284,7 @@ async def test_unknown_option_refused(wire: Any) -> None:
 # -- responses ------------------------------------------------------------
 
 
-async def test_refusal_and_empty_mean_no_text(wire: Any) -> None:
+async def test_refusal_is_final_and_still_counted(wire: Any) -> None:
     wire(
         body={
             "output": [
@@ -293,8 +293,16 @@ async def test_refusal_and_empty_mean_no_text(wire: Any) -> None:
             "usage": {"input_tokens": 5, "output_tokens": 1},
         }
     )
-    text, seen = await call("openai:gpt-6-luna", kwargs())
-    assert text == "" and seen == [("openai:gpt-6-luna", 5, 1)]
+    seen: list[Any] = []
+
+    async def record(m: str, usage: Any) -> None:
+        seen.append((m, usage.input_tokens, usage.output_tokens))
+
+    with pytest.raises(DescribeError) as e:
+        await call_text(None, model="openai:gpt-6-luna", create_kwargs=kwargs(), record=record)
+    assert str(e.value) == "model refused (openai:gpt-6-luna)" and not e.value.retryable
+    # The refused call was paid for all the same.
+    assert seen == [("openai:gpt-6-luna", 5, 1)]
 
 
 async def test_chat_missing_usage_counts_zero(wire: Any) -> None:

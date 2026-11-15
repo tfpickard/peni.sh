@@ -37,8 +37,10 @@ from penish.worker.describe import (
     DescribeError,
     LazyAnthropic,
     call_text,
+    invalid,
     output_config,
     parse_json,
+    rejected,
 )
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 from penish.worker.metrics import refresh_facet_stats
@@ -165,18 +167,22 @@ async def extract(
         ],
     }
     last: Exception | None = None
-    for _ in range(2):
+    text: str | None = None
+    for attempt in (1, 2):
         if pool is not None:
             await providers.check_daily_cap(pool)
-        text = await call_text(client, model=model, create_kwargs=kwargs, record=record)
+        text = await call_text(
+            client, model=model, create_kwargs=kwargs, record=record, purpose="extract"
+        )
         try:
             raw = parse_json(text)
             parts, offers, needs = clean(raw)
         except (ValueError, jsonschema.ValidationError) as exc:
             last = exc
+            rejected(text, exc, attempt=attempt, purpose="extract", model=model)
             continue
         return Extracted(facets=parts, offers=offers, needs=needs, model=model, raw=raw)
-    raise DescribeError(f"invalid extract output: {last}", retryable=True)
+    raise invalid("invalid extract output", text, last)
 
 
 # -- invalidation (called inside the caller's transaction) ------------------

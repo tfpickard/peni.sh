@@ -3,8 +3,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from penish import logs
 from penish.api import (
     admin,
+    admin_logs,
     admin_mycelium,
     admin_ops,
     admin_pictures,
@@ -24,13 +26,16 @@ from penish.db import make_pool
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    pool = make_pool(get_settings().database_url)
+    settings = get_settings()
+    logs.install(settings.database_url, "api", secrets=logs.secrets_from(settings))
+    pool = make_pool(settings.database_url)
     await pool.open()
     app.state.pool = pool
     try:
         yield
     finally:
         await pool.close()
+        logs.uninstall()
 
 
 def create_app() -> FastAPI:
@@ -45,6 +50,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_ops.router)
     app.include_router(admin_pictures.router)
     app.include_router(admin_mycelium.router)
+    app.include_router(admin_logs.router)
     app.include_router(social.router)
     app.include_router(attention.router)
     app.middleware("http")(admin.no_store)
