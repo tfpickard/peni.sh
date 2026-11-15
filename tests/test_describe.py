@@ -166,6 +166,16 @@ async def test_haiku_rejects_bad_shape(lines: list[str]) -> None:
     assert len(client.messages.calls) == 2
 
 
+async def test_haiku_drafts_are_asked_for_first_and_dropped() -> None:
+    reply = {"drafts": ["a / b / c", "d / e / f"], "lines": ["d", "e", "f"]}
+    client = FakeClient(json.dumps(reply))
+    assert await haiku_from("a cat", settings=SETTINGS, client=client) == ("d", "e", "f")
+    schema = client.messages.calls[0]["output_config"]["format"]["schema"]
+    # Order matters: the scratch has to be written before the pick it informs.
+    assert list(schema["properties"]) == ["drafts", "lines"]
+    assert schema["required"] == ["drafts", "lines"]
+
+
 def test_haiku_prompt_fills_examples() -> None:
     prompt = build_prompt("before\n{examples}\nafter", [("a", "b", "c"), ("d", "e", "f")])
     assert prompt == "before\na\nb\nc\n\nd\ne\nf\nafter"
