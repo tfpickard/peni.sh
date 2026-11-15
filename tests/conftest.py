@@ -85,10 +85,21 @@ def clean_db(database_url: str) -> str:
         # DELETE, not TRUNCATE CASCADE: haikus references images, and a cascade
         # would wipe the seed deck along with them.
         conn.execute("delete from haikus where source <> 'seed'")
+        # A test may switch the deck off; the next one starts with it whole.
+        conn.execute("update haikus set active = true where source = 'seed' and not active")
         conn.execute(
-            "truncate jobs, corpus_stats, corpus_stats_history, settings, api_usage, heartbeats"
-            " restart identity"
+            "truncate jobs, corpus_stats, corpus_stats_history, settings, api_usage, heartbeats,"
+            " picture_attention, view_days, candidate_edges, edge_state, mycelium_traffic,"
+            " mycelium_ticks, mycelium_tunables, colony_ticks, colony_events, colony_members,"
+            " image_facets, image_extracts, served_media, offers_needs restart identity"
         )
+        # haikus references colonies (gallery haikus, gone with the delete above), and
+        # truncate refuses a referenced table without a cascade into the deck.
+        conn.execute("delete from colonies")
+        # The singleton row back to how the migration leaves it, with a fixed seed so
+        # a test that never sets one still runs the same organism every time.
+        conn.execute("delete from mycelium_state")
+        conn.execute("insert into mycelium_state (id, seed) values (1, 1)")
         conn.execute("delete from images")
     return database_url
 

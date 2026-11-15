@@ -5,12 +5,16 @@ from fastapi import FastAPI
 
 from penish.api import (
     admin,
+    admin_mycelium,
     admin_ops,
     admin_pictures,
+    attention,
     index,
     media,
+    routes_galleries,
     routes_images,
     routes_meta,
+    routes_mycelium,
     routes_search,
     social,
 )
@@ -34,11 +38,15 @@ def create_app() -> FastAPI:
     app.include_router(routes_meta.router)
     app.include_router(routes_images.router)
     app.include_router(routes_search.router)
+    app.include_router(routes_galleries.router)
+    app.include_router(routes_mycelium.router)
     app.include_router(media.router)
     app.include_router(admin.router)
     app.include_router(admin_ops.router)
     app.include_router(admin_pictures.router)
+    app.include_router(admin_mycelium.router)
     app.include_router(social.router)
+    app.include_router(attention.router)
     app.middleware("http")(admin.no_store)
     # Last: its catch-all must not shadow routes registered above it.
     app.include_router(index.router)

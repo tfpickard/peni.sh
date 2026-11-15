@@ -13,7 +13,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-import anthropic
 import jsonschema
 import numpy as np
 import psycopg
@@ -22,7 +21,7 @@ from psycopg.rows import tuple_row
 from penish import runtime
 from penish.config import Settings
 from penish.runtime import Getter, Pool, UsageRecorder
-from penish.worker.describe import call_text, output_config, parse_json
+from penish.worker.describe import LazyAnthropic, call_text, output_config, parse_json
 from penish.worker.haiku import _validate as validate_haiku
 
 _SCHEMA = {
@@ -160,7 +159,8 @@ async def load_pool(conn: psycopg.AsyncConnection[Any]) -> list[Haiku]:
     # Tuple rows whatever the connection's row factory, so both the CLI's plain
     # connection and the worker pool's dict-row connections work.
     async with conn.cursor(row_factory=tuple_row) as cur:
-        await cur.execute("select l1, l2, l3 from haikus where active")
+        # The deck only: a gallery's haiku is neither an example nor a duplicate to avoid.
+        await cur.execute("select l1, l2, l3 from haikus where active and colony_id is null")
         return [(a, b, c) for a, b, c in await cur.fetchall()]
 
 
@@ -189,7 +189,7 @@ async def grow_into(
 ) -> Stats:
     """Grow the deck by up to n and insert the accepts; the core of the admin grow job."""
     if client is None:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = LazyAnthropic(settings.anthropic_api_key)
     async with db.connection() as conn:
         deck = await load_pool(conn)
     if not deck:

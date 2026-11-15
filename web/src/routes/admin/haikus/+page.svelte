@@ -122,6 +122,7 @@
 					</p>
 					<div class="row">
 						<span class="dim">{h.source}</span>
+						{#if h.gallery !== null}<a href="/g/{h.gallery}">gallery {h.gallery}</a>{/if}
 						<button class:dim={!h.active} onclick={() => toggle(h)}>
 							{h.active ? 'active' : 'inactive'}
 						</button>

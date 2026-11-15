@@ -1,7 +1,10 @@
-<script lang="ts">
-	import type { Neighbor } from '../api';
+<script lang="ts" generics="T extends Tile">
+	import type { Snippet } from 'svelte';
+	import Hyphae from './Hyphae.svelte';
+	import type { Tile } from '../api';
 
-	let { label, items }: { label: string; items: Neighbor[] } = $props();
+	// foot replaces the score under each tile, for strips whose items carry something else.
+	let { label, items, foot }: { label: string; items: T[]; foot?: Snippet<[T]> } = $props();
 </script>
 
 {#if items.length}
@@ -13,9 +16,14 @@
 					<a href="/i/{n.slug}">
 						<span class="thumb" style:background-image={hashUrl(n.blurhash)}>
 							<img src={n.src} alt="" loading="lazy" decoding="async" />
+							<Hyphae slug={n.slug} level={n.overgrowth} />
 						</span>
 					</a>
-					<span class="score">{n.score.toFixed(2)}</span>
+					{#if foot}
+						{@render foot(n)}
+					{:else if n.score !== undefined}
+						<span class="score">{n.score.toFixed(2)}</span>
+					{/if}
 				</li>
 			{/each}
 		</ul>
@@ -71,6 +79,7 @@
 		scroll-snap-align: start;
 	}
 	.thumb {
+		position: relative;
 		display: block;
 		height: 7rem;
 		background-size: cover;

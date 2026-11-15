@@ -55,6 +55,11 @@
 	onMount(load);
 
 	const running = $derived(d ? pics.active(d.jobs) : false);
+	const unpublished = $derived(d?.status === 'unpublished');
+	// Either direction waiting or running: the status shown is about to change.
+	const moving = $derived(
+		d ? pics.active(d.jobs.filter((j) => j.type === 'unpublish' || j.type === 'republish')) : false
+	);
 	$effect(() => {
 		if (!running) return;
 		const t = setInterval(load, 2000);
@@ -82,6 +87,7 @@
 		return act(() => pics.patch(id, { [f]: v }));
 	}
 	const regen = (...f: pics.Regen[]) => act(() => pics.regen(id, f));
+	const flip = () => act(() => (unpublished ? pics.republish(id) : pics.unpublish(id)));
 
 	async function applyCrop(r: pics.Rect | null) {
 		cropping = false;
@@ -125,10 +131,18 @@
 					oncancel={() => (cropping = false)}
 				/>
 			{:else}
-				<Picture image={item} sizes="(min-width: 48rem) 20rem, 100vw" eager />
+				{#if unpublished}
+					<!-- Its derivatives are held where nothing serves them. -->
+					<img class="orig" src={pics.originalUrl(id)} alt="" />
+				{:else}
+					<Picture image={item} sizes="(min-width: 48rem) 20rem, 100vw" eager />
+				{/if}
 				<div class="row">
 					<button onclick={() => (cropping = true)}>crop</button>
-					<a href="/i/{d.slug}">view</a>
+					{#if d.status === 'live'}<a href="/i/{d.slug}">view</a>{/if}
+					{#if d.status === 'live' || unpublished}
+						<button disabled={moving} onclick={flip}>{unpublished ? 'republish' : 'unpublish'}</button>
+					{/if}
 					<span class="dim">{d.crop ? `cropped ${d.crop.w} x ${d.crop.h}` : ''}</span>
 				</div>
 			{/if}
@@ -136,6 +150,10 @@
 				{d.status} / {d.votes.up} up {d.votes.down} down / {d.comments.pending} pending
 				{d.comments.approved} approved {d.comments.rejected} rejected
 			</p>
+			{#if d.purge?.length}
+				<h2>purge</h2>
+				<pre class="purge">{d.purge.join('\n')}</pre>
+			{/if}
 		</div>
 
 		<div class="form">
@@ -253,6 +271,20 @@
 	}
 	.pic {
 		min-width: 0;
+	}
+	.orig {
+		display: block;
+		width: 100%;
+		height: auto;
+	}
+	.purge {
+		margin: 0;
+		font: inherit;
+		font-size: 0.875rem;
+		color: var(--muted-foreground);
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		user-select: all;
 	}
 	/* The cropper needs the room; the grid column is only for the still image. */
 	.pic :global(.crop) {

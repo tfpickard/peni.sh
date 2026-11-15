@@ -12,6 +12,7 @@ from penish import runtime
 from penish.config import Settings
 from penish.runtime import Getter, Pool, UsageRecorder
 from penish.text import no_em_dash
+from penish.worker import providers
 
 log = logging.getLogger(__name__)
 
@@ -148,6 +149,26 @@ def map_api_error(exc: anthropic.APIError) -> DescribeError:
     return DescribeError(str(exc), retryable=False)
 
 
+class LazyAnthropic:
+    """The default client for every caller. With no explicit key the SDK resolves
+    credentials from env and disk at construction and can raise there, so building it
+    eagerly broke a worker keyed only for other providers before call_text could route a
+    prefixed id away. It is built on the first bare-id call instead, and reused after."""
+
+    def __init__(self, api_key: str | None) -> None:
+        self._key = api_key
+        self._client: anthropic.AsyncAnthropic | None = None
+
+    @property
+    def messages(self) -> Any:
+        if self._client is None:
+            # Same flat refusal a provider without a key gives; retrying cannot add a key.
+            if not self._key:
+                raise DescribeError("no key for anthropic", retryable=False)
+            self._client = anthropic.AsyncAnthropic(api_key=self._key)
+        return self._client.messages
+
+
 async def call_text(
     client: Any,
     *,
@@ -155,10 +176,21 @@ async def call_text(
     create_kwargs: dict[str, Any],
     record: UsageRecorder | None = None,
 ) -> str:
+    """One model call. `client` is the caller's Anthropic client or a test fake; a model id
+    with a provider prefix swaps a real Anthropic client for that provider's adapter, so
+    every caller can be pointed at another provider from admin without knowing it."""
+    try:
+        other = providers.prefixed(model)
+    except ValueError as exc:
+        raise DescribeError(str(exc), retryable=False) from exc
+    if other and (client is None or isinstance(client, LazyAnthropic | anthropic.AsyncAnthropic)):
+        client = providers.client_for(model)
     try:
         resp = await client.messages.create(model=model, **create_kwargs)
     except anthropic.APIError as exc:
         raise map_api_error(exc) from exc
+    except providers.ProviderError as exc:
+        raise DescribeError(str(exc), retryable=exc.retryable) from exc
     if record is not None:
         try:
             await record(model, getattr(resp, "usage", None))
@@ -192,7 +224,7 @@ async def describe(
     if not want or not want <= set(_FIELDS):
         raise ValueError(f"want must be a non-empty subset of {_FIELDS}")
     if client is None:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = LazyAnthropic(settings.anthropic_api_key)
     get = get or runtime.getter(pool, settings)
     # Read per call so an admin change applies to the next image without a restart.
     model = await get("describe.model")

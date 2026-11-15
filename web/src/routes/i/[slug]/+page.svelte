@@ -1,10 +1,14 @@
 <script lang="ts">
-	import { goto, preloadData } from '$app/navigation';
+	import { afterNavigate, goto, preloadData } from '$app/navigation';
 	import { tick } from 'svelte';
 	import Picture from '../../../lib/components/Picture.svelte';
 	import Strip from '../../../lib/components/Strip.svelte';
+	import Reach from '../../../lib/components/Reach.svelte';
 	import Votes from '../../../lib/components/Votes.svelte';
 	import Comments from '../../../lib/components/Comments.svelte';
+	import Overlap from '../../../lib/components/Overlap.svelte';
+	import { postView } from '../../../lib/api';
+	import { markViewed } from '../../../lib/viewed';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -32,11 +36,55 @@
 		});
 	});
 	const title = $derived(image?.caption?.body ? `${image.caption.body} -- peni.sh` : 'peni.sh');
+	const inNow = $derived(image?.galleries?.filter((g) => g.current) ?? []);
+	const wasIn = $derived(image?.galleries?.filter((g) => !g.current) ?? []);
 
 	// Same-route navigation keeps the scroll offset, so strips would land mid-page.
 	$effect(() => {
 		data;
 		window.scrollTo(0, 0);
+	});
+
+	// The picture this one was reached from, when that was a picture too. Same-route
+	// navigation reuses this component, so it is refreshed on every arrival.
+	let cameFrom: string | null = null;
+	// The server rejects the whole view over a malformed `from`, and a mistyped URL can
+	// sit on this route as 'not here'; dropping it here keeps the real view.
+	const SLUG = /^[a-z0-9-]{1,100}$/;
+	afterNavigate((nav) => {
+		const f = nav.from;
+		const prev = f?.route.id === '/i/[slug]' ? f.params?.slug : undefined;
+		cameFrom = prev && SLUG.test(prev) ? prev : null;
+	});
+
+	// A derived primitive, so a reload of the same picture (another ?sim) does not restart it.
+	const viewing = $derived(image?.slug ?? null);
+
+	// A view counts once the picture has been on screen for two seconds. Leaving sooner
+	// cancels it; a background tab waits until it is brought forward.
+	$effect(() => {
+		const slug = viewing;
+		if (!slug) return;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let sent = false;
+		const arm = () => {
+			clearTimeout(timer);
+			if (sent || document.visibilityState !== 'visible') return;
+			timer = setTimeout(() => {
+				sent = true;
+				// Read at send time: afterNavigate runs after this effect has armed.
+				const from = cameFrom === slug ? null : cameFrom;
+				postView(slug, from)
+					.then((ok) => ok && markViewed(slug))
+					.catch(() => {});
+			}, 2000);
+		};
+		arm();
+		document.addEventListener('visibilitychange', arm);
+		return () => {
+			clearTimeout(timer);
+			document.removeEventListener('visibilitychange', arm);
+		};
 	});
 
 	// Swipe left for the next picture in grid order, right for the previous one. The hero
@@ -209,7 +257,13 @@
 			{/key}
 		</div>
 	</div>
-	{#if image.caption}<h1>{image.caption.body}</h1>{/if}
+	<!-- In more than one living gallery at once: the same mark the gallery tiles carry. -->
+	{#if image.caption || inNow.length > 1}
+		<div class="head">
+			{#if image.caption}<h1>{image.caption.body}</h1>{/if}
+			{#if inNow.length > 1}<Overlap others={inNow} label="in" />{/if}
+		</div>
+	{/if}
 	{#key image.slug}<Votes slug={image.slug} votes={image.votes} />{/key}
 	{#each paragraphs as p}
 		<p class="desc">
@@ -231,6 +285,18 @@
 			{/each}
 		</p>
 	{/if}
+	{#if inNow.length}
+		<p class="gals">
+			<span class="k">in</span>
+			{#each inNow as g (g.serial)}<a href="/g/{g.serial}">{g.title}</a>{' '}{/each}
+		</p>
+	{/if}
+	{#if wasIn.length}
+		<p class="gals">
+			<span class="k">was in</span>
+			{#each wasIn as g (g.serial)}<a href="/g/{g.serial}">{g.title}</a>{' '}{/each}
+		</p>
+	{/if}
 	{#if image.prompt}
 		<div class="prompt">
 			<span class="k">prompt</span>
@@ -239,6 +305,9 @@
 	{/if}
 	<Strip label="similar" items={image.similar} />
 	<Strip label="dissimilar" items={image.dissimilar} />
+	<Strip label="reaching" items={image.hyphae ?? []}>
+		{#snippet foot(h)}<Reach strength={h.strength} layer={h.layer} />{/snippet}
+	</Strip>
 	{#if metrics.length}
 		<dl>
 			{#each metrics as [k, v]}
@@ -276,8 +345,15 @@
 		width: min(100%, calc(80svh * var(--ar)));
 		margin-inline: auto;
 	}
-	h1 {
+	.head {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 0.5rem;
 		margin: 2rem 0 1rem;
+	}
+	h1 {
+		margin: 0;
 		font-size: 1.25rem;
 		font-weight: 500;
 		line-height: 1.3;
@@ -307,6 +383,12 @@
 	}
 	.tags a {
 		color: inherit;
+	}
+	.gals {
+		margin: 1rem 0 0;
+	}
+	.gals a {
+		margin-right: 1rem;
 	}
 	.prompt {
 		margin-top: 2rem;

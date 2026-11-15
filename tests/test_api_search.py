@@ -113,7 +113,15 @@ async def test_search_tagged_first_then_nearest(
     # everything else by distance. img-5 has no vector and is only here for its tag.
     assert [i["slug"] for i in body["items"]] == ["img-1", "img-5", "img-2", "img-3"]
     assert body["tags"] == [{"tag": "blue-chair", "n": 2}, {"tag": "blue-chair-leg", "n": 1}]
-    assert set(body["items"][0]) == {"slug", "width", "height", "blurhash", "palette", "variants"}
+    assert set(body["items"][0]) == {
+        "slug",
+        "width",
+        "height",
+        "blurhash",
+        "palette",
+        "variants",
+        "overgrowth",
+    }
 
     # The same words again are served from the cache.
     await client.get("/api/search", params={"q": "blue chair", "limit": 1})

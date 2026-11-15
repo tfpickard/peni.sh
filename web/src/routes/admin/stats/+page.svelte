@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import * as ops from '../../../lib/admin-ops';
+	import { spark } from '../../../lib/spark';
 
 	let s = $state<ops.Stats | null>(null);
 	let note = $state('');
@@ -12,16 +13,6 @@
 			note = 'not here';
 		}
 	});
-
-	function spark(vals: number[]): string {
-		if (vals.length < 2) return '';
-		const lo = Math.min(...vals);
-		const hi = Math.max(...vals);
-		const span = hi - lo || 1;
-		return vals
-			.map((v, i) => `${((i / (vals.length - 1)) * 200).toFixed(1)},${(22 - ((v - lo) / span) * 20).toFixed(1)}`)
-			.join(' ');
-	}
 
 	const usage = $derived(s?.api_usage.last_30d ?? []);
 	const totalIn = $derived(usage.reduce((a, u) => a + u.in, 0));

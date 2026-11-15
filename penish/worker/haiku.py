@@ -1,14 +1,19 @@
 import json
 from typing import Any
 
-import anthropic
 import jsonschema
 
 from penish import runtime
 from penish.config import Settings
 from penish.runtime import Getter, Pool
 from penish.text import no_em_dash
-from penish.worker.describe import DescribeError, call_text, output_config, parse_json
+from penish.worker.describe import (
+    DescribeError,
+    LazyAnthropic,
+    call_text,
+    output_config,
+    parse_json,
+)
 
 Haiku = tuple[str, str, str]
 
@@ -25,10 +30,13 @@ _SCHEMA = {
 async def load_examples(pool: Pool, n: int = N_EXAMPLES) -> list[Haiku]:
     # From the live deck, not the seed migration: the image ships no migrations folder, and
     # owner edits and deactivations should steer the voice. Random so the prompt does not
-    # pull every haiku toward the same six.
+    # pull every haiku toward the same six. A gallery's haiku is about its room, not a
+    # picture, so it is no example of the deck.
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "select l1, l2, l3 from haikus where active order by random() limit %s", (n,)
+            "select l1, l2, l3 from haikus where active and colony_id is null"
+            " order by random() limit %s",
+            (n,),
         )
         rows = await cur.fetchall()
     return [(r["l1"], r["l2"], r["l3"]) for r in rows]
@@ -59,7 +67,7 @@ async def haiku_from(
     """`get` overrides the runtime lookup (tests); `pool` supplies it, the examples and
     usage recording otherwise."""
     if client is None:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = LazyAnthropic(settings.anthropic_api_key)
     get = get or runtime.getter(pool, settings)
     model = await get("haiku.model")
     template = await get("haiku.prompt")

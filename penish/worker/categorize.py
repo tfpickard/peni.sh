@@ -12,13 +12,18 @@ import logging
 from importlib import resources
 from typing import Any
 
-import anthropic
 import jsonschema
 
 from penish import runtime
 from penish.categories import CATEGORIES, MAX_PER_IMAGE, SLUGS
 from penish.config import Settings
-from penish.worker.describe import DescribeError, call_text, output_config, parse_json
+from penish.worker.describe import (
+    DescribeError,
+    LazyAnthropic,
+    call_text,
+    output_config,
+    parse_json,
+)
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 
 log = logging.getLogger(__name__)
@@ -63,7 +68,7 @@ async def classify(
     client: Any = None,
 ) -> tuple[list[str], str]:
     if client is None:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = LazyAnthropic(settings.anthropic_api_key)
     get = runtime.getter(pool, settings)
     model = await get("describe.model")
     kwargs: dict[str, Any] = {

@@ -3,12 +3,14 @@ import json
 import re
 import secrets
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from penish.api.haiku_render import Gen, render_haiku_html
 from penish.api.media import variants_for
+from penish.api.routes_galleries import gallery_card, parse_serial
 from penish.api.routes_images import resolve_live
 from penish.api.routes_meta import random_haiku
 from penish.config import get_settings
@@ -103,6 +105,47 @@ async def _image_page(request: Request, slug: str) -> HTMLResponse:
     return await render_index(request, "".join(tags), title=caption)
 
 
+def _og_image(request: Request, variants: list[dict[str, Any]]) -> list[str]:
+    webps = [v for v in variants if v["webp"]]
+    if not webps:
+        return []
+    big = webps[-1]
+    base = str(request.base_url).rstrip("/")
+    out = [_meta("og:image", base + big["webp"]), _meta("og:image:width", big["w"])]
+    if "h" in big:
+        out.append(_meta("og:image:height", big["h"]))
+    return out
+
+
+def _meta(prop: str, value: object, attr: str = "property") -> str:
+    return f'<meta {attr}="{prop}" content="{html.escape(str(value))}">'
+
+
+def _gallery_line(card: dict[str, Any]) -> str:
+    if card["state"] == "dead":
+        days = card["died_days"] or 0
+        if days == 0:
+            return "died today"
+        return f"died {days} day ago" if days == 1 else f"died {days} days ago"
+    n = card["size"]
+    return f"{n} picture" if n == 1 else f"{n} pictures"
+
+
+async def _gallery_page(request: Request, raw: str) -> HTMLResponse:
+    serial = parse_serial(raw)
+    card = None
+    if serial is not None:
+        async with request.app.state.pool.connection() as conn:
+            card = await gallery_card(conn, serial)
+    if card is None:
+        return await render_index(request, status_code=404)
+    tags = [_meta("og:type", "website"), _meta("og:description", _gallery_line(card))]
+    if card["cover"] is not None:
+        tags.append(_meta("twitter:card", "summary_large_image", "name"))
+        tags.extend(_og_image(request, card["cover"]["variants"]))
+    return await render_index(request, "".join(tags), title=card["title"])
+
+
 # HEAD too: link unfurlers and uptime checks probe with HEAD before GET.
 @router.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
 async def catch_all(path: str, request: Request) -> Response:
@@ -111,6 +154,10 @@ async def catch_all(path: str, request: Request) -> Response:
 
     if path.startswith("i/") and "/" not in path[2:] and path[2:]:
         return await _image_page(request, path[2:])
+
+    # Digits only: anything else under g/ is not an address and falls through.
+    if path.startswith("g/") and path[2:].isascii() and path[2:].isdigit():
+        return await _gallery_page(request, path[2:])
 
     build = get_settings().web_build_dir.resolve()
     if path:

@@ -33,11 +33,22 @@ router = APIRouter(
 )
 
 # Static on purpose: the list only seeds a dropdown, and a model id set by hand still shows.
+# The prefixed ids were checked on 2026-11-14 against each provider's model list as taking
+# images and strict json schema output; any other `provider:id` is accepted by hand.
 KNOWN_MODELS = (
     "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-haiku-5-5",
     "claude-fable-5-2",
+    "openai:gpt-6-astra",
+    "openai:gpt-6.1-sol",
+    "openai:gpt-6.1-terra",
+    "openai:gpt-6-luna",
+    "xai:grok-4.7",
+    "xai:grok-4.6",
+    "openrouter:google/gemini-4-carbon",
+    "openrouter:qwen/qwen3.8-max-prime",
+    "openrouter:mistralai/mistral-large-4-0",
 )
 THUMB_WIDTH = 480
 HAIKU_LINE_MAX = 60
@@ -150,6 +161,14 @@ def _clean_lines(lines: list[str]) -> list[str]:
     return out
 
 
+# A gallery's haiku sits in the same table as the deck but is shown only on its gallery,
+# so the list labels it with the gallery's serial (null for the deck).
+_HAIKU_COLS = (
+    "id, l1, l2, l3, source::text as source, active, image_id, created_at,"
+    " (select c.serial from colonies c where c.id = haikus.colony_id) as gallery"
+)
+
+
 def _haiku(r: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": r["id"],
@@ -157,6 +176,7 @@ def _haiku(r: dict[str, Any]) -> dict[str, Any]:
         "source": r["source"],
         "active": r["active"],
         "image_id": r["image_id"],
+        "gallery": r["gallery"],
         "created_at": _iso(r["created_at"]),
     }
 
@@ -182,8 +202,8 @@ async def list_haikus(
         cur = await conn.execute(f"select count(*) as n from haikus {clause}", args)  # noqa: S608
         total = (await cur.fetchone())["n"]
         cur = await conn.execute(
-            f"select id, l1, l2, l3, source::text as source, active, image_id, created_at"  # noqa: S608
-            f" from haikus {clause} order by id desc limit %s offset %s",
+            f"select {_HAIKU_COLS} from haikus {clause}"  # noqa: S608
+            " order by id desc limit %s offset %s",
             [*args, limit, offset],
         )
         rows = await cur.fetchall()
@@ -201,7 +221,7 @@ async def create_haiku(body: HaikuIn, request: Request) -> dict[str, Any]:
         async with _pool(request).connection() as conn:
             cur = await conn.execute(
                 "insert into haikus (l1, l2, l3, source) values (%s, %s, %s, 'owner')"
-                " returning id, l1, l2, l3, source::text as source, active, image_id, created_at",
+                " returning " + _HAIKU_COLS,
                 (l1, l2, l3),
             )
             row = await cur.fetchone()
@@ -233,7 +253,7 @@ async def patch_haiku(haiku_id: int, body: HaikuPatch, request: Request) -> dict
         async with _pool(request).connection() as conn:
             cur = await conn.execute(
                 f"update haikus set {', '.join(sets)} where id = %s"  # noqa: S608
-                " returning id, l1, l2, l3, source::text as source, active, image_id, created_at",
+                " returning " + _HAIKU_COLS,
                 [*args, haiku_id],
             )
             row = await cur.fetchone()
@@ -274,11 +294,21 @@ async def get_models(request: Request) -> dict[str, Any]:
     for k, v in current.items():
         if k.endswith(".model") and v not in known:
             known.append(v)
+    async with pool.connection() as conn:
+        cur = await conn.execute("select info from heartbeats where name = 'worker'")
+        beat = await cur.fetchone()
+    info = beat["info"] if beat and isinstance(beat["info"], dict) else {}
+    keyed = info.get("providers")
     return {
         "current": current,
         "default": default,
         "efforts": list(runtime.EFFORTS),
         "known_models": known,
+        "purposes": list(runtime.PURPOSES),
+        "providers": ["anthropic", *runtime.PROVIDERS],
+        # From the worker, which holds the keys; null until a worker that reports it beats.
+        "keyed": keyed if isinstance(keyed, list) else None,
+        "calls_today": await runtime.calls_today(pool),
     }
 
 

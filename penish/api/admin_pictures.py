@@ -1,4 +1,5 @@
-"""Admin pictures: list and search, detail, edits, regen, crop, delete, the clean original."""
+"""Admin pictures: list and search, detail, edits, regen, crop, unpublish and republish,
+delete, the clean original."""
 
 from __future__ import annotations
 
@@ -18,6 +19,8 @@ from penish.api import embed_client
 from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for, variants_for_many
 from penish.config import get_settings
+from penish.mycelium import store as mycelium
+from penish.worker import facet_jobs, unpublish
 from penish.worker.admin_jobs import (
     ORIG_TYPES,
     find_original,
@@ -27,7 +30,7 @@ from penish.worker.admin_jobs import (
     remove_pub,
 )
 from penish.worker.derive import clamp_rect
-from penish.worker.ingest import EMBED_FIELD
+from penish.worker.ingest import EMBED_FIELD, _all_keys
 from penish.worker.jobs import enqueue
 from penish.worker.metrics import refresh_corpus_stats
 
@@ -41,7 +44,7 @@ router = APIRouter(
 
 KIND = "description"
 SLUG = re.compile(r"^[a-z0-9-]{1,80}$")
-Status = Literal["queued", "processing", "pending_enrichment", "live", "failed"]
+Status = Literal["queued", "processing", "pending_enrichment", "live", "failed", "unpublished"]
 Sort = Literal["new", "old", "votes", "lonely"]
 _LONELY_K = 5
 
@@ -96,7 +99,14 @@ def _offset(cursor: str | None) -> int:
     return int(cursor)
 
 
-def _thumb(vs: list[dict[str, Any]]) -> str | None:
+def original_url(image_id: int) -> str:
+    return f"/api/admin/pictures/{image_id}/original"
+
+
+def _thumb(r: dict[str, Any], vs: list[dict[str, Any]]) -> str | None:
+    # An unpublished picture's derivatives are held where nothing serves them.
+    if r["status"] == "unpublished":
+        return original_url(r["id"])
     webps = [v["webp"] for v in vs if v["webp"]]
     return webps[0] if webps else None
 
@@ -167,7 +177,7 @@ async def list_pictures(
             "id": r["id"],
             "slug": r["slug"],
             "status": r["status"],
-            "thumb": _thumb(variants[r["pub_sha"]]),
+            "thumb": _thumb(r, variants[r["pub_sha"]]),
             "caption": r["caption"],
             "net": r["net"],
             "created_at": _iso(r["created_at"]),
@@ -234,6 +244,9 @@ async def _detail(request: Request, image_id: int) -> dict[str, Any]:
             {**r, "created_at": _iso(r["created_at"]), "updated_at": _iso(r["updated_at"])}
             for r in await cur.fetchall()
         ]
+        purge = None
+        if img["status"] == "unpublished":
+            purge = await _purge(conn, request, img, aliases)
 
     original = None
     orig = find_original(get_settings().media_orig, img["sha256"])
@@ -265,9 +278,42 @@ async def _detail(request: Request, image_id: int) -> dict[str, Any]:
         "votes": {"up": votes["up"], "down": votes["down"], "net": votes["up"] - votes["down"]},
         "comments": comments,
         "jobs": jobs,
+        "purge": purge,
         "created_at": _iso(img["created_at"]),
         "published_at": _iso(img["published_at"]),
     }
+
+
+async def _purge(conn: Any, request: Request, img: dict[str, Any], aliases: list[str]) -> list[str]:
+    """What Cloudflare may still hold for an unpublished picture, to purge by hand: its
+    page under every slug it answered to, and each derivative ladder its page served.
+
+    The ladders come from `served_media`, written as it went down and whenever a live
+    crop or heal replaced one, not from the current pub_sha: a crop while it is down
+    renames the files to URLs that were never served. A ladder another shown picture
+    still serves is left out, since purging it would only send that picture's visitors
+    back to the origin."""
+    base = str(request.base_url).rstrip("/")
+    urls = [f"{base}/i/{s}" for s in (img["slug"], *aliases) if s]
+    cur = await conn.execute(
+        """
+        select s.pub_sha, s.width
+          from served_media s
+         where s.image_id = %s
+           and not exists (select 1 from images o
+                            where o.pub_sha = s.pub_sha and o.id <> s.image_id
+                              and o.status <> 'unpublished')
+         order by s.created_at, s.pub_sha
+        """,
+        (img["id"],),
+    )
+    for r in await cur.fetchall():
+        # The ladder ingest and crop name files by, so the api need not see the held dir.
+        urls += [
+            f"{base}/media/pub/{k.removeprefix('pub/')}"
+            for k in _all_keys(r["pub_sha"], r["width"])
+        ]
+    return urls
 
 
 @router.get("/{image_id}")
@@ -341,6 +387,11 @@ async def edit_picture(request: Request, image_id: int, body: Edit) -> dict[str,
     given = body.model_fields_set
     try:
         async with _pool(request).connection() as conn, conn.transaction():
+            if EMBED_FIELD in given:
+                # Before the images row lock: a tick holds the state row while its edge
+                # inserts take key share locks on images, so the other order deadlocks.
+                # A mark for an analysis that turns out unchanged costs one rebuild.
+                await mycelium.mark_dirty(conn)
             cur = await conn.execute(
                 "select id, slug, status from images where id = %s for update", (image_id,)
             )
@@ -377,6 +428,7 @@ async def edit_picture(request: Request, image_id: int, body: Edit) -> dict[str,
                         "delete from embeddings where image_id = %s and kind = %s",
                         (image_id, KIND),
                     )
+                    await facet_jobs.invalidate_split(conn, image_id)
                     await conn.execute(
                         "insert into jobs (type, payload, dedupe_key) values ('regen', %s, %s)"
                         " on conflict do nothing",
@@ -469,6 +521,58 @@ async def crop_picture(request: Request, image_id: int, body: CropBody) -> dict[
     return {"job_id": job_id, "queued": job_id is not None}
 
 
+# -- unpublish ----------------------------------------------------------------
+
+
+async def _publish_job(request: Request, image_id: int, kind: str) -> dict[str, Any]:
+    row = await _require(request, image_id)
+    if row["status"] not in ("live", "unpublished"):
+        raise HTTPException(status_code=409, detail="not live")
+    other = unpublish.REPUBLISH if kind == unpublish.UNPUBLISH else unpublish.UNPUBLISH
+    image = str(image_id)
+    async with _pool(request).connection() as conn, conn.transaction():
+        # One press per picture at a time, from any tab, so the look below and the
+        # insert cannot interleave with another press.
+        await conn.execute(
+            "select pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"press:{image_id}",)
+        )
+        # A press the other way that is still queued is withdrawn; one already running
+        # finishes, and the job inserted below supersedes it if it has not acted yet.
+        await conn.execute(
+            "delete from jobs where type = %s and status = 'queued' and payload->>'image_id' = %s",
+            (other, image),
+        )
+        cur = await conn.execute(
+            "select type from jobs where type = any(%s) and status in ('queued', 'running')"
+            " and payload->>'image_id' = %s order by id desc limit 1",
+            (list(unpublish.JOBS), image),
+        )
+        last = await cur.fetchone()
+        if last is not None and last["type"] == kind:
+            # The newest pending job already goes this way, and nothing newer can
+            # overrule it, so this press is already counted.
+            return {"job_id": None, "queued": False}
+        # No dedupe key: an older job this way may still be running behind a newer one
+        # the other way, and a press swallowed into it would let the other one win.
+        cur = await conn.execute(
+            "insert into jobs (type, payload) values (%s, %s) returning id",
+            (kind, Jsonb({"image_id": image_id})),
+        )
+        got = await cur.fetchone()
+    assert got is not None
+    return {"job_id": int(got["id"]), "queued": True}
+
+
+@router.post("/{image_id}/unpublish")
+async def unpublish_picture(request: Request, image_id: int) -> dict[str, Any]:
+    return await _publish_job(request, image_id, unpublish.UNPUBLISH)
+
+
+@router.post("/{image_id}/republish")
+async def republish_picture(request: Request, image_id: int) -> dict[str, Any]:
+    return await _publish_job(request, image_id, unpublish.REPUBLISH)
+
+
 # -- delete -----------------------------------------------------------------
 
 
@@ -491,6 +595,9 @@ async def _delete(pool: Any, image_id: int) -> tuple[str, list[str]] | None:
         await conn.execute("select pg_advisory_lock(hashtextextended(%s, 0))", (sha,))
         try:
             async with conn.transaction():
+                # First: the cascade below deletes edge rows a tick may be writing, and
+                # the tick holds the state row while it does.
+                await mycelium.mark_dirty(conn)
                 cur = await conn.execute(
                     "select distinct model from embeddings where image_id = %s and kind = %s",
                     (image_id, KIND),
@@ -509,6 +616,19 @@ async def _delete(pool: Any, image_id: int) -> tuple[str, list[str]] | None:
                     (gone["pub_sha"],),
                 )
                 shared = await cur.fetchone()
+                if gone["status"] == "unpublished" or (shared and shared["shared"]):
+                    # Held files are out of this container's reach, and pub files left to
+                    # unpublished pictures only must be held: the worker settles both.
+                    # In the transaction, so a crash cannot lose it.
+                    await conn.execute(
+                        "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s)"
+                        " on conflict do nothing",
+                        (
+                            unpublish.SETTLE,
+                            Jsonb({"pub_sha": gone["pub_sha"]}),
+                            f"{unpublish.SETTLE}:{gone['pub_sha']}",
+                        ),
+                    )
 
             def unlink() -> None:
                 for ext in ORIG_TYPES:

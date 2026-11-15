@@ -1,7 +1,8 @@
 """Runs the real worker main() with the describer, haiku writer and embedder faked.
 
-CI has no network and no model, so those three are the only seams replaced; the
-watcher, job loop, ingest handler and database are the real ones.
+CI has no network and no model, so those are the only seams replaced (plus the facet
+extractor, which is the describer's kind of call); the watcher, job loop, ingest
+handler and database are the real ones.
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ import numpy as np
 
 import penish.worker.__main__ as worker_main
 from penish.config import Settings, get_settings
-from penish.worker import ingest
+from penish.mycelium.facets import FACETS
+from penish.worker import facet_jobs, ingest
 from penish.worker.describe import Described, expand
 
 
@@ -48,6 +50,17 @@ async def fake_haiku(
     return "one fake line", "another fake line", "a last fake line"
 
 
+async def fake_extract(
+    image_bytes: bytes, mime: str, *, settings: Settings, pool: Any = None
+) -> facet_jobs.Extracted:
+    tag = hashlib.sha256(image_bytes).hexdigest()[:8]
+    parts = {f: f"fake {f} of image {tag}" for f in FACETS}
+    raw = {**parts, "offers": ["a fake offer"], "needs": ["a fake need"]}
+    return facet_jobs.Extracted(
+        facets=parts, offers=raw["offers"], needs=raw["needs"], model="fake-extractor", raw=raw
+    )
+
+
 class FakeEmbedder:
     def __init__(self, *_: Any, **__: Any) -> None:
         self.dim = get_settings().embed_dim
@@ -67,6 +80,9 @@ def install() -> None:
     ingest.describe = fake_describe  # type: ignore[assignment]
     ingest.handle_ingest.__kwdefaults__["describer"] = fake_describe  # type: ignore[index]
     ingest.handle_haiku.__kwdefaults__["writer"] = fake_haiku  # type: ignore[index]
+    # The fake analysis has one label only, so splits take the extract recipe instead.
+    facet_jobs.handle_split.__kwdefaults__["extractor"] = fake_extract  # type: ignore[index]
+    facet_jobs.handle_extract.__kwdefaults__["extractor"] = fake_extract  # type: ignore[index]
     worker_main.Embedder = FakeEmbedder  # type: ignore[misc,assignment]
 
 
