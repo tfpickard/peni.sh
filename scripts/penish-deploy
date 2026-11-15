@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Pull-based deploy poller. Run by penish-deploy.timer as the deploy user.
-# Env overrides (testing): APP_ROOT, API_URL, RAW_URL_BASE, STATE_DIRECTORY, DRY_RUN=1, WAIT_SECS.
+# Env overrides (testing): APP_ROOT, API_URL, RAW_URL_BASE, DEPLOYMENTS_URL, STATE_DIRECTORY,
+# DRY_RUN=1, WAIT_SECS, GH_TIMEOUT_SECS.
 set -euo pipefail
 umask 077
 
@@ -16,9 +17,18 @@ DRY_RUN=${DRY_RUN:-0}
 DEFAULT_API_URL='https://api.github.com/repos/tfpickard/peni.sh/actions/workflows/ci.yml/runs?branch=main&status=success&event=push&per_page=1'
 API_URL=${API_URL:-$DEFAULT_API_URL}
 RAW_URL_BASE=${RAW_URL_BASE:-https://raw.githubusercontent.com/tfpickard/peni.sh}
+DEPLOYMENTS_URL=${DEPLOYMENTS_URL:-https://api.github.com/repos/tfpickard/peni.sh/deployments}
+GH_TIMEOUT_SECS=${GH_TIMEOUT_SECS:-10}
+SITE_URL=https://peni.sh
 COMPOSE=$ROOT/compose.yaml
 compose_prev=
 compose_swapped=0
+sync_error=
+gh_token=
+gh_deploy_id=
+gh_resp=
+# 1 while a GitHub deployment has no final status yet; the exit trap closes it.
+gh_open=0
 
 log() { printf 'penish-deploy: %s\n' "$*"; }
 err() { printf 'penish-deploy: ERROR: %s\n' "$*" >&2; }
@@ -123,6 +133,7 @@ sync_compose() {
   tmp=$(mktemp "$STATE/compose.XXXXXX")
   if ! curl -fsSL --max-time 30 -o "$tmp" "$RAW_URL_BASE/$sha/compose.yaml"; then
     rm -f "$tmp"
+    sync_error="compose.yaml fetch failed"
     err "could not fetch compose.yaml for $sha; aborting deploy"
     return 1
   fi
@@ -130,6 +141,7 @@ sync_compose() {
   # A broken file must never reach the box: validate with the real .env before touching anything.
   if ! docker compose --project-directory "$ROOT" --env-file "$ENV_FILE" -f "$tmp" config -q; then
     rm -f "$tmp"
+    sync_error="compose.yaml failed validation"
     err "compose.yaml for $sha failed validation; aborting deploy"
     return 1
   fi
@@ -148,6 +160,7 @@ sync_compose() {
     # Install exactly the bytes that were validated.
     if [ "$(sha256_of "$tmp")" != "$staged_sum" ]; then
       rm -f "$tmp"
+      sync_error="staged compose.yaml changed after validation"
       err "staged compose.yaml changed after validation; aborting deploy"
       return 1
     fi
@@ -181,6 +194,90 @@ wait_healthy() {
   return 1
 }
 
+# GitHub deployment reporting. Strictly best-effort: a GitHub outage must never block, delay
+# (beyond GH_TIMEOUT_SECS per call) or fail a deploy, so gh_create and gh_status always return 0.
+
+# POSTs JSON $3 to $2. On 2xx leaves the body in gh_resp; otherwise one warning with the status.
+gh_post() {
+  local what=$1 url=$2 body=$3 out code rc=0
+  gh_resp=
+  # The token goes in as curl config on stdin so it never shows up in ps output.
+  out=$(printf 'header = "Authorization: Bearer %s"\n' "$gh_token" \
+    | curl -sS --max-time "$GH_TIMEOUT_SECS" -K - -X POST \
+      -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H 'Content-Type: application/json' --data-binary "$body" \
+      -w '\n%{http_code}' "$url" 2>/dev/null) || rc=$?
+  code=${out##*$'\n'}
+  if [[ $code =~ ^2[0-9][0-9]$ ]]; then
+    gh_resp=${out%$'\n'*}
+    return 0
+  fi
+  # Status only: response bodies are not logged, the journal is readable by more than deploy.
+  # curl's stderr stays dropped too, it can echo the URL. Exit 28 is curl's own timeout; any
+  # other failure (refused, DNS, TLS) is instant, and calling it a timeout misleads the reader.
+  if [[ $code =~ ^[1-9][0-9][0-9]$ ]]; then
+    log "WARNING: github $what failed (HTTP $code)"
+  elif [ "$rc" = 28 ]; then
+    log "WARNING: github $what failed (no response within ${GH_TIMEOUT_SECS}s)"
+  else
+    log "WARNING: github $what failed (no connection, curl exit $rc)"
+  fi
+  return 1
+}
+
+gh_create() {
+  local ref=$1 desc=$2 payload
+  gh_token=$(env_get GH_DEPLOY_TOKEN)
+  [ -n "$gh_token" ] || return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '+ github deployment create ref=%s environment=production description=%s\n' "$ref" "$desc"
+    gh_deploy_id=dry-run
+    gh_open=1
+    return 0
+  fi
+  if ! payload=$(jq -nc --arg ref "$ref" --arg d "$desc" '{ref: $ref, environment: "production",
+      auto_merge: false, required_contexts: [], transient_environment: false,
+      production_environment: true, description: $d}'); then
+    log "WARNING: github deployment create skipped (jq failed)"
+    return 0
+  fi
+  gh_post "deployment create" "$DEPLOYMENTS_URL" "$payload" || return 0
+  gh_deploy_id=$(printf '%s' "$gh_resp" | jq -r '.id // empty' 2>/dev/null || true)
+  # The id goes into a URL, so anything but digits is dropped.
+  if ! [[ $gh_deploy_id =~ ^[0-9]+$ ]]; then
+    log "WARNING: github deployment create returned no id"
+    gh_deploy_id=
+    return 0
+  fi
+  gh_open=1
+}
+
+gh_status() {
+  local state=$1 desc=${2:0:140} payload
+  [ -n "$gh_deploy_id" ] || return 0
+  [ "$state" = in_progress ] || gh_open=0
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '+ github deployment status %s: %s\n' "$state" "$desc"
+    return 0
+  fi
+  # auto_inactive on success marks the older production deployments inactive.
+  if ! payload=$(jq -nc --arg s "$state" --arg d "$desc" --arg url "$SITE_URL" \
+      '{state: $s, description: $d, environment: "production"}
+      + (if $s == "success" then {environment_url: $url, auto_inactive: true} else {} end)'); then
+    log "WARNING: github deployment status $state skipped (jq failed)"
+    return 0
+  fi
+  gh_post "deployment status $state" "$DEPLOYMENTS_URL/$gh_deploy_id/statuses" "$payload" || true
+  return 0
+}
+
+# An unexpected abort (set -e) would otherwise leave the deployment in_progress on GitHub forever.
+gh_on_exit() {
+  if [ "$gh_open" = 1 ]; then gh_status error "deploy script aborted; see journal"; fi
+  return 0
+}
+trap gh_on_exit EXIT
+
 cd "$ROOT"
 [ -f "$ROOT/compose.yaml" ] || [ "$DRY_RUN" = 1 ] || exit 0
 
@@ -195,9 +292,9 @@ else
   if [ -z "$token" ] && [ "$API_URL" = "$DEFAULT_API_URL" ]; then
     exit 0
   fi
-  auth=()
-  [ -z "$token" ] || auth=(-H "Authorization: Bearer $token")
-  if ! resp=$(curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' "${auth[@]}" "$API_URL"); then
+  # The token goes in as curl config on stdin, as in gh_post, so it never shows up in ps output.
+  if ! resp=$( { [ -z "$token" ] || printf 'header = "Authorization: Bearer %s"\n' "$token"; } \
+    | curl -fsS --max-time 20 -K - -H 'Accept: application/vnd.github+json' "$API_URL"); then
     err "could not query $API_URL"
     exit 1
   fi
@@ -225,13 +322,22 @@ if [ "$(read_state failed_sha)" = "$target" ] \
 fi
 
 log "deploying $target (was ${deployed:-none})"
-sync_compose "$target" || exit 1
+deploy_start=$(date +%s)
+# Created before sync_compose so a fetch or validation failure shows up on GitHub too.
+if [ -n "$pinned" ]; then gh_create "$target" pinned; else gh_create "$target" "from main"; fi
+gh_status in_progress pulling
+
+if ! sync_compose "$target"; then
+  gh_status error "${sync_error:-compose.yaml sync failed}; nothing changed"
+  exit 1
+fi
 set_image_tag "$target"
 
 if ! run docker compose pull; then
   err "pull failed for $target; running containers untouched"
   [ -z "$deployed" ] || set_image_tag "$deployed"
   restore_compose
+  gh_status failure "pull failed; running containers untouched"
   exit 1
 fi
 
@@ -248,13 +354,20 @@ fi
 if [ "$failed" = 1 ]; then
   err "DEPLOY FAILED for $target: api not healthy within ${WAIT_SECS}s"
   write_state failed_sha "$target"
+  why="api not healthy within ${WAIT_SECS}s"
   if [ -n "$deployed" ]; then
     err "rolling back to $deployed"
     set_image_tag "$deployed"
     restore_compose
-    run docker compose up -d --remove-orphans || err "rollback up failed; manual intervention needed"
+    if run docker compose up -d --remove-orphans; then
+      gh_status failure "$why; rolled back to ${deployed:0:7}"
+    else
+      err "rollback up failed; manual intervention needed"
+      gh_status failure "$why; rollback to ${deployed:0:7} failed"
+    fi
   else
     err "no previous deploy to roll back to"
+    gh_status failure "$why; nothing to roll back to"
   fi
   exit 1
 fi
@@ -266,6 +379,7 @@ else
   rm -f "$STATE/failed_sha"
 fi
 log "deployed $target"
+gh_status success "api healthy in $(($(date +%s) - deploy_start))s"
 
 # Each deploy pulls a torch-sized image; without this the disk fills in days.
 run docker image prune -af --filter until=72h >/dev/null || true
