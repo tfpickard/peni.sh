@@ -55,14 +55,15 @@ class Described:
 
 
 def build_schema(want: set[str], *, scratch: bool = True) -> dict[str, Any]:
-    # Order is generation order. The faithful analysis comes first and the misreading is
-    # committed to in `concern` before the public text, which otherwise drifts back into an
-    # inventory of the scene. `concern` is scratch and never stored.
+    # Order is generation order. The faithful analysis comes first, then `angle` pins the
+    # main subject and what only a local knows about it before the public text, which
+    # otherwise drifts to a prop in the corner or back into an inventory of the scene.
+    # `angle` is scratch and never stored.
     props: dict[str, Any] = {}
     if "analysis" in want:
         props["analysis"] = {"type": "string"}
     if scratch and want & {"caption", "description"}:
-        props["concern"] = {"type": "string"}
+        props["angle"] = {"type": "string"}
     if "caption" in want:
         props["caption"] = {"type": "string"}
     if "description" in want:
@@ -123,7 +124,7 @@ def check_public(field: str, text: str) -> None:
 def _validate(text: str, want: set[str]) -> dict[str, Any]:
     data = parse_json(text)
     if isinstance(data, dict):
-        data.pop("concern", None)
+        data.pop("angle", None)
     jsonschema.validate(data, build_schema(want, scratch=False))
     out: dict[str, Any] = {}
     for key in want:
