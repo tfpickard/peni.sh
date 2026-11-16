@@ -22,12 +22,16 @@ the site has always been this way. Applies to UI, errors, prompts and design.
   `similar`, `dissimilar`, `loneliness 0.41`). No exclamation marks, emoji,
   "oops", or asides about the site being weird. No tooltips on metric names.
 - Empty and error states are flat, no apology: `0 pictures`, `not here`.
-- Model prompts ask for a deadpan, matter-of-fact voice that treats strange
-  content as ordinary. Descriptions stay literal and precise: the clerk is the
-  straight man and never gets weird.
-- Haikus are the one place that invents. Precise, never random: plain
-  sentences whose logic does not close. They add what the picture and its
-  description do not show, and they are not a second clerk.
+- Model prompts ask for a matter-of-fact voice that treats strange content as
+  ordinary. Public text is additive: the visitor can see the picture, so text
+  that restates it is wasted. Captions and descriptions are written by a local
+  who knows this world: they name the main subject's strange thing exactly,
+  then add what the picture cannot show (habits, history, consequences). They
+  may invent but never contradict the picture, and visible text and numbers
+  stay exact. A caption alone has to make a stranger need to look.
+- Haikus invent in verse. Precise, never random: plain sentences whose logic
+  does not close. They add what the picture and its description do not show,
+  and they do not reuse the description's invented facts.
 - og tags: caption and description only. No taglines or calls to action.
 - Visual: lots of empty dark ground, one type scale, no cards or shadows,
   almost no chrome. Magenta and cyan sparingly. The Fungal haiku is the only
