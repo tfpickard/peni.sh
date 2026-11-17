@@ -11,7 +11,14 @@ export type Item = {
 	nudity: string[] | null;
 	created_at: string;
 };
-export type Nudity = { kinds: string[]; seen: string; model: string; checked_at: string };
+export type Nudity = {
+	kinds: string[];
+	seen: string;
+	// The detector's, kept when the owner overrules it; null if the owner set it first.
+	model: string | null;
+	source: string;
+	checked_at: string;
+};
 export type Page = { items: Item[]; next_cursor: string | null };
 export type Field = 'caption' | 'description' | 'analysis' | 'prompt' | 'tags' | 'slug';
 export type Regen = 'caption' | 'description' | 'analysis' | 'tags' | 'haiku' | 'embedding';
@@ -43,6 +50,7 @@ export type Detail = {
 	votes: { up: number; down: number; net: number };
 	comments: { pending: number; approved: number; rejected: number };
 	nudity: Nudity | null;
+	nudity_kinds: string[];
 	jobs: Job[];
 	// Unpublished only: the URLs Cloudflare may still hold, to purge by hand.
 	purge: string[] | null;
@@ -108,6 +116,7 @@ export async function detail(id: string | number): Promise<Detail> {
 		votes: { up: 0, down: 0, net: 0 },
 		comments: { pending: 0, approved: 0, rejected: 0 },
 		nudity: null,
+		nudity_kinds: [],
 		jobs: [],
 		purge: null,
 		...d
@@ -135,6 +144,13 @@ export type BulkResult = { action: BulkAction; done: number[]; queued?: number[]
 export const BULK_MAX = 500;
 export const bulk = (action: BulkAction, ids: number[]) =>
 	call<BulkResult>('/bulk', { method: 'POST', body: JSON.stringify({ action, ids }) });
+
+// The owner's verdict; none means not nude. Detector runs leave it until detectNudity.
+export const setNudity = (id: number, kinds: string[]) =>
+	call<unknown>(`/${id}/nudity`, { method: 'PUT', body: JSON.stringify({ kinds }) });
+
+// Ask the detector again, handing an owner verdict back to it.
+export const detectNudity = (id: number) => call<unknown>(`/${id}/nudity`, { method: 'POST' });
 
 // Every live and unpublished picture, checked again.
 export const nudityAll = () =>

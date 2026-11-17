@@ -25,6 +25,9 @@
 	};
 	const blank: Draft = { caption: '', description: '', analysis: '', prompt: '', tags: '', slug: '' };
 	let draft = $state<Draft>({ ...blank });
+	// The override's checkboxes, kept like a draft: a poll only resets them if untouched.
+	let picks = $state<string[]>([]);
+	let seenPicks = '';
 	// What the server last said, so a poll only replaces drafts the owner has not touched.
 	let seen: Draft = { ...blank };
 
@@ -45,6 +48,9 @@
 				if (draft[k] === seen[k]) draft[k] = next[k];
 			}
 			seen = next;
+			const kinds = x.nudity?.kinds ?? [];
+			if (picks.join(',') === seenPicks) picks = [...kinds];
+			seenPicks = kinds.join(',');
 			d = x;
 		} catch (e) {
 			if (!d) missing = true;
@@ -89,7 +95,22 @@
 		return act(() => pics.patch(id, { [f]: v }));
 	}
 	const regen = (...f: pics.Regen[]) => act(() => pics.regen(id, f));
-	const detect = () => act(() => pics.bulk('nudity', [id]));
+	const detect = () => act(() => pics.detectNudity(id));
+	function toggle(k: string) {
+		const on = new Set(picks);
+		if (on.has(k)) on.delete(k);
+		else on.add(k);
+		picks = (d?.nudity_kinds ?? []).filter((x) => on.has(x));
+	}
+	// Saving an unchanged choice still means something when the detector made it: it
+	// turns the detector's answer into the owner's, which no rerun will overwrite.
+	const picksDirty = $derived(
+		!d ? false : d.nudity?.source !== 'owner' || picks.join(',') !== seenPicks
+	);
+	const saveNudity = () => act(() => pics.setNudity(id, picks));
+	const nuditySource = $derived(
+		d?.nudity?.source === 'owner' ? 'owner' : (d?.nudity?.model ?? '')
+	);
 	const nudity = $derived(
 		!d?.nudity ? 'unchecked' : d.nudity.kinds.length ? d.nudity.kinds.join(', ') : 'none'
 	);
@@ -216,11 +237,20 @@
 			</div>
 
 			<div class="nude">
-				<span class="l">nudity <span class="dim">{d.nudity?.model ?? ''}</span></span>
+				<span class="l">nudity <span class="dim">{nuditySource}</span></span>
 				<p class="nudity">{nudity}</p>
 				{#if d.nudity?.seen}<p class="dim nudity">{d.nudity.seen}</p>{/if}
+				<div class="kinds">
+					{#each d.nudity_kinds as k (k)}
+						<label class="kind">
+							<input type="checkbox" checked={picks.includes(k)} onchange={() => toggle(k)} />
+							{k}
+						</label>
+					{/each}
+				</div>
 			</div>
 			<div class="row">
+				<button disabled={!picksDirty} onclick={saveNudity}>save</button>
 				<button onclick={detect}>detect nudity</button>
 			</div>
 
@@ -343,6 +373,28 @@
 	}
 	p.nudity {
 		margin: 0.25rem 0 0;
+	}
+	.kinds {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem 1.25rem;
+		margin-top: 0.5rem;
+	}
+	label.kind {
+		flex-direction: row;
+		align-items: center;
+		gap: 0.4rem;
+		margin-top: 0;
+		font-size: 0.875rem;
+		color: var(--muted-foreground);
+	}
+	label.kind input {
+		width: 1rem;
+		height: 1rem;
+		margin: 0;
+		padding: 0;
+		border: 0;
+		accent-color: var(--primary);
 	}
 	.row {
 		display: flex;

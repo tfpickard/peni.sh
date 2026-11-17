@@ -246,7 +246,7 @@ async def _detail(request: Request, image_id: int) -> dict[str, Any]:
         )
         comments = await cur.fetchone()
         cur = await conn.execute(
-            "select kinds, seen, model, checked_at from image_nudity where image_id = %s",
+            "select kinds, seen, model, source, checked_at from image_nudity where image_id = %s",
             (image_id,),
         )
         nude = await cur.fetchone()
@@ -297,6 +297,8 @@ async def _detail(request: Request, image_id: int) -> dict[str, Any]:
         "votes": {"up": votes["up"], "down": votes["down"], "net": votes["up"] - votes["down"]},
         "comments": comments,
         "nudity": None if nude is None else {**nude, "checked_at": _iso(nude["checked_at"])},
+        # What the override can choose from, so the page never carries its own list.
+        "nudity_kinds": list(nudity.KIND_NAMES),
         "jobs": jobs,
         "purge": purge,
         "created_at": _iso(img["created_at"]),
@@ -539,6 +541,36 @@ async def crop_picture(request: Request, image_id: int, body: CropBody) -> dict[
     # itself when a newer crop of the same image exists.
     job_id = await enqueue(_pool(request), "crop", {"image_id": image_id, "rect": rect})
     return {"job_id": job_id, "queued": job_id is not None}
+
+
+class NudityBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kinds: list[str] = Field(max_length=len(nudity.KIND_NAMES))
+
+
+@router.put("/{image_id}/nudity")
+async def set_nudity(request: Request, image_id: int, body: NudityBody) -> dict[str, Any]:
+    """The owner's verdict; no kinds means not nude. Detector runs leave it alone until
+    the owner asks for one on this picture."""
+    await _require(request, image_id)
+    try:
+        kinds = nudity.owner_kinds(body.kinds)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
+    async with _pool(request).connection() as conn:
+        await nudity.set_owner(conn, image_id, kinds)
+    return await _detail(request, image_id)
+
+
+@router.post("/{image_id}/nudity")
+async def detect_nudity(request: Request, image_id: int) -> dict[str, Any]:
+    """Ask the detector again, handing an owner verdict back to it, as regenerate does
+    for text."""
+    await _require(request, image_id)
+    async with _pool(request).connection() as conn:
+        queued = await nudity.enqueue_for(conn, [image_id], force=True)
+    return {"queued": bool(queued)}
 
 
 # -- unpublish ----------------------------------------------------------------
