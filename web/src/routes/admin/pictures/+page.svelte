@@ -5,6 +5,8 @@
 
 	let q = $state('');
 	let status = $state('');
+	let nudity = $state('');
+	let armed = $state(false);
 	let sort = $state('new');
 	let items = $state<pics.Item[]>([]);
 	let cursor = $state<string | null>(null);
@@ -34,7 +36,7 @@
 		const mine = gen;
 		loading = true;
 		try {
-			const page = await pics.list({ q: q.trim(), status, sort, cursor });
+			const page = await pics.list({ q: q.trim(), status, nudity, sort, cursor });
 			if (mine !== gen) return;
 			items = reset ? page.items : [...items, ...page.items];
 			cursor = page.next_cursor;
@@ -94,8 +96,24 @@
 		redescribe: 'redescribe',
 		retag: 'retag',
 		rehaiku: 'rehaiku',
-		reembed: 're-embed'
+		reembed: 're-embed',
+		nudity: 'detect nudity'
 	};
+
+	// Every picture costs a model call, so the first press only arms it.
+	async function detectAll() {
+		if (!armed) {
+			armed = true;
+			return;
+		}
+		armed = false;
+		try {
+			await pics.nudityAll();
+			note = 'queued';
+		} catch {
+			note = 'failed';
+		}
+	}
 
 	async function run(action: pics.BulkAction) {
 		if (busy || !picked.size) return;
@@ -151,6 +169,12 @@
 		<option value="failed">failed</option>
 		<option value="unpublished">unpublished</option>
 	</select>
+	<select aria-label="nudity" bind:value={nudity} onchange={reload}>
+		<option value="">nudity</option>
+		<option value="nude">nude</option>
+		<option value="clean">clean</option>
+		<option value="unchecked">unchecked</option>
+	</select>
 	<select aria-label="sort" bind:value={sort} onchange={reload}>
 		<option value="new">new</option>
 		<option value="old">old</option>
@@ -173,6 +197,9 @@
 			<button class="dim" disabled={busy} onclick={() => ((picked = new Set()), (anchor = null))}
 				>clear</button
 			>
+		{:else}
+			<button onclick={detectAll}>{armed ? 'sure' : 'detect nudity in all'}</button>
+			{#if armed}<button class="dim" onclick={() => (armed = false)}>cancel</button>{/if}
 		{/if}
 	</div>
 {/if}
@@ -204,6 +231,7 @@
 					</a>
 				</td>
 				<td class="cap"><a href="/admin/pictures/{it.id}">{it.caption ?? it.slug ?? it.id}</a></td>
+				<td class="nude">{it.nudity?.length ? 'nude' : ''}</td>
 				<td class="dim" class:bad={it.status === 'failed'}>{it.status}</td>
 				<td class="dim num">{net(it.net)}</td>
 				<td class="dim num">{day(it.created_at)}</td>
@@ -288,9 +316,13 @@
 	.bad {
 		color: var(--primary);
 	}
-	td.dim {
+	td.dim,
+	td.nude {
 		font-size: 0.875rem;
 		white-space: nowrap;
+	}
+	td.nude {
+		color: var(--primary);
 	}
 	.end {
 		height: 1px;

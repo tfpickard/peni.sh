@@ -18,6 +18,7 @@ from penish.worker.derive import rebuild_public
 from penish.worker.describe import Described, DescribeError, expand
 from penish.worker.ingest import handle_haiku, handle_ingest
 from penish.worker.jobs import HardError, Job, SoftError
+from penish.worker.nudity import Nudity
 
 DIM = 16
 TAGS = ["moss", "lamp", "chair", "window", "dust", "evening"]
@@ -43,11 +44,20 @@ class FakeDescriber:
         self.caption = caption
         self.fail = fail
         self.calls: list[set[str]] = []
+        self.told: list[tuple[str, ...]] = []
 
     async def __call__(
-        self, image_bytes: bytes, mime: str, *, want: set[str], settings: Settings, pool: Any
+        self,
+        image_bytes: bytes,
+        mime: str,
+        *,
+        want: set[str],
+        settings: Settings,
+        pool: Any,
+        nudity: Any = (),
     ) -> Described:
         self.calls.append(set(want))
+        self.told.append(tuple(nudity))
         assert image_bytes and mime.startswith("image/")
         if self.fail is not None:
             raise self.fail
@@ -96,8 +106,31 @@ def drop(settings: Settings, stem: str, image: bytes, ext: str = "png", **sideca
     )
 
 
+class FakeDetector:
+    """Clean unless given kinds; records what it was shown and what describe was told."""
+
+    def __init__(self, kinds: tuple[str, ...] = (), fail: Exception | None = None) -> None:
+        self.kinds = kinds
+        self.fail = fail
+        self.calls = 0
+
+    async def __call__(
+        self, image_bytes: bytes, mime: str, *, settings: Settings, pool: Any
+    ) -> Nudity:
+        self.calls += 1
+        assert image_bytes and mime.startswith("image/")
+        if self.fail is not None:
+            raise self.fail
+        return Nudity(kinds=self.kinds, seen="nothing" if not self.kinds else "a nude", model="d1")
+
+
 async def run(
-    job: Job, p: Any, settings: Settings, describer: Any = None, embedder: Any = None
+    job: Job,
+    p: Any,
+    settings: Settings,
+    describer: Any = None,
+    embedder: Any = None,
+    detector: Any = None,
 ) -> None:
     await handle_ingest(
         job,
@@ -105,6 +138,7 @@ async def run(
         settings=settings,
         embedder=embedder or FakeEmbedder(),
         describer=describer or FakeDescriber(),
+        detector=detector or FakeDetector(),
     )
 
 
@@ -457,7 +491,9 @@ async def test_haiku_job(p: Any, settings: Settings) -> None:
     img = await image(p)
     seen: list[str] = []
 
-    async def writer(description: str, *, settings: Settings, pool: Any) -> tuple[str, str, str]:
+    async def writer(
+        description: str, *, settings: Settings, pool: Any, nudity: Any = ()
+    ) -> tuple[str, str, str]:
         seen.append(description)
         return "moss holds the lamp", "brass remembers nothing", "evening, still"
 
@@ -468,7 +504,9 @@ async def test_haiku_job(p: Any, settings: Settings) -> None:
     assert rows == [{"l1": "moss holds the lamp", "source": "model", "image_id": img["id"]}]
     assert seen[0] == DESCRIPTION
 
-    async def flaky(description: str, *, settings: Settings, pool: Any) -> tuple[str, str, str]:
+    async def flaky(
+        description: str, *, settings: Settings, pool: Any, nudity: Any = ()
+    ) -> tuple[str, str, str]:
         raise DescribeError("overloaded", retryable=True)
 
     with pytest.raises(SoftError):

@@ -68,7 +68,9 @@
 
 	const label = (t: pics.Text | null) => (!t ? '' : t.source === 'owner' ? 'owner' : (t.model ?? t.source));
 	const tagSource = $derived.by(() => {
-		const s = new Set((d?.tags ?? []).map((t) => (t.source === 'owner' ? 'owner' : (t.model ?? t.source))));
+		const s = new Set(
+			(d?.tags ?? []).map((t) => (t.source === 'model' ? (t.model ?? t.source) : t.source))
+		);
 		return [...s].join(' ');
 	});
 
@@ -87,6 +89,10 @@
 		return act(() => pics.patch(id, { [f]: v }));
 	}
 	const regen = (...f: pics.Regen[]) => act(() => pics.regen(id, f));
+	const detect = () => act(() => pics.bulk('nudity', [id]));
+	const nudity = $derived(
+		!d?.nudity ? 'unchecked' : d.nudity.kinds.length ? d.nudity.kinds.join(', ') : 'none'
+	);
 	const flip = () => act(() => (unpublished ? pics.republish(id) : pics.unpublish(id)));
 
 	async function applyCrop(r: pics.Rect | null) {
@@ -209,6 +215,15 @@
 				<button disabled={!dirty('slug')} onclick={() => save('slug')}>save</button>
 			</div>
 
+			<div class="nude">
+				<span class="l">nudity <span class="dim">{d.nudity?.model ?? ''}</span></span>
+				<p class="nudity">{nudity}</p>
+				{#if d.nudity?.seen}<p class="dim nudity">{d.nudity.seen}</p>{/if}
+			</div>
+			<div class="row">
+				<button onclick={detect}>detect nudity</button>
+			</div>
+
 			<div class="row all">
 				<button onclick={() => regen('caption', 'description', 'analysis', 'tags')}>regenerate all</button>
 				<button onclick={() => regen('haiku')}>regenerate haiku</button>
@@ -322,6 +337,12 @@
 		font: inherit;
 		padding: 0.4rem 0;
 		resize: vertical;
+	}
+	.nude {
+		margin-top: 0.75rem;
+	}
+	p.nudity {
+		margin: 0.25rem 0 0;
 	}
 	.row {
 		display: flex;

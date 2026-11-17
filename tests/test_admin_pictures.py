@@ -173,6 +173,7 @@ async def test_list_sorts_filters_and_pages(client: httpx.AsyncClient, clean_db:
         "thumb": f"/media/pub/{sha(1)}-200.webp",
         "caption": "first",
         "net": 1,
+        "nudity": None,
         "created_at": (BASE + timedelta(minutes=1)).isoformat(),
     }
     assert ids((await client.get(URL, params={"sort": "old"})).json()) == [a, b, c, d]

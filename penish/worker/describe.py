@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -379,9 +380,11 @@ async def describe(
     pool: Pool | None = None,
     get: Getter | None = None,
     client: Any = None,
+    nudity: Sequence[str] | None = None,
 ) -> Described:
     """`get` overrides the runtime lookup (tests); otherwise `pool` supplies it, and usage
-    is recorded whenever a pool is given."""
+    is recorded whenever a pool is given. `nudity` is the detector's kinds, which the
+    prompt writes for differently."""
     want = expand(want)
     if not want or not want <= set(_FIELDS):
         raise ValueError(f"want must be a non-empty subset of {_FIELDS}")
@@ -395,6 +398,9 @@ async def describe(
     record = runtime.usage_recorder(pool, "describe")
 
     keys = [k for k in _FIELDS if k in want]
+    ask = f"Return only these keys: {', '.join(keys)}."
+    if nudity:
+        ask = f"Nudity in this picture: {', '.join(nudity)}.\n\n{ask}"
     # temperature is not accepted for claude-sonnet-5-5 (the SDK no longer exposes
     # it), so determinism comes from the fixed analysis structure instead.
     kwargs: dict[str, Any] = {
@@ -415,7 +421,7 @@ async def describe(
                             "data": base64.b64encode(image_bytes).decode(),
                         },
                     },
-                    {"type": "text", "text": f"Return only these keys: {', '.join(keys)}."},
+                    {"type": "text", "text": ask},
                 ],
             }
         ],

@@ -153,11 +153,18 @@ async def handle_categorize(
         )
         if await cur.fetchone():
             return
-        await conn.execute("delete from image_categories where image_id = %s", (image_id,))
+        # The detector's erotica row stays: it is the detector's to take back.
+        await conn.execute(
+            "delete from image_categories where image_id = %s and source <> 'detect'",
+            (image_id,),
+        )
+        # A category both chose becomes the classifier's, so a clean nudity rerun does
+        # not remove what the classifier filed on its own.
         await conn.execute(
             """
             insert into image_categories (image_id, category, source, model)
             select %s, c, 'model', %s from unnest(%s::text[]) c
+            on conflict (image_id, category) do update set source = 'model', model = excluded.model
             """,
             (image_id, model, cats),
         )
@@ -174,7 +181,8 @@ async def enqueue_uncategorized(pool: Pool) -> int:
             select 'categorize', jsonb_build_object('image_id', i.id), 'categorize:' || i.id
               from images i
              where i.status = 'live'
-               and not exists (select 1 from image_categories c where c.image_id = i.id)
+               and not exists (select 1 from image_categories c
+                                where c.image_id = i.id and c.source <> 'detect')
              order by i.id
             on conflict do nothing
             """

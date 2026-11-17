@@ -7,8 +7,11 @@ export type Item = {
 	thumb: string | null;
 	caption: string | null;
 	net: number;
+	// The detector's kinds: null never checked, empty clean.
+	nudity: string[] | null;
 	created_at: string;
 };
+export type Nudity = { kinds: string[]; seen: string; model: string; checked_at: string };
 export type Page = { items: Item[]; next_cursor: string | null };
 export type Field = 'caption' | 'description' | 'analysis' | 'prompt' | 'tags' | 'slug';
 export type Regen = 'caption' | 'description' | 'analysis' | 'tags' | 'haiku' | 'embedding';
@@ -39,6 +42,7 @@ export type Detail = {
 	crop: Rect | null;
 	votes: { up: number; down: number; net: number };
 	comments: { pending: number; approved: number; rejected: number };
+	nudity: Nudity | null;
 	jobs: Job[];
 	// Unpublished only: the URLs Cloudflare may still hold, to purge by hand.
 	purge: string[] | null;
@@ -67,12 +71,19 @@ export class HttpError extends Error {
 	}
 }
 
-export type Query = { q: string; status: string; sort: string; cursor: string | null };
+export type Query = {
+	q: string;
+	status: string;
+	nudity: string;
+	sort: string;
+	cursor: string | null;
+};
 
 export function list(p: Query): Promise<Page> {
 	const q = new URLSearchParams();
 	if (p.q) q.set('q', p.q);
 	if (p.status) q.set('status', p.status);
+	if (p.nudity) q.set('nudity', p.nudity);
 	if (p.sort) q.set('sort', p.sort);
 	if (p.cursor) q.set('cursor', p.cursor);
 	return call<Page>(`?${q}`);
@@ -96,6 +107,7 @@ export async function detail(id: string | number): Promise<Detail> {
 		crop: null,
 		votes: { up: 0, down: 0, net: 0 },
 		comments: { pending: 0, approved: 0, rejected: 0 },
+		nudity: null,
 		jobs: [],
 		purge: null,
 		...d
@@ -117,12 +129,16 @@ export const republish = (id: number) => call<unknown>(`/${id}/republish`, { met
 
 export const remove = (id: number) => call<unknown>(`/${id}`, { method: 'DELETE' });
 
-export type BulkAction = 'delete' | 'redescribe' | 'retag' | 'rehaiku' | 'reembed';
+export type BulkAction = 'delete' | 'redescribe' | 'retag' | 'rehaiku' | 'reembed' | 'nudity';
 export type BulkResult = { action: BulkAction; done: number[]; queued?: number[] };
 // The server takes at most this many ids per request.
 export const BULK_MAX = 500;
 export const bulk = (action: BulkAction, ids: number[]) =>
 	call<BulkResult>('/bulk', { method: 'POST', body: JSON.stringify({ action, ids }) });
+
+// Every live and unpublished picture, checked again.
+export const nudityAll = () =>
+	call<{ job_id: number | null; queued: boolean }>('/nudity', { method: 'POST' });
 
 export const originalUrl = (id: number) => `/api/admin/pictures/${id}/original`;
 
