@@ -402,3 +402,110 @@ async def test_admin_bulk_all_list_and_detail(client: httpx.AsyncClient, clean_d
     got = (await client.get(f"{URL}/{a}")).json()["nudity"]
     assert got["kinds"] == ["topless"] and got["seen"] == "a bare chest" and got["checked_at"]
     assert (await client.get(f"{URL}/{c}")).json()["nudity"] is None
+
+
+# -- the owner's verdict ------------------------------------------------------
+
+
+async def nude_source(p: Any, image_id: int) -> tuple[list[str], str, str | None]:
+    r = (await q(p, "select kinds, source, model from image_nudity where image_id = %s", image_id))[
+        0
+    ]
+    return r["kinds"], r["source"], r["model"]
+
+
+async def test_owner_verdict_stands_until_asked_back(p: Any, settings: Settings) -> None:
+    image_id = await live(p, settings)
+    await rerun(p, settings, image_id, ("fully-nude",))
+    assert await cats(p, image_id) == [("erotica", "detect")]
+
+    # Overruled: not nude. The detector's model is kept as a record.
+    async with p.connection() as conn:
+        await nudity.set_owner(conn, image_id, [])
+    assert await nude_source(p, image_id) == ([], "owner", "d2")
+    assert await cats(p, image_id) == []
+    assert not [t for t, s in await tag_rows(p, image_id) if s == "detect"]
+
+    # A plain run neither asks the detector nor writes.
+    calls: list[int] = []
+
+    async def counting(data: bytes, mime: str, **kw: Any) -> Nudity:
+        calls.append(1)
+        return Nudity(kinds=("topless",), seen="x", model="d3")
+
+    j = job(nudity.JOB, {"image_id": image_id})
+    await nudity.handle_nudity(j, pool=p, settings=settings, detector=counting)
+    assert calls == [] and (await nude_source(p, image_id))[1] == "owner"
+
+    # Nor does one that started before the owner saved.
+    async with p.connection() as conn:
+        assert not await nudity.store(conn, image_id, Nudity(("topless",), "x", "d3"))
+
+    # The owner can also say yes, with kinds of their own choosing.
+    async with p.connection() as conn:
+        await nudity.set_owner(conn, image_id, ["sex-act", "topless"])
+    assert (await nude_source(p, image_id))[0] == ["topless", "sex-act"]
+    assert {t for t, s in await tag_rows(p, image_id) if s == "detect"} == {
+        "nudity",
+        "topless",
+        "sex-act",
+    }
+    assert await cats(p, image_id) == [("erotica", "detect")]
+    async with p.connection() as conn:
+        with pytest.raises(ValueError):
+            await nudity.set_owner(conn, image_id, ["cleavage"])
+
+    # Handed back by a forced run.
+    forced = job(nudity.JOB, {"image_id": image_id, "force_owner": True})
+    await nudity.handle_nudity(forced, pool=p, settings=settings, detector=counting)
+    assert calls == [1]
+    assert await nude_source(p, image_id) == (["topless"], "model", "d3")
+
+
+async def test_batches_skip_owner_verdicts(p: Any, settings: Settings) -> None:
+    a = await live(p, settings, seed=1)
+    b = await live(p, settings, seed=2)
+    async with p.connection() as conn:
+        await conn.execute("delete from jobs")
+        await nudity.set_owner(conn, a, [])
+        assert await nudity.enqueue_for(conn, [a, b]) == [b]
+        assert await nudity.enqueue_for(conn, [a], force=True) == [a]
+        # A forced job is its own key, so it does not fold into the queued plain one.
+        assert await nudity.enqueue_for(conn, [b], force=True) == [b]
+    rows = await q(p, "select payload, dedupe_key from jobs order by id")
+    assert [r["dedupe_key"] for r in rows] == [
+        f"nudity:{b}",
+        f"nudity:{a}:owner",
+        f"nudity:{b}:owner",
+    ]
+    assert rows[1]["payload"] == {"image_id": a, "force_owner": True}
+
+
+async def test_admin_override(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, caption="a")
+    sql(
+        clean_db,
+        "insert into image_nudity (image_id, kinds, seen, model) values"
+        " (%s, '{fully-nude}', 'a bare figure, hands over the lap', 'd')",
+        a,
+    )
+    r = await client.put(f"{URL}/{a}/nudity", headers=XHR, json={"kinds": []})
+    assert r.status_code == 200
+    got = r.json()
+    assert got["nudity"]["kinds"] == [] and got["nudity"]["source"] == "owner"
+    assert got["nudity"]["seen"] == "a bare figure, hands over the lap"
+    assert got["nudity_kinds"] == list(KIND_NAMES)
+    assert (await client.get(URL, params={"nudity": "clean"})).json()["items"][0]["id"] == a
+
+    bad = await client.put(f"{URL}/{a}/nudity", headers=XHR, json={"kinds": ["cleavage"]})
+    assert bad.status_code == 422
+    missing = await client.put(f"{URL}/999999/nudity", headers=XHR, json={"kinds": []})
+    assert missing.status_code == 404
+
+    # The bulk action leaves it; the picture's own button hands it back.
+    r = await client.post(f"{URL}/bulk", headers=XHR, json={"action": "nudity", "ids": [a]})
+    assert r.json()["queued"] == []
+    assert (await client.post(f"{URL}/{a}/nudity", headers=XHR)).json() == {"queued": True}
+    assert sql(clean_db, "select payload from jobs where type = 'nudity'") == [
+        ({"image_id": a, "force_owner": True},)
+    ]

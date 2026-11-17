@@ -44,7 +44,10 @@ KINDS: tuple[tuple[str, str], ...] = (
     ("topless", "bare female breasts or nipples"),
     ("bare-buttocks", "bare buttocks"),
     ("full-frontal", "bare genitals or pubic area"),
-    ("fully-nude", "a figure wearing nothing at all, whatever it turns toward the viewer"),
+    (
+        "fully-nude",
+        "a figure wearing nothing at all, with breasts, buttocks or genitals left visible",
+    ),
     ("sex-act", "sexual activity between bare figures"),
 )
 KIND_NAMES: tuple[str, ...] = tuple(k for k, _ in KINDS)
@@ -158,50 +161,87 @@ async def kinds_for(conn: Conn, image_id: int) -> tuple[str, ...] | None:
     return None if row is None else tuple(row["kinds"])
 
 
-async def store(conn: Conn, image_id: int, n: Nudity) -> None:
-    """Record a result and apply it. Rows an earlier result added go first, so a clean
-    result takes them back and a changed one replaces them."""
+async def _apply(conn: Conn, image_id: int, kinds: Sequence[str], model: str | None) -> None:
+    """Rows an earlier result added go first, so a clean result takes them back and a
+    changed one replaces them."""
+    await conn.execute("delete from tags where image_id = %s and source = %s", (image_id, SOURCE))
+    await conn.execute(
+        "delete from image_categories where image_id = %s and source = %s",
+        (image_id, SOURCE),
+    )
+    if not kinds:
+        return
+    # A tag the describer or the owner already gave stays theirs.
+    await conn.execute(
+        """
+        insert into tags (image_id, tag, source, model)
+        select %s, t, %s, %s from unnest(%s::text[]) t
+        on conflict do nothing
+        """,
+        (image_id, SOURCE, model, [TAG, *kinds]),
+    )
+    # Categories the owner chose are left as they are. Erotica sits beside the medium
+    # rather than displacing it, so a clean result loses nothing by removing it.
+    await conn.execute(
+        """
+        insert into image_categories (image_id, category, source, model)
+        select %(id)s, %(cat)s, %(src)s, %(m)s
+         where not exists (select 1 from image_categories
+                            where image_id = %(id)s and source = 'owner')
+        on conflict do nothing
+        """,
+        {"id": image_id, "cat": CATEGORY, "src": SOURCE, "m": model},
+    )
+
+
+async def store(conn: Conn, image_id: int, n: Nudity, *, force: bool = False) -> bool:
+    """Record a detector result and apply it. False, and nothing written, when the owner
+    has overruled the detector on this picture and `force` does not hand it back."""
     async with conn.transaction():
+        # Locked, so an owner choice saved while the detector ran is seen here.
+        cur = await conn.execute(
+            "select source from image_nudity where image_id = %s for update", (image_id,)
+        )
+        prev = await cur.fetchone()
+        if prev is not None and prev["source"] == "owner" and not force:
+            return False
         await conn.execute(
             """
-            insert into image_nudity (image_id, kinds, seen, model, checked_at)
-            values (%s, %s, %s, %s, now())
+            insert into image_nudity (image_id, kinds, seen, model, source, checked_at)
+            values (%s, %s, %s, %s, 'model', now())
             on conflict (image_id) do update set
               kinds = excluded.kinds, seen = excluded.seen, model = excluded.model,
-              checked_at = now()
+              source = 'model', checked_at = now()
             """,
             (image_id, list(n.kinds), n.seen, n.model),
         )
-        await conn.execute(
-            "delete from tags where image_id = %s and source = %s", (image_id, SOURCE)
-        )
-        await conn.execute(
-            "delete from image_categories where image_id = %s and source = %s",
-            (image_id, SOURCE),
-        )
-        if not n.nude:
-            return
-        # A tag the describer or the owner already gave stays theirs.
-        await conn.execute(
-            """
-            insert into tags (image_id, tag, source, model)
-            select %s, t, %s, %s from unnest(%s::text[]) t
-            on conflict do nothing
-            """,
-            (image_id, SOURCE, n.model, n.tags),
-        )
-        # Categories the owner chose are left as they are. Erotica sits beside the
-        # medium rather than displacing it, so a clean rerun loses nothing by removing it.
+        await _apply(conn, image_id, n.kinds, n.model)
+    return True
+
+
+def owner_kinds(raw: Sequence[str]) -> tuple[str, ...]:
+    """The owner's choice in the fixed order; ValueError for a kind that does not exist."""
+    unknown = set(raw) - set(KIND_NAMES)
+    if unknown:
+        raise ValueError(f"unknown kinds: {', '.join(sorted(unknown))}")
+    return tuple(k for k in KIND_NAMES if k in raw)
+
+
+async def set_owner(conn: Conn, image_id: int, kinds: Sequence[str]) -> None:
+    """The owner's verdict, empty for not nude. It stands until the owner asks the detector
+    again. The detector's model and note stay, as a record of what it thought."""
+    kinds = owner_kinds(kinds)
+    async with conn.transaction():
         await conn.execute(
             """
-            insert into image_categories (image_id, category, source, model)
-            select %(id)s, %(cat)s, %(src)s, %(m)s
-             where not exists (select 1 from image_categories
-                                where image_id = %(id)s and source = 'owner')
-            on conflict do nothing
+            insert into image_nudity (image_id, kinds, seen, model, source, checked_at)
+            values (%s, %s, '', null, 'owner', now())
+            on conflict (image_id) do update set
+              kinds = excluded.kinds, source = 'owner', checked_at = now()
             """,
-            {"id": image_id, "cat": CATEGORY, "src": SOURCE, "m": n.model},
+            (image_id, list(kinds)),
         )
+        await _apply(conn, image_id, kinds, None)
 
 
 # -- jobs ---------------------------------------------------------------------
@@ -215,11 +255,22 @@ async def handle_nudity(job: Job, *, pool: Pool, settings: Settings, detector: A
         image_id = int(job.payload["image_id"])
     except (KeyError, TypeError, ValueError) as e:
         raise HardError(f"bad nudity payload: {e}") from e
+    force = bool(job.payload.get("force_owner"))
     async with pool.connection() as conn:
-        cur = await conn.execute("select sha256, crop from images where id = %s", (image_id,))
+        cur = await conn.execute(
+            """
+            select i.sha256, i.crop,
+                   exists (select 1 from image_nudity n
+                            where n.image_id = i.id and n.source = 'owner') as owned
+              from images i where i.id = %s
+            """,
+            (image_id,),
+        )
         row = await cur.fetchone()
     if row is None:
         log.info("nudity: image %s is gone; skipping", image_id)
+        return
+    if row["owned"] and not force:
         return
     orig = find_original(settings.media_orig, row["sha256"])
     if orig is None:
@@ -237,22 +288,43 @@ async def handle_nudity(job: Job, *, pool: Pool, settings: Settings, detector: A
         cur = await conn.execute("select 1 from images where id = %s", (image_id,))
         if await cur.fetchone() is None:
             return
-        await store(conn, image_id, found)
+        if not await store(conn, image_id, found, force=force):
+            log.info("nudity: image %s was set by the owner meanwhile; kept", image_id)
+            return
     log.info("nudity: image %s is %s", image_id, ", ".join(found.kinds) or "clean")
 
 
-async def enqueue_for(conn: Conn, ids: Sequence[int]) -> list[int]:
-    """One job per picture; the ids that got a new one (a queued job absorbs a repeat)."""
+async def enqueue_for(conn: Conn, ids: Sequence[int], *, force: bool = False) -> list[int]:
+    """One job per picture; the ids that got a new one (a queued job absorbs a repeat).
+
+    Pictures the owner has ruled on are left out unless `force` hands them back, which
+    only the picture page does: one click across a selection should not undo them."""
+    payload = (
+        "jsonb_build_object('image_id', i.id, 'force_owner', true)"
+        if force
+        else ("jsonb_build_object('image_id', i.id)")
+    )
+    owned = (
+        ""
+        if force
+        else (
+            " and not exists (select 1 from image_nudity n"
+            " where n.image_id = i.id and n.source = 'owner')"
+        )
+    )
+    # Separate key space, as regen has: a forced check must not fold into a queued plain
+    # one that would skip the owner's row.
+    suffix = " || ':owner'" if force else ""
     cur = await conn.execute(
-        """
+        f"""
         insert into jobs (type, payload, dedupe_key)
-        select %(job)s, jsonb_build_object('image_id', i.id), %(job)s || ':' || i.id
+        select %(job)s, {payload}, %(job)s || ':' || i.id{suffix}
           from images i
-         where i.id = any(%(ids)s)
+         where i.id = any(%(ids)s){owned}
          order by i.id
         on conflict do nothing
         returning (payload->>'image_id')::bigint as id
-        """,
+        """.encode(),  # noqa: S608 -- only fixed literals from this function
         {"job": JOB, "ids": list(ids)},
     )
     return [int(r["id"]) for r in await cur.fetchall()]
