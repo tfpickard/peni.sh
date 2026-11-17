@@ -54,16 +54,25 @@ class Redescriber:
     def __init__(self, fail: Exception | None = None) -> None:
         self.calls: list[set[str]] = []
         self.sizes: list[tuple[int, int]] = []
+        self.told: list[tuple[str, ...]] = []
         self.fail = fail
 
     async def __call__(
-        self, image_bytes: bytes, mime: str, *, want: set[str], settings: Settings, pool: Any
+        self,
+        image_bytes: bytes,
+        mime: str,
+        *,
+        want: set[str],
+        settings: Settings,
+        pool: Any,
+        nudity: Any = (),
     ) -> Described:
         import pyvips
 
         img = pyvips.Image.new_from_buffer(image_bytes, "")
         self.sizes.append((img.width, img.height))
         self.calls.append(set(want))
+        self.told.append(tuple(nudity))
         if self.fail is not None:
             raise self.fail
         want = expand(want)
@@ -76,7 +85,9 @@ class Redescriber:
         )
 
 
-async def writer(description: str, *, settings: Settings, pool: Any) -> tuple[str, str, str]:
+async def writer(
+    description: str, *, settings: Settings, pool: Any, nudity: Any = ()
+) -> tuple[str, str, str]:
     return ("bulb over ferns", "the room keeps its own weather", "nobody asked")
 
 
@@ -494,6 +505,8 @@ async def test_make_handlers(p: Any, settings: Settings) -> None:
             "unpublish",
             "republish",
             "settle_media",
+            "nudity",
+            "nudity_all",
         }
     )
     await handlers["reembed_all"](job("reembed_all", {}))

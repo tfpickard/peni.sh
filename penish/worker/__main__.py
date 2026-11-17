@@ -24,6 +24,7 @@ from penish.worker.heartbeat import run_heartbeat
 from penish.worker.ingest import handle_haiku, handle_ingest
 from penish.worker.jobs import Job
 from penish.worker.name_jobs import run_loop as run_naming
+from penish.worker.nudity import enqueue_unchecked
 from penish.worker.phrase_jobs import enqueue_unphrased
 from penish.worker.watcher import InboxWatcher
 
@@ -102,6 +103,9 @@ async def main() -> None:
         n = await enqueue_uncategorized(pool)
         if n:
             log.info("enqueued %d pictures to categorize", n)
+        n = await enqueue_unchecked(pool)
+        if n:
+            log.info("enqueued %d pictures to check for nudity", n)
         n = await enqueue_unsplit(pool, settings)
         if n:
             log.info("enqueued %d pictures to split into facets", n)

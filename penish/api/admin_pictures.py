@@ -7,7 +7,7 @@ import asyncio
 import contextlib
 import logging
 import re
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -20,7 +20,7 @@ from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for, variants_for_many
 from penish.config import get_settings
 from penish.mycelium import store as mycelium
-from penish.worker import facet_jobs, unpublish
+from penish.worker import facet_jobs, nudity, unpublish
 from penish.worker.admin_jobs import (
     ORIG_TYPES,
     find_original,
@@ -46,6 +46,7 @@ KIND = "description"
 SLUG = re.compile(r"^[a-z0-9-]{1,80}$")
 Status = Literal["queued", "processing", "pending_enrichment", "live", "failed", "unpublished"]
 Sort = Literal["new", "old", "votes", "lonely"]
+NudityFilter = Literal["nude", "clean", "unchecked"]
 _LONELY_K = 5
 
 
@@ -67,7 +68,8 @@ _SELECT = """
     select i.id, i.slug, i.status, i.pub_sha, i.width, i.height, i.created_at,
            (select t.body from image_texts t
              where t.image_id = i.id and t.field = 'caption') as caption,
-           coalesce((select sum(v.value) from votes v where v.image_id = i.id), 0)::int as net
+           coalesce((select sum(v.value) from votes v where v.image_id = i.id), 0)::int as net,
+           (select n.kinds from image_nudity n where n.image_id = i.id) as nudity
 """
 
 # Mean raw distance to the k nearest live images, as the public loneliness metric.
@@ -80,6 +82,12 @@ _LONELY = f"""
           order by d
           limit {_LONELY_K}) nn) as lonely
 """
+
+_NUDITY = {
+    "nude": "exists (select 1 from image_nudity n where n.image_id = i.id and n.kinds <> '{}')",
+    "clean": "exists (select 1 from image_nudity n where n.image_id = i.id and n.kinds = '{}')",
+    "unchecked": "not exists (select 1 from image_nudity n where n.image_id = i.id)",
+}
 
 _ORDER = {
     "new": "i.created_at desc, i.id desc",
@@ -116,16 +124,21 @@ async def list_pictures(
     request: Request,
     q: str = "",
     status: Status | Literal[""] = "",
+    nude: Annotated[NudityFilter | Literal[""], Query(alias="nudity")] = "",
     sort: Sort = "new",
     cursor: str | None = None,
     limit: int = Query(60, ge=1, le=200),
 ) -> dict[str, Any]:
     offset = _offset(cursor)
     params: dict[str, Any] = {"limit": limit + 1, "offset": offset, "kind": KIND}
-    where = ""
+    conds: list[str] = []
     if status:
-        where = "where i.status = %(status)s"
+        conds.append("i.status = %(status)s")
         params["status"] = status
+    if nude:
+        # A fixed literal per value, so nothing from the request reaches the sql text.
+        conds.append(_NUDITY[nude])
+    where = f"where {' and '.join(conds)}" if conds else ""
 
     q = q.strip()
     if q:
@@ -180,6 +193,7 @@ async def list_pictures(
             "thumb": _thumb(r, variants[r["pub_sha"]]),
             "caption": r["caption"],
             "net": r["net"],
+            "nudity": r["nudity"],
             "created_at": _iso(r["created_at"]),
         }
         for r in rows
@@ -231,6 +245,11 @@ async def _detail(request: Request, image_id: int) -> dict[str, Any]:
             (image_id,),
         )
         comments = await cur.fetchone()
+        cur = await conn.execute(
+            "select kinds, seen, model, checked_at from image_nudity where image_id = %s",
+            (image_id,),
+        )
+        nude = await cur.fetchone()
         # Admin jobs carry image_id; ingest jobs only know their dir and stem.
         cur = await conn.execute(
             """
@@ -277,6 +296,7 @@ async def _detail(request: Request, image_id: int) -> dict[str, Any]:
         "aliases": aliases,
         "votes": {"up": votes["up"], "down": votes["down"], "net": votes["up"] - votes["down"]},
         "comments": comments,
+        "nudity": None if nude is None else {**nude, "checked_at": _iso(nude["checked_at"])},
         "jobs": jobs,
         "purge": purge,
         "created_at": _iso(img["created_at"]),
@@ -679,7 +699,7 @@ BULK_MAX = 500
 class BulkBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["delete", "redescribe", "retag", "rehaiku", "reembed"]
+    action: Literal["delete", "redescribe", "retag", "rehaiku", "reembed", "nudity"]
     ids: list[int] = Field(min_length=1, max_length=BULK_MAX)
 
 
@@ -703,6 +723,12 @@ async def bulk(request: Request, body: BulkBody) -> dict[str, Any]:
             # a later delete fails, because the earlier ones are committed.
             await _refresh(pool, live_models)
         return {"action": "delete", "done": done}
+    if body.action == "nudity":
+        async with pool.connection() as conn:
+            cur = await conn.execute("select id from images where id = any(%s)", (ids,))
+            found = {r["id"] for r in await cur.fetchall()}
+            checking = await nudity.enqueue_for(conn, [i for i in ids if i in found])
+        return {"action": "nudity", "done": [i for i in ids if i in found], "queued": checking}
     fields = BULK_REGEN[body.action]
     async with pool.connection() as conn:
         cur = await conn.execute("select id from images where id = any(%s)", (ids,))
@@ -722,6 +748,14 @@ async def bulk(request: Request, body: BulkBody) -> dict[str, Any]:
         if job_id is not None:
             queued.append(image_id)
     return {"action": body.action, "done": [i for i in ids if i in found], "queued": queued}
+
+
+@router.post("/nudity")
+async def nudity_all(request: Request) -> dict[str, Any]:
+    """Check every live and unpublished picture again. One job that fans out, so the
+    request returns at once however large the collection."""
+    job_id = await enqueue(_pool(request), nudity.ALL_JOB, {}, dedupe_key=nudity.ALL_JOB)
+    return {"job_id": job_id, "queued": job_id is not None}
 
 
 # -- original ---------------------------------------------------------------

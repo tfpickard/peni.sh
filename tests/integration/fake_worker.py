@@ -20,12 +20,18 @@ import numpy as np
 import penish.worker.__main__ as worker_main
 from penish.config import Settings, get_settings
 from penish.mycelium.facets import FACETS
-from penish.worker import facet_jobs, ingest
+from penish.worker import facet_jobs, ingest, nudity
 from penish.worker.describe import Described, expand
 
 
 async def fake_describe(
-    image_bytes: bytes, mime: str, *, want: set[str], settings: Settings, pool: Any = None
+    image_bytes: bytes,
+    mime: str,
+    *,
+    want: set[str],
+    settings: Settings,
+    pool: Any = None,
+    nudity: Any = (),
 ) -> Described:
     tag = hashlib.sha256(image_bytes).hexdigest()[:8]
     # The test counts lines here to tell whether the model was consulted at all.
@@ -45,7 +51,7 @@ async def fake_describe(
 
 
 async def fake_haiku(
-    description: str, *, settings: Settings, pool: Any = None
+    description: str, *, settings: Settings, pool: Any = None, nudity: Any = ()
 ) -> tuple[str, str, str]:
     return "one fake line", "another fake line", "a last fake line"
 
@@ -59,6 +65,12 @@ async def fake_extract(
     return facet_jobs.Extracted(
         facets=parts, offers=raw["offers"], needs=raw["needs"], model="fake-extractor", raw=raw
     )
+
+
+async def fake_detect(
+    image_bytes: bytes, mime: str, *, settings: Settings, pool: Any = None
+) -> nudity.Nudity:
+    return nudity.Nudity(kinds=(), seen="nothing", model="fake-detector")
 
 
 class FakeEmbedder:
@@ -80,6 +92,8 @@ def install() -> None:
     ingest.describe = fake_describe  # type: ignore[assignment]
     ingest.handle_ingest.__kwdefaults__["describer"] = fake_describe  # type: ignore[index]
     ingest.handle_haiku.__kwdefaults__["writer"] = fake_haiku  # type: ignore[index]
+    ingest.handle_ingest.__kwdefaults__["detector"] = fake_detect  # type: ignore[index]
+    nudity.handle_nudity.__kwdefaults__["detector"] = fake_detect  # type: ignore[index]
     # The fake analysis has one label only, so splits take the extract recipe instead.
     facet_jobs.handle_split.__kwdefaults__["extractor"] = fake_extract  # type: ignore[index]
     facet_jobs.handle_extract.__kwdefaults__["extractor"] = fake_extract  # type: ignore[index]

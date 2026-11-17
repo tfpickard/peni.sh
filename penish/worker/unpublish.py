@@ -315,7 +315,8 @@ async def _republish_locked(
                     """
                     insert into jobs (type, payload, dedupe_key)
                     select 'categorize', %s, %s
-                     where not exists (select 1 from image_categories where image_id = %s)
+                     where not exists (select 1 from image_categories
+                                        where image_id = %s and source <> 'detect')
                     on conflict do nothing
                     """,
                     (Jsonb({"image_id": image_id}), f"categorize:{image_id}", image_id),

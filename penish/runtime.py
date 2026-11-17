@@ -34,6 +34,7 @@ _PROMPT_FILES = {
     "grow.prompt": "grow_haikus.md",
     "extract.prompt": "mycelium_extract.md",
     "name.prompt": "mycelium_name.md",
+    "nudity.prompt": "nudity.md",
 }
 KEYS = (
     "describe.model",
@@ -48,13 +49,15 @@ KEYS = (
     "extract.prompt",
     "name.model",
     "name.prompt",
+    "nudity.model",
+    "nudity.prompt",
     "mycelium.daily_calls",
     "log.level",
     "log.keep_days",
 )
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
-PURPOSES = ("describe", "haiku", "grow", "extract", "name")
-# The purposes that count against mycelium.daily_calls. Describe, haiku and grow run once
+PURPOSES = ("describe", "haiku", "grow", "extract", "name", "nudity")
+# The purposes that count against mycelium.daily_calls. Describe, haiku, grow and nudity run once
 # per upload or per click; these two run from sweeps and the organism, so they are the
 # ones that could run away.
 CAPPED_PURPOSES = ("extract", "name")
@@ -96,9 +99,9 @@ def default(key: str, settings: Settings | None = None) -> Any:
     """The value a key has when no override row exists."""
     _check_key(key)
     s = settings or get_settings()
-    # Grow, extract and naming are describe-grade work (extract also needs vision), so they
-    # follow describe until someone splits them.
-    if key in ("describe.model", "grow.model", "extract.model", "name.model"):
+    # Grow, extract, naming and nudity are describe-grade work (extract and nudity also need
+    # vision), so they follow describe until someone splits them.
+    if key in ("describe.model", "grow.model", "extract.model", "name.model", "nudity.model"):
         return s.describe_model
     if key == "haiku.model":
         return s.haiku_model

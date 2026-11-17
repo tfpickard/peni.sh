@@ -24,7 +24,7 @@ from penish.config import Settings
 from penish.mycelium import genesis
 from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
-from penish.worker import facet_jobs, name_jobs, phrase_jobs, unpublish
+from penish.worker import facet_jobs, name_jobs, nudity, phrase_jobs, unpublish
 from penish.worker.derive import (
     Public,
     UndecodableImage,
@@ -153,8 +153,12 @@ async def _describe(
         data = await asyncio.to_thread(_describe_input, orig, row["crop"])
     except (UndecodableImage, ValueError) as e:
         raise HardError(f"describe input: {e}") from e
+    async with pool.connection() as conn:
+        kinds = await nudity.kinds_for(conn, row["id"])
     try:
-        return await describer(data, "image/webp", want=want, settings=settings, pool=pool)
+        return await describer(
+            data, "image/webp", want=want, settings=settings, pool=pool, nudity=kinds or ()
+        )
     except DescribeError as e:
         raise _soft_or_hard("describe", e) from e
 
@@ -204,7 +208,10 @@ async def _apply_described(
                 changed = True
         if "tags" in want and d.tags:
             if "tags" in force:
-                await conn.execute("delete from tags where image_id = %s", (image_id,))
+                # The detector's tags are its own to take back, on a clean rerun.
+                await conn.execute(
+                    "delete from tags where image_id = %s and source <> 'detect'", (image_id,)
+                )
             else:
                 await conn.execute(
                     "delete from tags where image_id = %s and source = 'model'", (image_id,)
@@ -275,11 +282,14 @@ async def _embed(pool: Pool, image_id: int, settings: Settings, embedder: Docume
 async def _haiku(pool: Pool, image_id: int, settings: Settings, writer: HaikuWriter) -> None:
     async with pool.connection() as conn:
         texts = await _texts(conn, image_id)
+        kinds = await nudity.kinds_for(conn, image_id)
     if "description" not in texts:
         log.info("regen: image %s has no description; no haiku", image_id)
         return
     try:
-        l1, l2, l3 = await writer(texts["description"]["body"], settings=settings, pool=pool)
+        l1, l2, l3 = await writer(
+            texts["description"]["body"], settings=settings, pool=pool, nudity=kinds or ()
+        )
     except DescribeError as e:
         raise _soft_or_hard("haiku", e) from e
     async with pool.connection() as conn:
@@ -504,6 +514,10 @@ async def handle_crop(
                 await conn.set_autocommit(False)
     if not applied:
         return
+    # The new framing may have cropped nudity in or out. Queued rather than run here, so
+    # a detector outage cannot fail a crop that is already on disk.
+    async with pool.connection() as conn:
+        await nudity.enqueue_for(conn, [image_id])
     # Owner text stays: it was written about the picture, not about its framing.
     await regen(
         pool,
@@ -667,6 +681,20 @@ def _republish_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedde
     return go
 
 
+def _nudity_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await nudity.handle_nudity(job, pool=pool, settings=settings)
+
+    return go
+
+
+def _nudity_all_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await nudity.handle_nudity_all(job, pool=pool)
+
+    return go
+
+
 def _settle_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
     async def go(job: Job) -> None:
         await unpublish.handle_settle(job, pool=pool, settings=settings)
@@ -688,6 +716,8 @@ HANDLERS: dict[str, HandlerFactory] = {
     unpublish.UNPUBLISH: _unpublish_handler,
     unpublish.REPUBLISH: _republish_handler,
     unpublish.SETTLE: _settle_handler,
+    nudity.JOB: _nudity_handler,
+    nudity.ALL_JOB: _nudity_all_handler,
 }
 
 

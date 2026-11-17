@@ -26,7 +26,7 @@ from penish.config import Settings
 from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
 from penish.text import slugify
-from penish.worker import facet_jobs
+from penish.worker import facet_jobs, nudity
 from penish.worker.derive import (
     WIDTHS,
     Decoded,
@@ -42,6 +42,7 @@ from penish.worker.describe import Described, DescribeError, describe
 from penish.worker.haiku import haiku_from
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 from penish.worker.metrics import refresh_corpus_stats, surprise_at_arrival
+from penish.worker.nudity import Detector, detect
 from penish.worker.sidecars import Group, GroupError, parse_group
 
 log = logging.getLogger(__name__)
@@ -259,10 +260,14 @@ async def _apply_owner(conn: Conn, image_id: int, group: Group) -> bool:
     tags = group.values.get("tags")
     if tags:
         async with conn.transaction():
-            await conn.execute("delete from tags where image_id = %s", (image_id,))
+            # The detector's tags stay: they answer a different question than the sidecar.
+            await conn.execute(
+                "delete from tags where image_id = %s and source <> 'detect'", (image_id,)
+            )
             await conn.execute(
                 "insert into tags (image_id, tag, source, model)"
-                " select %s, t, 'owner', null from unnest(%s::text[]) t",
+                " select %s, t, 'owner', null from unnest(%s::text[]) t"
+                " on conflict (image_id, tag) do update set source = 'owner', model = null",
                 (image_id, tags),
             )
     return caption_changed
@@ -271,8 +276,10 @@ async def _apply_owner(conn: Conn, image_id: int, group: Group) -> bool:
 async def _missing(conn: Conn, image_id: int) -> set[str]:
     have = set(await _texts(conn, image_id))
     want = {f for f in ("caption", "description", "analysis") if f not in have}
+    # The detector runs first and tags a nude picture; that is not the describer's tagging.
     cur = await conn.execute(
-        "select exists (select 1 from tags where image_id = %s) as t", (image_id,)
+        "select exists (select 1 from tags where image_id = %s and source <> 'detect') as t",
+        (image_id,),
     )
     row = await cur.fetchone()
     if not (row and row["t"]):
@@ -508,6 +515,7 @@ async def handle_ingest(
     settings: Settings,
     embedder: DocumentEmbedder,
     describer: Describer = describe,
+    detector: Detector = detect,
 ) -> None:
     directory = Path(job.payload["dir"])
     stem = str(job.payload.get("stem") or directory.name)
@@ -539,7 +547,16 @@ async def handle_ingest(
         await conn.execute("select pg_advisory_lock(hashtextextended(%s, 0))", (sha,))
         try:
             await _ingest_locked(
-                conn, pool, group, decoded, data, directory, settings, embedder, describer
+                conn,
+                pool,
+                group,
+                decoded,
+                data,
+                directory,
+                settings,
+                embedder,
+                describer,
+                detector,
             )
         finally:
             with contextlib.suppress(psycopg.Error):
@@ -557,6 +574,7 @@ async def _ingest_locked(
     settings: Settings,
     embedder: DocumentEmbedder,
     describer: Describer,
+    detector: Detector,
 ) -> None:
     sha = decoded.sha256
     row, existed = await _image_row(conn, sha, group.stem)
@@ -595,12 +613,37 @@ async def _ingest_locked(
 
     caption_changed = await _apply_owner(conn, image_id, group)
 
-    want = await _missing(conn, image_id)
-    if want:
+    img_bytes: bytes | None = None
+    kinds = await nudity.kinds_for(conn, image_id)
+    if kinds is None:
+        # Before the describer, which writes nude pictures differently. A re-drop of a
+        # picture already checked keeps its result, as it keeps its text.
         img_bytes = await asyncio.to_thread(_describe_bytes, decoded.image)
         try:
+            found = await detector(img_bytes, "image/webp", settings=settings, pool=pool)
+        except DescribeError as e:
+            if e.retryable:
+                await _set_status(conn, image_id, "pending_enrichment")
+                raise SoftError(f"nudity: {e}") from e
+            # A refusal says the same thing next time; the picture goes up unchecked and
+            # the worker start sweep or the admin can try again.
+            log.warning("ingest: nudity check for image %s failed: %s", image_id, e)
+        else:
+            await nudity.store(conn, image_id, found)
+            kinds = found.kinds
+
+    want = await _missing(conn, image_id)
+    if want:
+        if img_bytes is None:
+            img_bytes = await asyncio.to_thread(_describe_bytes, decoded.image)
+        try:
             described = await describer(
-                img_bytes, "image/webp", want=want, settings=settings, pool=pool
+                img_bytes,
+                "image/webp",
+                want=want,
+                settings=settings,
+                pool=pool,
+                nudity=kinds or (),
             )
         except DescribeError as e:
             if e.retryable:
@@ -664,11 +707,12 @@ async def handle_haiku(
             (image_id,),
         )
         row = await cur.fetchone()
+        kinds = await nudity.kinds_for(conn, image_id)
     if row is None:
         log.info("haiku: image %s has no description (deleted?); skipping", image_id)
         return
     try:
-        l1, l2, l3 = await writer(row["body"], settings=settings, pool=pool)
+        l1, l2, l3 = await writer(row["body"], settings=settings, pool=pool, nudity=kinds or ())
     except DescribeError as e:
         if e.retryable:
             raise SoftError(f"haiku: {e}") from e

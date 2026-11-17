@@ -1,4 +1,5 @@
 import json
+from collections.abc import Sequence
 from typing import Any
 
 import jsonschema
@@ -69,9 +70,11 @@ async def haiku_from(
     get: Getter | None = None,
     client: Any = None,
     examples: list[Haiku] | None = None,
+    nudity: Sequence[str] | None = None,
 ) -> Haiku:
     """`get` overrides the runtime lookup (tests); `pool` supplies it, the examples and
-    usage recording otherwise."""
+    usage recording otherwise. `nudity` is the detector's kinds, which the prompt writes
+    for differently."""
     if client is None:
         client = LazyAnthropic(settings.anthropic_api_key)
     get = get or runtime.getter(pool, settings)
@@ -79,13 +82,16 @@ async def haiku_from(
     template = await get("haiku.prompt")
     if examples is None:
         examples = await load_examples(pool) if pool is not None else []
+    content = description
+    if nudity:
+        content = f"{description}\n\nNudity in this picture: {', '.join(nudity)}."
     kwargs: dict[str, Any] = {
         # The budget covers thinking too: haiku-5-5 thinks by default, and at 300 it spent
         # every token there and returned no text. The drafts share it as well.
         "max_tokens": 4096,
         "system": build_prompt(template, examples),
         "output_config": output_config(_SCHEMA, None),
-        "messages": [{"role": "user", "content": description}],
+        "messages": [{"role": "user", "content": content}],
     }
     record = runtime.usage_recorder(pool, "haiku")
     last: Exception | None = None

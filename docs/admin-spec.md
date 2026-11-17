@@ -53,6 +53,14 @@ A server secret for hashing: `SECRET_KEY` env (required in prod; dev default).
     exist, then regenerates model-sourced description, tags and caption, then embedding
     and stats.
   - `reembed_all`, `redescribe_all` (model-sourced fields only): enqueue per-image work.
+  - `nudity {image_id}`: runs the nudity detector (`penish/worker/nudity.py`) on the
+    displayed pixels and stores the result in `image_nudity`. A positive result adds the
+    kinds plus `nudity` as tags and `erotica` as a category, all with `source='detect'`;
+    a clean result removes the detect rows and nothing else. Owner categories get no
+    erotica. Ingest runs the same detector before describing, so the describer and the
+    haiku writer are told the kinds; a crop queues this job. The worker queues it at
+    start for every live picture never checked.
+  - `nudity_all`: one `nudity` job per live or unpublished picture.
   - `grow_haikus {n}` calls the grow script's core function.
 - Delete is synchronous in the api: row delete (cascades), then remove
   `media/orig/{sha256}.*` and `media/pub/{pub_sha}-*`, then refresh corpus stats.
@@ -79,11 +87,16 @@ A server secret for hashing: `SECRET_KEY` env (required in prod; dev default).
 ## Admin API (cookie auth from penish/api/admin.py, all under /api/admin, no-store)
 
 Pictures:
-- `GET /pictures?q=&status=&sort=new|old|votes|lonely&cursor=` returns
-  `{items:[{id,slug,status,thumb,caption,net,created_at}], next_cursor}`. With `q`,
-  results are ranked by semantic similarity via the worker /embed.
+- `GET /pictures?q=&status=&nudity=nude|clean|unchecked&sort=new|old|votes|lonely&cursor=`
+  returns `{items:[{id,slug,status,thumb,caption,net,nudity,created_at}], next_cursor}`,
+  where `nudity` is the detector's kinds, `[]` for clean and null for never checked.
+  With `q`, results are ranked by semantic similarity via the worker /embed.
 - `GET /pictures/{id}`: full detail, including every text field with source and model,
-  tags, crop, votes, comment counts, and the latest job errors.
+  tags, crop, votes, comment counts, `nudity {kinds,seen,model,checked_at}|null`, and
+  the latest job errors.
+- `POST /pictures/bulk {action, ids[]}`: `delete`, `redescribe`, `retag`, `rehaiku`,
+  `reembed` or `nudity`.
+- `POST /pictures/nudity` enqueues `nudity_all`.
 - `PATCH /pictures/{id}` with any of `caption, description, prompt, tags[], slug`.
   Edits become `source='owner'`. A caption or slug change keeps the old slug as an alias.
   A description change enqueues an embedding regen.
