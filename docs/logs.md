@@ -47,6 +47,12 @@ with whatever partial text came back. A refusal partway through a haiku grow end
 there: the haikus already accepted are inserted, and the job then fails with the summary
 (`accepted n, ..., stopped: model refused (model)`) so it shows in recent errors.
 
+Anthropic calls ask for the server-side fallback (`fallbacks: "default"`), so a request a
+safety classifier declines is rerun on Anthropic's recommended model for that category;
+an `info` line names both models, and usage is booked to the one that answered. A refusal
+that survives that names its category in the error (`model refused (model, category)`).
+A haiku refused as `reasoning_extraction` is asked once more without the drafts field.
+
 ## retention
 
 Runtime key `log.keep_days`, 1 to 365, default 14. The worker prunes hourly (and at

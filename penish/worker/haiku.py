@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -9,6 +10,7 @@ from penish.config import Settings
 from penish.runtime import Getter, Pool
 from penish.text import no_em_dash
 from penish.worker.describe import (
+    DescribeError,
     LazyAnthropic,
     call_text,
     invalid,
@@ -16,6 +18,8 @@ from penish.worker.describe import (
     parse_json,
     rejected,
 )
+
+log = logging.getLogger(__name__)
 
 Haiku = tuple[str, str, str]
 
@@ -30,6 +34,22 @@ _SCHEMA = {
     "required": ["drafts", "lines"],
     "additionalProperties": False,
 }
+# The retry after a reasoning_extraction refusal: the drafts in the reply are what that
+# classifier objects to, so the model is asked for the survivor alone and drafts in its
+# thinking. Only on refusal, because written drafts are the only way to be sure the
+# drafting happens at all on a model whose adaptive thinking may skip it.
+_LINES_ONLY = {
+    "type": "object",
+    "properties": {"lines": _STRINGS},
+    "required": ["lines"],
+    "additionalProperties": False,
+}
+_NO_DRAFTS = (
+    "\n\nThis time the reply holds only `lines`, in the shape"
+    ' {"lines": ["...", "...", "..."]}. Draft and strike before you answer, as above,'
+    " and leave the drafts out of the reply."
+)
+REASONING_EXTRACTION = "reasoning_extraction"
 # What a reply must hold. Looser than _SCHEMA because grow.py validates bare lines here too.
 _REPLY = {"type": "object", "properties": {"lines": _STRINGS}, "required": ["lines"]}
 
@@ -96,10 +116,23 @@ async def haiku_from(
     record = runtime.usage_recorder(pool, "haiku")
     last: Exception | None = None
     text: str | None = None
+    drafting = True
     for attempt in (1, 2):
-        text = await call_text(
-            client, model=model, create_kwargs=kwargs, record=record, purpose="haiku"
-        )
+        try:
+            text = await call_text(
+                client, model=model, create_kwargs=kwargs, record=record, purpose="haiku"
+            )
+        except DescribeError as e:
+            if not (drafting and e.category == REASONING_EXTRACTION and attempt == 1):
+                raise
+            log.warning("haiku: %s refused the drafts; asking for the lines alone", model)
+            drafting = False
+            kwargs = {
+                **kwargs,
+                "system": kwargs["system"] + _NO_DRAFTS,
+                "output_config": output_config(_LINES_ONLY, None),
+            }
+            continue
         try:
             return _validate(text)
         except (ValueError, json.JSONDecodeError, jsonschema.ValidationError) as exc:
