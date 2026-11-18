@@ -36,14 +36,21 @@ RAW_LOG = 8000
 RAW_ERR = 200
 # Stop reasons that mean the reply was cut off, so unparseable JSON is a budget problem.
 OUT_OF_TOKENS = frozenset({"max_tokens", "model_context_window_exceeded"})
+# Server-side fallback: a request a safety classifier declines is rerun on the model
+# Anthropic recommends for that refusal category, inside the same call. "default" on a
+# model without fallbacks runs the request alone, so every Anthropic call can send it.
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 
 class DescribeError(Exception):
-    """`retryable` tells the job loop whether to back off (soft) or fail the job (hard)."""
+    """`retryable` tells the job loop whether to back off (soft) or fail the job (hard).
+    `category` is the refusal category when the model refused, so a caller can tell a
+    request it can rephrase from one it cannot."""
 
-    def __init__(self, message: str, *, retryable: bool) -> None:
+    def __init__(self, message: str, *, retryable: bool, category: str | None = None) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.category = category
 
 
 @dataclass
@@ -168,14 +175,21 @@ class LazyAnthropic:
         self._key = api_key
         self._client: anthropic.AsyncAnthropic | None = None
 
-    @property
-    def messages(self) -> Any:
+    def _get(self) -> anthropic.AsyncAnthropic:
         if self._client is None:
             # Same flat refusal a provider without a key gives; retrying cannot add a key.
             if not self._key:
                 raise DescribeError("no key for anthropic", retryable=False)
             self._client = anthropic.AsyncAnthropic(api_key=self._key)
-        return self._client.messages
+        return self._client
+
+    @property
+    def messages(self) -> Any:
+        return self._get().messages
+
+    @property
+    def beta(self) -> Any:
+        return self._get().beta
 
 
 class Reply(str):
@@ -287,7 +301,13 @@ async def call_text(
             )
         started = time.monotonic()
         try:
-            resp = await client.messages.create(model=model, **create_kwargs)
+            if isinstance(client, LazyAnthropic | anthropic.AsyncAnthropic):
+                resp = await client.beta.messages.create(
+                    model=model, betas=[FALLBACK_BETA], fallbacks="default", **create_kwargs
+                )
+            else:
+                # Other providers and test fakes take the plain call.
+                resp = await client.messages.create(model=model, **create_kwargs)
         except anthropic.APIError as exc:
             log.warning("model call %s %s failed: %s", purpose, model, exc)
             raise map_api_error(exc) from exc
@@ -295,9 +315,13 @@ async def call_text(
             log.warning("model call %s %s failed: %s", purpose, model, exc)
             raise DescribeError(str(exc), retryable=exc.retryable) from exc
         took = time.monotonic() - started
+        # The model that answered: the fallback, when the requested one declined.
+        served = str(getattr(resp, "model", None) or model)
+        if served != model:
+            log.info("model %s declined %s; %s answered", model, purpose, served)
         if record is not None:
             try:
-                await record(model, getattr(resp, "usage", None))
+                await record(served, getattr(resp, "usage", None))
             except Exception:
                 # Accounting must not throw away a response that was already paid for.
                 log.exception("could not record api usage for %s", model)
@@ -330,7 +354,9 @@ async def call_text(
                 text[:RAW_LOG],
                 extra={"stop_reason": stop},
             )
-            raise DescribeError(f"model refused ({model})", retryable=False)
+            # The category in the message too, so the queue page says which kind it was.
+            why = f"{model}, {category}" if category else model
+            raise DescribeError(f"model refused ({why})", retryable=False, category=category)
     return Reply(text, stop_reason=stop, model=model, purpose=purpose, max_tokens=max_tokens)
 
 
