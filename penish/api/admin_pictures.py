@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from penish.api import embed_client
 from penish.api.admin import _gate, require_admin
+from penish.api.admin_collections import for_picture
 from penish.api.media import variants_for, variants_for_many
 from penish.config import get_settings
 from penish.mycelium import store as mycelium
@@ -266,6 +267,7 @@ async def _detail(request: Request, image_id: int) -> dict[str, Any]:
         purge = None
         if img["status"] == "unpublished":
             purge = await _purge(conn, request, img, aliases)
+        collections = await for_picture(conn, image_id)
 
     original = None
     orig = find_original(get_settings().media_orig, img["sha256"])
@@ -301,6 +303,7 @@ async def _detail(request: Request, image_id: int) -> dict[str, Any]:
         "nudity_kinds": list(nudity.KIND_NAMES),
         "jobs": jobs,
         "purge": purge,
+        "collections": collections,
         "created_at": _iso(img["created_at"]),
         "published_at": _iso(img["published_at"]),
     }

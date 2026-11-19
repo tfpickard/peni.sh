@@ -20,6 +20,7 @@ from penish.db import make_pool
 
 MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
 _UP = re.compile(r"--\s*migrate:up(.*?)(?:--\s*migrate:down|\Z)", re.S)
+COLLECTION_SEED = MIGRATIONS / "018_seed_pansophicon.sql"
 
 
 def _apply_migrations(dsn: str) -> None:
@@ -102,6 +103,12 @@ def clean_db(database_url: str) -> str:
         conn.execute("delete from mycelium_state")
         conn.execute("insert into mycelium_state (id, seed) values (1, 1)")
         conn.execute("delete from images")
+        # The seeded collection back exactly as the migration leaves it: a test may
+        # publish it, retitle a book or embed its anchors.
+        conn.execute("delete from collections")
+        m = _UP.search(COLLECTION_SEED.read_text())
+        assert m
+        conn.execute(m.group(1).encode())
     return database_url
 
 

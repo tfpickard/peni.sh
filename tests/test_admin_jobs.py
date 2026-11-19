@@ -507,6 +507,9 @@ async def test_make_handlers(p: Any, settings: Settings) -> None:
             "settle_media",
             "nudity",
             "nudity_all",
+            "collection_file",
+            "collection_anchor",
+            "collection_resort",
         }
     )
     await handlers["reembed_all"](job("reembed_all", {}))

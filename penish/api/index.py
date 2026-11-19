@@ -10,9 +10,11 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from penish.api.haiku_render import Gen, render_haiku_html
 from penish.api.media import variants_for
+from penish.api.routes_collections import published
 from penish.api.routes_galleries import gallery_card, parse_serial
 from penish.api.routes_images import resolve_live
 from penish.api.routes_meta import random_haiku
+from penish.collection.numerals import roman
 from penish.config import get_settings
 
 router = APIRouter()
@@ -146,6 +148,20 @@ async def _gallery_page(request: Request, raw: str) -> HTMLResponse:
     return await render_index(request, "".join(tags), title=card["title"])
 
 
+async def _collection_page(request: Request, slug: str, book: str | None) -> HTMLResponse:
+    """The title only. A collection says nothing about itself, here or anywhere."""
+    async with request.app.state.pool.connection() as conn:
+        c = await published(conn, slug)
+    if c is None:
+        return await render_index(request, status_code=404)
+    if book is None:
+        return await render_index(request, _meta("og:type", "website"), title=c["title"])
+    if not (book.isascii() and book.isdigit()) or not 1 <= int(book) <= c["book_count"]:
+        return await render_index(request, status_code=404)
+    title = f"{c['abbrev']} {roman(int(book))}"
+    return await render_index(request, _meta("og:type", "website"), title=title)
+
+
 # HEAD too: link unfurlers and uptime checks probe with HEAD before GET.
 @router.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
 async def catch_all(path: str, request: Request) -> Response:
@@ -158,6 +174,11 @@ async def catch_all(path: str, request: Request) -> Response:
     # Digits only: anything else under g/ is not an address and falls through.
     if path.startswith("g/") and path[2:].isascii() and path[2:].isdigit():
         return await _gallery_page(request, path[2:])
+
+    if path.startswith("collections/"):
+        parts = path.split("/")[1:]
+        if 1 <= len(parts) <= 2 and parts[0]:
+            return await _collection_page(request, parts[0], parts[1] if len(parts) == 2 else None)
 
     build = get_settings().web_build_dir.resolve()
     if path:

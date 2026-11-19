@@ -9,11 +9,29 @@
 	import Overlap from '../../../lib/components/Overlap.svelte';
 	import { postView } from '../../../lib/api';
 	import { markViewed } from '../../../lib/viewed';
+	import { roman } from '../../../lib/roman';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
 
 	const image = $derived(data.image);
+	// The abbreviation, never the nickname: `ptp iii, leaf 14`, with the latest earlier
+	// place when the leaf has moved, naming the book only when that changed too.
+	const leaf = $derived.by(() => {
+		const l = image?.leaf;
+		if (!l) return null;
+		const abbrev = l.collection.abbrev_latin.toLowerCase();
+		const p = l.previous;
+		return {
+			href: `/collections/${l.collection.slug}/${l.book}`,
+			text: `${abbrev} ${roman(l.book)}, leaf ${l.position}`,
+			was: !p
+				? null
+				: p.book === l.book
+					? `formerly leaf ${p.position}`
+					: `formerly ${abbrev} ${roman(p.book)}, leaf ${p.position}`
+		};
+	});
 	const sizes = '(min-width: 60rem) 57rem, 100vw';
 	const metrics = $derived(
 		image
@@ -278,6 +296,11 @@
 			{/each}
 		</p>
 	{/if}
+	{#if leaf}
+		<p class="leaf">
+			<a href={leaf.href}>{leaf.text}</a>{#if leaf.was}<span class="was">({leaf.was})</span>{/if}
+		</p>
+	{/if}
 	{#if image.tags.length}
 		<p class="tags">
 			{#each image.tags as t (t.tag)}
@@ -375,6 +398,18 @@
 	}
 	.cats a {
 		margin-right: 1rem;
+	}
+	.leaf {
+		margin: 1rem 0 0;
+		font-size: 0.9rem;
+	}
+	.leaf a {
+		color: var(--muted-foreground);
+	}
+	.was {
+		margin-left: 0.5rem;
+		font-size: 0.8rem;
+		color: var(--ink-500);
 	}
 	.tags {
 		margin: 1.5rem 0 0;

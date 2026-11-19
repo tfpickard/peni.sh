@@ -31,10 +31,16 @@ quiet for 10 seconds, then takes it.
 | `x_tags.txt` | tags, one per line |
 | `x_prompt.txt` | prompt |
 | `x_embedding.json` | embedding, if it names the current model and width |
+| `x_collection.txt` | a collection, as `pansophicon`, `pansophicon iii` or `pansophicon iii 14` |
 
 A missing caption, description, analysis or tags are written by a model. A
 missing prompt stays missing. Anything supplied is kept. A model never
 overwrites a field the owner wrote.
+
+A collection line that cannot be read is dropped. The picture is published
+anyway and the line waits in `/admin/queue` as a failed job. Nothing but the
+owner puts a picture in a collection. Where in it the picture goes is decided
+after it is published, unless the line says. `docs/collections.md` has the rest.
 
 A picture that cannot become a picture, or that the model declines, goes to
 `data/failed/<stem>/` with an `.err` file saying why.
@@ -131,7 +137,7 @@ width. Every query filters on both. Changing the model needs no migration.
     tests/           pytest, against a throwaway pgvector container
     scripts/         bootstrap, deploy and backup scripts for the host
     ops/             systemd units, host hardening
-    docs/            ops.md, hardening.md, admin-spec.md, logs.md
+    docs/            ops.md, hardening.md, admin-spec.md, logs.md, collections.md
 
 
 ## ⎔ running it
