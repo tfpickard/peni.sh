@@ -25,6 +25,7 @@ from typing import Any, Literal
 import psycopg
 from psycopg.types.json import Jsonb
 
+from penish.collection import store as collection
 from penish.config import Settings
 from penish.mycelium import facets
 from penish.mycelium import store as mycelium
@@ -321,6 +322,9 @@ async def _republish_locked(
                     """,
                     (Jsonb({"image_id": image_id}), f"categorize:{image_id}", image_id),
                 )
+                # A collection request made while it was down, or one whose filing gave
+                # up waiting for it, is filed now rather than at the next worker start.
+                await conn.execute(collection.ENQUEUE_FOR_IMAGE, (image_id,))
             log.info("image %s republished", image_id)
     return await _spaces(conn, image_id)
 
