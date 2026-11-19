@@ -4,6 +4,8 @@
 	import Picture from '../../../../lib/components/Picture.svelte';
 	import Cropper from '../../../../lib/components/admin/Cropper.svelte';
 	import * as pics from '../../../../lib/admin-pictures';
+	import * as col from '../../../../lib/admin-collections';
+	import { roman } from '../../../../lib/collections';
 
 	let { data } = $props();
 	const id = $derived(data.id);
@@ -58,7 +60,41 @@
 		}
 	}
 
-	onMount(load);
+	// One row per collection: in it or not, and the book and leaf to pin it to.
+	let cols = $state<col.PictureCollection[]>([]);
+	let colDraft = $state<Record<string, { on: boolean; book: string; leaf: string }>>({});
+	async function loadCols() {
+		try {
+			cols = (await col.forPicture(id)).collections;
+			colDraft = Object.fromEntries(
+				cols.map((x) => [x.slug, { on: Boolean(x.leaf || x.request), book: '', leaf: '' }])
+			);
+		} catch {
+			cols = [];
+		}
+	}
+	const colState = (x: col.PictureCollection) =>
+		x.leaf
+			? `${roman(x.leaf.book)}, leaf ${x.leaf.position}${x.leaf.pinned_position ? ', pinned' : x.leaf.pinned_book ? ', pinned to book' : ''}`
+			: x.request
+				? (x.request.error ?? 'waiting')
+				: '';
+	async function saveCol(x: col.PictureCollection) {
+		const dft = colDraft[x.slug];
+		msg = '';
+		try {
+			if (!dft.on) await col.unfile(x.slug, id);
+			else await col.place(x.slug, id, dft.book, dft.leaf);
+		} catch (e) {
+			msg = e instanceof col.CollectionError ? e.message : 'failed';
+		}
+		await Promise.all([loadCols(), load()]);
+	}
+
+	onMount(() => {
+		load();
+		loadCols();
+	});
 
 	const running = $derived(d ? pics.active(d.jobs) : false);
 	const unpublished = $derived(d?.status === 'unpublished');
@@ -254,6 +290,22 @@
 				<button onclick={detect}>detect nudity</button>
 			</div>
 
+			{#each cols as x (x.slug)}
+				{@const dft = colDraft[x.slug]}
+				{#if dft}
+					<div class="row coll">
+						<label class="kind"><input type="checkbox" bind:checked={dft.on} /> {x.slug}</label>
+						<input class="num" placeholder="book" aria-label="book" bind:value={dft.book} disabled={!dft.on} />
+						<input class="num" placeholder="leaf" aria-label="leaf" bind:value={dft.leaf} disabled={!dft.on} />
+						<button
+							disabled={dft.on === Boolean(x.leaf || x.request) && !dft.book.trim() && !dft.leaf.trim()}
+							onclick={() => saveCol(x)}>save</button
+						>
+						<span class="dim" class:bad={Boolean(x.request?.error)}>{colState(x)}</span>
+					</div>
+				{/if}
+			{/each}
+
 			<div class="row all">
 				<button onclick={() => regen('caption', 'description', 'analysis', 'tags')}>regenerate all</button>
 				<button onclick={() => regen('haiku')}>regenerate haiku</button>
@@ -292,6 +344,9 @@
 {/if}
 
 <style>
+	.num {
+		width: 4rem;
+	}
 	.top {
 		margin: 0 0 1.5rem;
 	}

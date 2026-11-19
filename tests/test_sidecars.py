@@ -64,6 +64,7 @@ def test_registry_shape() -> None:
         "_tags",
         "_prompt",
         "_embedding",
+        "_collection",
     }
 
 

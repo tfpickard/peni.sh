@@ -59,6 +59,14 @@ export type ImageDetail = Omit<ImageItem, 'overgrowth'> & {
 	next: string | null;
 	// Galleries it is in now (living, then fading), then the ones it was in.
 	galleries: ImageGallery[];
+	// Where it sits in a published collection, and where it sat before its last move.
+	leaf: Leaf | null;
+};
+export type Leaf = {
+	collection: { slug: string; abbrev: string; abbrev_latin: string };
+	book: number;
+	position: number;
+	previous: { book: number; position: number } | null;
 };
 export type ImageRedirect = { redirect: string };
 
@@ -433,4 +441,49 @@ export const getMap = (f: typeof fetch = fetch) =>
 	f('/api/mycelium').then((r) => {
 		if (!r.ok) throw new ApiError(r.status);
 		return r.json() as Promise<MyceliumMap>;
+	});
+
+// -- collections
+
+export type CollectionHead = {
+	slug: string;
+	title: string;
+	abbrev: string;
+	abbrev_latin: string;
+	book_count: number;
+	leaves_per_book: number;
+};
+export type CollectionCard = CollectionHead & { leaves: number; capacity: number };
+export type LeafTile = Omit<ImageItem, 'overgrowth'> & { position: number };
+export type Collection = CollectionCard & {
+	preamble: string;
+	books: { number: number; title: string | null; leaves: LeafTile[] }[];
+};
+export type Book = {
+	collection: CollectionHead;
+	number: number;
+	title: string | null;
+	// One per leaf of the book, in order; null where no leaf has been found.
+	slots: (LeafTile | null)[];
+};
+
+export const getCollections = (f: typeof fetch = fetch) =>
+	f('/api/collections').then((r) => {
+		if (!r.ok) throw new ApiError(r.status);
+		return r.json() as Promise<{ collections: CollectionCard[] }>;
+	});
+
+// A collection or book that is not there loads as null and the page says `not here`.
+export const getCollection = (slug: string, f: typeof fetch = fetch) =>
+	f(`/api/collections/${encodeURIComponent(slug)}`).then((r) => {
+		if (r.status === 404) return null;
+		if (!r.ok) throw new ApiError(r.status);
+		return r.json() as Promise<Collection>;
+	});
+
+export const getBook = (slug: string, n: string, f: typeof fetch = fetch) =>
+	f(`/api/collections/${encodeURIComponent(slug)}/books/${encodeURIComponent(n)}`).then((r) => {
+		if (r.status === 404 || r.status === 422) return null;
+		if (!r.ok) throw new ApiError(r.status);
+		return r.json() as Promise<Book>;
 	});

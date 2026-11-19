@@ -364,6 +364,15 @@ async def test_no_public_payload_carries_a_phrase(app: Any, clean_db: str) -> No
     found = await needles(clean_db)
 
     slugs = [s for (s,) in sql(clean_db, "select slug from images order by id")]
+    # A published collection with a leaf, so its pages and the picture's leaf line are
+    # crawled with something in them.
+    sql(clean_db, "update collections set published = true")
+    sql(
+        clean_db,
+        "insert into collection_leaves (image_id, collection_id, book_id, position)"
+        " select i.id, b.collection_id, b.id, 14 from images i, collection_books b"
+        " where b.number = 3 order by i.id limit 1",
+    )
     serials = [
         str(s)
         for (s,) in sql(
@@ -373,7 +382,8 @@ async def test_no_public_payload_carries_a_phrase(app: Any, clean_db: str) -> No
     assert str(NEED_SERIAL) in serials and str(DEAD_SERIAL) in serials
     last_event = sql(clean_db, "select max(id) from colony_events")[0][0]
     fill = {
-        "slug": [*slugs, "old-name", "nothing"],
+        "slug": [*slugs, "pansophicon", "old-name", "nothing"],
+        "number": ["1", "3", "8"],
         "serial": [*serials, "0", "99999"],
         "name": [f"{sha(1)}-480.webp", f"{sha(1)}-480.avif", "nothing.webp"],
         "path": [

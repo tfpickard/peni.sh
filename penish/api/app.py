@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from penish import logs
 from penish.api import (
     admin,
+    admin_collections,
     admin_logs,
     admin_mycelium,
     admin_ops,
@@ -13,6 +14,7 @@ from penish.api import (
     attention,
     index,
     media,
+    routes_collections,
     routes_galleries,
     routes_images,
     routes_meta,
@@ -44,6 +46,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_images.router)
     app.include_router(routes_search.router)
     app.include_router(routes_galleries.router)
+    app.include_router(routes_collections.router)
     app.include_router(routes_mycelium.router)
     app.include_router(media.router)
     app.include_router(admin.router)
@@ -51,6 +54,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_pictures.router)
     app.include_router(admin_mycelium.router)
     app.include_router(admin_logs.router)
+    app.include_router(admin_collections.router)
     app.include_router(social.router)
     app.include_router(attention.router)
     app.middleware("http")(admin.no_store)

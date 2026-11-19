@@ -12,7 +12,18 @@
 	let loginMsg = $state('');
 	let pending = $state(0);
 
-	const items = ['pictures', 'comments', 'haikus', 'models', 'mycelium', 'queue', 'stats', 'system', 'logs'];
+	const items = [
+		'pictures',
+		'comments',
+		'haikus',
+		'models',
+		'mycelium',
+		'collections',
+		'queue',
+		'stats',
+		'system',
+		'logs'
+	];
 	const here = $derived(page.url.pathname.split('/')[2] ?? '');
 
 	async function count() {

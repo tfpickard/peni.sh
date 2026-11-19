@@ -31,6 +31,7 @@ quiet for 10 seconds, then takes it.
 | `x_tags.txt` | tags, one per line |
 | `x_prompt.txt` | prompt |
 | `x_embedding.json` | embedding, if it names the current model and width |
+| `x_collection.txt` | one line: `pansophicon`, `pansophicon iii` or `pansophicon iii 14` |
 
 A missing caption, description, analysis or tags are written by a model. A
 missing prompt stays missing. Anything supplied is kept. A model never

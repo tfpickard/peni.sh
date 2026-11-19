@@ -7,6 +7,7 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from penish.api.media import variants_for, variants_for_many
+from penish.api.routes_collections import leaf_for
 from penish.api.social import approved_comments, vote_summary, voter_for
 from penish.categories import LABELS, SLUGS
 from penish.config import get_settings
@@ -357,6 +358,7 @@ async def image_detail(
         prev, nxt = await _adjacent(conn, img)
         hyphae = await hyphae_for(conn, img["id"])
         galleries = await galleries_for_image(conn, img["id"])
+        leaf = await leaf_for(conn, img["id"])
 
     mode: Mode = sim or "auto"
     nb = await neighbors(pool, img["id"], k=_K, mode=mode)
@@ -415,6 +417,7 @@ async def image_detail(
         "dissimilar": strip(nb.dissimilar),
         "hyphae": reaching,
         "galleries": galleries,
+        "leaf": leaf,
         "mode": nb.mode,
         "metrics": {
             "loneliness": metrics.loneliness,

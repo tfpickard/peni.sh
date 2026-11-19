@@ -17,6 +17,12 @@
 	let fields = $state<admin.Fields>({ caption: '', description: '', tags: '', prompt: '' });
 	let busy = $state(false);
 	let over = $state(false);
+	// One checkbox while there is one collection; book and leaf pin the placement.
+	let filing = $state({ on: false, book: '', leaf: '' });
+	const filed = (): Record<string, string> =>
+		filing.on
+			? { collection: 'pansophicon', book: filing.book.trim(), leaf: single ? filing.leaf.trim() : '' }
+			: {};
 
 	const single = $derived(rows.length === 1);
 
@@ -67,7 +73,12 @@
 		for (const row of rows) {
 			try {
 				row.state = 'uploading';
-				const { sha256, stem } = await admin.upload(row.file, text, (f) => (row.progress = f));
+				const { sha256, stem } = await admin.upload(
+					row.file,
+					text,
+					(f) => (row.progress = f),
+					filed()
+				);
 				row.progress = 1;
 				row.state = 'waiting';
 				pending.push(track(row, sha256, stem));
@@ -78,6 +89,7 @@
 		}
 		busy = false;
 		fields = { caption: '', description: '', tags: '', prompt: '' };
+		filing = { on: false, book: '', leaf: '' };
 		await Promise.all(pending);
 		ondone?.();
 	}
@@ -128,6 +140,18 @@
 	></textarea>
 	<textarea placeholder="prompt" rows="3" bind:value={fields.prompt} disabled={!single}></textarea>
 
+	<div class="filing">
+		<label class="check"><input type="checkbox" bind:checked={filing.on} /> pansophicon</label>
+		<input class="num" placeholder="book" aria-label="book" bind:value={filing.book} disabled={!filing.on} />
+		<input
+			class="num"
+			placeholder="leaf"
+			aria-label="leaf"
+			bind:value={filing.leaf}
+			disabled={!filing.on || !single}
+		/>
+	</div>
+
 	<div class="actions">
 		<button disabled={busy || !rows.length}>post</button>
 	</div>
@@ -173,6 +197,23 @@
 	button:disabled {
 		color: var(--ink-500);
 		cursor: default;
+	}
+	.filing {
+		display: flex;
+		align-items: center;
+		gap: 1rem;
+	}
+	.check {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		color: var(--muted-foreground);
+	}
+	.check input {
+		accent-color: var(--primary);
+	}
+	.num {
+		width: 4rem;
 	}
 	.up {
 		padding: 0.75rem;

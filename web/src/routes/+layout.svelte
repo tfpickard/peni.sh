@@ -3,19 +3,26 @@
 	import { page } from '$app/state';
 	import type { LayoutProps } from './$types';
 	import Chicken from '../lib/components/Chicken.svelte';
-	import { getStats, type Stats } from '../lib/api';
+	import { getCollections, getStats, type Stats } from '../lib/api';
 
 	let { children }: LayoutProps = $props();
 
+	// Only once something has been published into one; until then the word is not here.
+	let collections = $state(false);
+	$effect(() => {
+		getCollections().then((c) => (collections = c.collections.length > 0), () => {});
+	});
+
 	// A picture belongs to the grid it was opened from; a tag's, category's or gallery's
 	// pictures to its index. The map is the galleries' own view of the network.
-	const sections = [
+	const sections = $derived([
 		{ label: 'pictures', href: '/', under: ['/i/'] },
 		{ label: 'categories', href: '/categories', under: ['/c/'] },
 		{ label: 'galleries', href: '/galleries', under: ['/g/', '/mycelium'] },
+		...(collections ? [{ label: 'collections', href: '/collections', under: ['/collections/'] }] : []),
 		{ label: 'tags', href: '/tags', under: ['/t/'] },
 		{ label: 'search', href: '/search', under: [] }
-	];
+	]);
 	const here = $derived.by(() => {
 		const p = page.url.pathname;
 		return sections.find((s) => p === s.href || s.under.some((u) => p.startsWith(u)))?.label;
@@ -89,7 +96,7 @@
 	}
 	nav {
 		display: flex;
-		/* Five sections no longer fit beside the mark on a narrow phone. */
+		/* Five or six sections no longer fit beside the mark on a narrow phone. */
 		flex-wrap: wrap;
 		justify-content: flex-end;
 		gap: 0.25rem 1.25rem;

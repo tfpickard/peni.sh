@@ -102,6 +102,12 @@ def clean_db(database_url: str) -> str:
         conn.execute("delete from mycelium_state")
         conn.execute("insert into mycelium_state (id, seed) values (1, 1)")
         conn.execute("delete from images")
+        # Collections back to their seed: the up section of 017 is idempotent, and deleting
+        # the rows first takes every leaf, request and history row with them.
+        conn.execute("delete from collections")
+        m = _UP.search((MIGRATIONS / "017_collections.sql").read_text())
+        assert m
+        conn.execute(m.group(1).encode())
     return database_url
 
 

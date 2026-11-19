@@ -8,6 +8,7 @@
 	import Comments from '../../../lib/components/Comments.svelte';
 	import Overlap from '../../../lib/components/Overlap.svelte';
 	import { postView } from '../../../lib/api';
+	import { leafLine } from '../../../lib/collections';
 	import { markViewed } from '../../../lib/viewed';
 	import type { PageProps } from './$types';
 
@@ -36,6 +37,15 @@
 		});
 	});
 	const title = $derived(image?.caption?.body ? `${image.caption.body} -- peni.sh` : 'peni.sh');
+	const leaf = $derived(image?.leaf ?? null);
+	// The previous place in as few words as tell it apart: the leaf alone within one book.
+	const formerly = $derived.by(() => {
+		const p = leaf?.previous;
+		if (!leaf || !p) return '';
+		return p.book === leaf.book
+			? `leaf ${p.position}`
+			: leafLine(leaf.collection.abbrev_latin, p.book, p.position);
+	});
 	const inNow = $derived(image?.galleries?.filter((g) => g.current) ?? []);
 	const wasIn = $derived(image?.galleries?.filter((g) => !g.current) ?? []);
 
@@ -278,6 +288,13 @@
 			{/each}
 		</p>
 	{/if}
+	{#if leaf}
+		<p class="leaf">
+			<a href="/collections/{leaf.collection.slug}/{leaf.book}"
+				>{leafLine(leaf.collection.abbrev_latin, leaf.book, leaf.position)}</a
+			>{#if formerly}{' '}<span class="formerly">(formerly {formerly})</span>{/if}
+		</p>
+	{/if}
 	{#if image.tags.length}
 		<p class="tags">
 			{#each image.tags as t (t.tag)}
@@ -375,6 +392,17 @@
 	}
 	.cats a {
 		margin-right: 1rem;
+	}
+	.leaf {
+		margin: 0.75rem 0 0;
+		font-size: 0.85rem;
+	}
+	.leaf a {
+		color: var(--muted-foreground);
+	}
+	.formerly {
+		color: var(--ink-500);
+		font-size: 0.75rem;
 	}
 	.tags {
 		margin: 1.5rem 0 0;

@@ -1,6 +1,7 @@
 """Sidecar files that ride along with an inbox image, and grouping them by stem.
 
-A drop is `x.png` plus any of `x_caption.txt`, `x_tags.txt`, ... `x_embedding.json`.
+A drop is `x.png` plus any of `x_caption.txt`, `x_tags.txt`, ... `x_embedding.json`,
+`x_collection.txt`.
 """
 
 from __future__ import annotations
@@ -44,6 +45,12 @@ def _lines(p: Path) -> list[str]:
     return list(dict.fromkeys(t for t in tags if t))
 
 
+def _lenient(p: Path) -> str:
+    # Never raises: a bad collection line must not fail the picture, so it is read as
+    # whatever it is and judged by ingest, which can report it without stopping.
+    return p.read_text(encoding="utf-8", errors="replace").strip()
+
+
 def _embedding(p: Path) -> Embedding:
     # JSON only. A .npy variant would need a second file for model and dim, and
     # nothing produces .npy sidecars yet; add it here if that changes.
@@ -80,6 +87,7 @@ SIDECARS: dict[str, SidecarSpec] = {
     "_tags": SidecarSpec("tags", _lines),
     "_prompt": SidecarSpec("prompt", _text),
     "_embedding": SidecarSpec("embedding", _embedding, ".json"),
+    "_collection": SidecarSpec("collection", _lenient),
 }
 
 
@@ -108,7 +116,8 @@ def stem_of(filename: str) -> tuple[str, str] | tuple[None, None]:
 class Group:
     stem: str
     image: Path
-    # Keyed by SidecarSpec.field: caption, description, analysis, tags, prompt, embedding.
+    # Keyed by SidecarSpec.field: caption, description, analysis, tags, prompt, embedding,
+    # collection.
     values: dict[str, Any] = field(default_factory=dict)
     sidecars: dict[str, Path] = field(default_factory=dict)
     unknown: list[str] = field(default_factory=list)

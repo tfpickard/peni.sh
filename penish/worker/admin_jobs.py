@@ -20,11 +20,12 @@ import psycopg
 import pyvips
 from psycopg.types.json import Jsonb
 
+from penish.collections import store as collection_store
 from penish.config import Settings
 from penish.mycelium import genesis
 from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
-from penish.worker import facet_jobs, name_jobs, nudity, phrase_jobs, unpublish
+from penish.worker import collection_jobs, facet_jobs, name_jobs, nudity, phrase_jobs, unpublish
 from penish.worker.derive import (
     Public,
     UndecodableImage,
@@ -702,6 +703,31 @@ def _settle_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) 
     return go
 
 
+def _collection_file_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await collection_jobs.handle_file(job, pool=pool, settings=settings, embedder=embedder)
+
+    return go
+
+
+def _collection_anchor_handler(
+    pool: Pool, settings: Settings, embedder: DocumentEmbedder
+) -> Handler:
+    async def go(job: Job) -> None:
+        await collection_jobs.handle_anchor(job, pool=pool, settings=settings, embedder=embedder)
+
+    return go
+
+
+def _collection_resort_handler(
+    pool: Pool, settings: Settings, embedder: DocumentEmbedder
+) -> Handler:
+    async def go(job: Job) -> None:
+        await collection_jobs.handle_resort(job, pool=pool, settings=settings, embedder=embedder)
+
+    return go
+
+
 HANDLERS: dict[str, HandlerFactory] = {
     "regen": _regen_handler,
     "crop": _crop_handler,
@@ -718,6 +744,9 @@ HANDLERS: dict[str, HandlerFactory] = {
     unpublish.SETTLE: _settle_handler,
     nudity.JOB: _nudity_handler,
     nudity.ALL_JOB: _nudity_all_handler,
+    collection_store.FILE_JOB: _collection_file_handler,
+    collection_store.ANCHOR_JOB: _collection_anchor_handler,
+    collection_store.RESORT_JOB: _collection_resort_handler,
 }
 
 

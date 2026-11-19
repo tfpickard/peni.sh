@@ -22,6 +22,8 @@ from psycopg import AsyncConnection
 from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
+from penish.collections import parse_spec
+from penish.collections import store as collection_store
 from penish.config import Settings
 from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
@@ -271,6 +273,24 @@ async def _apply_owner(conn: Conn, image_id: int, group: Group) -> bool:
                 (image_id, tags),
             )
     return caption_changed
+
+
+async def _apply_collection(conn: Conn, image_id: int, group: Group) -> None:
+    """Mark the picture for the collection its sidecar names. A line that cannot be read
+    is reported on the queue page and dropped; the picture goes on as if it were absent."""
+    raw = group.values.get("collection")
+    if raw is None:
+        return
+    name = group.sidecars["collection"].name
+    try:
+        want = parse_spec(raw)
+        c = await collection_store.get(conn, slug=want.collection)
+        if c is None:
+            raise ValueError(f"no collection {want.collection!r}")
+        await collection_store.request(conn, c, image_id, want.book, want.position)
+    except ValueError as e:
+        log.warning("ingest: %s ignored: %s", name, e)
+        await collection_store.note_bad_sidecar(conn, image_id, f"{name}: {e}")
 
 
 async def _missing(conn: Conn, image_id: int) -> set[str]:
@@ -612,6 +632,7 @@ async def _ingest_locked(
         )
 
     caption_changed = await _apply_owner(conn, image_id, group)
+    await _apply_collection(conn, image_id, group)
 
     img_bytes: bytes | None = None
     kinds = await nudity.kinds_for(conn, image_id)
@@ -690,6 +711,9 @@ async def _ingest_locked(
         await _reslug(conn, image_id, row["slug"], base)
 
     await refresh_corpus_stats(pool, kind=KIND, model=settings.embed_model)
+    # After publish and the vector, which filing needs. A crash before this line leaves the
+    # request for the worker's start-up sweep.
+    await collection_store.enqueue_for_image(conn, image_id)
     await asyncio.to_thread(shutil.rmtree, directory)
 
 
