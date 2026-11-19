@@ -7,14 +7,16 @@
 
 	let { children }: LayoutProps = $props();
 
-	// Only once something has been published into one; until then the word is not here.
-	let collections = $state(false);
-	$effect(() => {
-		getCollections().then((c) => (collections = c.collections.length > 0), () => {});
-	});
-
 	// A picture belongs to the grid it was opened from; a tag's, category's or gallery's
 	// pictures to its index. The map is the galleries' own view of the network.
+	// collections appears only once one is published; until then the nav is as it was.
+	let collections = $state(false);
+	$effect(() => {
+		getCollections().then(
+			(c) => (collections = c.collections.length > 0),
+			() => {}
+		);
+	});
 	const sections = $derived([
 		{ label: 'pictures', href: '/', under: ['/i/'] },
 		{ label: 'categories', href: '/categories', under: ['/c/'] },
@@ -96,7 +98,7 @@
 	}
 	nav {
 		display: flex;
-		/* Five or six sections no longer fit beside the mark on a narrow phone. */
+		/* The sections no longer fit beside the mark on a narrow phone. */
 		flex-wrap: wrap;
 		justify-content: flex-end;
 		gap: 0.25rem 1.25rem;

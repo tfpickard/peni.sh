@@ -1,7 +1,8 @@
-"""Worker side of collections: filing a requested picture, embedding book anchors, and
-the full re-sort, on demand or weekly when the owner has switched that on.
+"""Collection jobs: filing a requested picture, embedding book anchors, re-sorting, and the
+weekly re-sort for a collection that asks for one.
 
-Membership is never decided here. A filing job only acts on a request the owner made.
+Filing waits on publish rather than a timer: the go-live transaction enqueues it, and the
+worker start sweep re-enqueues any request a crash left without a job.
 """
 
 from __future__ import annotations
@@ -9,129 +10,183 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
+from psycopg.types.json import Jsonb
 
-from penish import runtime
-from penish.collections import store
+from penish.collection import store
+from penish.collection.numerals import parse_line
+from penish.collection.plan import Tuning
 from penish.config import Settings
 from penish.worker.ingest import DocumentEmbedder
-from penish.worker.jobs import HardError, Job, Pool, SoftError, enqueue
+from penish.worker.jobs import HardError, Job, Pool, SoftError
 
 log = logging.getLogger(__name__)
 
 WEEK = timedelta(days=7)
-# How often the weekly loop looks; the re-sort itself is due at most once a week.
-WEEKLY_CHECK_SECONDS = 3600.0
+WEEKLY_CHECK = 3600.0
 
 
-async def embed_anchors(
-    pool: Pool, settings: Settings, embedder: DocumentEmbedder, cid: int | None = None
+def _int(job: Job, key: str) -> int:
+    raw = job.payload.get(key)
+    if isinstance(raw, bool) or not isinstance(raw, int | str):
+        raise HardError(f"bad {job.type} payload: {key}")
+    try:
+        return int(raw)
+    except ValueError:
+        raise HardError(f"bad {job.type} payload: {key}") from None
+
+
+async def ensure_anchors(
+    pool: Pool, collection_id: int, settings: Settings, embedder: DocumentEmbedder
 ) -> int:
-    """Embed every anchor whose text has no vector under the current model."""
+    """Embed every anchor that has no vector under the current model. Returns how many."""
     async with pool.connection() as conn:
-        stale = await store.stale_anchors(conn, settings, cid)
+        stale = await store.stale_anchors(conn, collection_id, settings)
     if not stale:
         return 0
     out = await embedder.embed_documents([r["anchor_text"] for r in stale])
+    vecs = np.asarray(out, dtype=np.float32)
+    if vecs.shape != (len(stale), settings.embed_dim):
+        raise HardError(f"anchor embeddings have shape {vecs.shape}")
+    n = 0
     async with pool.connection() as conn:
-        for r, v in zip(stale, out, strict=True):
-            vec = np.asarray(v, dtype=np.float32)
-            if vec.shape != (settings.embed_dim,):
-                raise HardError(f"anchor embedding has shape {vec.shape}")
-            await store.store_anchor(
-                conn, int(r["id"]), r["anchor_text"], vec, settings.embed_model
-            )
-    log.info("embedded %d collection anchors", len(stale))
-    return len(stale)
+        for r, v in zip(stale, vecs, strict=True):
+            if await store.store_anchor(
+                conn, collection_id, r["number"], r["anchor_text"], v, settings
+            ):
+                n += 1
+    return n
 
 
 async def handle_file(
     job: Job, *, pool: Pool, settings: Settings, embedder: DocumentEmbedder
 ) -> None:
-    # The marker a malformed sidecar leaves: already failed, and a retry says the same.
-    if job.payload.get("error"):
-        raise HardError(str(job.payload["error"]))
-    image_id = int(job.payload["image_id"])
-    cid = int(job.payload["collection_id"])
-    async with pool.connection() as conn:
-        c = await store.get(conn, cid=cid)
-    if c is None:
-        log.info("collection %s is gone; nothing to file", cid)
-        return
-    # Before filing: an empty book with no anchor vector cannot be scored at all.
-    await embed_anchors(pool, settings, embedder, cid)
-    p = await store.load_params(pool, settings)
-    try:
-        async with pool.connection() as conn, conn.transaction():
-            await store.file_one(conn, c, image_id, settings, p)
-    except store.NotReady as e:
-        raise SoftError(str(e)) from e
-    except store.FilingError as e:
+    image_id = _int(job, "image_id")
+    if "line" in job.payload:
+        # A sidecar that was malformed on arrival, retried from the queue page. The line
+        # cannot have changed, so this says the same thing again unless the collection
+        # it names has since appeared.
+        line = str(job.payload["line"])
+        try:
+            req = parse_line(line)
+        except ValueError as e:
+            raise HardError(f"collection sidecar: {e}") from e
         async with pool.connection() as conn:
-            await store.set_error(conn, c, image_id, str(e))
-        raise HardError(str(e)) from e
+            collection = await store.collection_by_slug(conn, req.collection)
+            if collection is None:
+                raise HardError(f"collection sidecar: no collection {req.collection!r}")
+            try:
+                await store.request(conn, collection, image_id, req.book, req.position)
+            except store.Refused as e:
+                raise HardError(f"collection sidecar: {e}") from e
+        return
+
+    collection_id = _int(job, "collection_id")
+    await ensure_anchors(pool, collection_id, settings, embedder)
+    async with pool.connection() as conn:
+        result = await store.file_request(conn, image_id, collection_id, settings)
+    if result == "waiting":
+        # Publish enqueues this again, but an embedding still on its way is not a publish.
+        raise SoftError(f"image {image_id} is not live and embedded yet")
+    if result not in ("filed", "gone"):
+        # Kept on the request for the collection page; retrying alone cannot change it.
+        log.warning("collection_file %s: %s", image_id, result)
 
 
 async def handle_anchor(
     job: Job, *, pool: Pool, settings: Settings, embedder: DocumentEmbedder
 ) -> None:
-    cid = job.payload.get("collection_id")
-    await embed_anchors(pool, settings, embedder, int(cid) if cid is not None else None)
+    n = await ensure_anchors(pool, _int(job, "collection_id"), settings, embedder)
+    log.info("collection anchors embedded: %d", n)
 
 
 async def handle_resort(
     job: Job, *, pool: Pool, settings: Settings, embedder: DocumentEmbedder
 ) -> None:
-    cid = int(job.payload["collection_id"])
+    collection_id = _int(job, "collection_id")
+    await ensure_anchors(pool, collection_id, settings, embedder)
     async with pool.connection() as conn:
-        c = await store.get(conn, cid=cid)
-    if c is None:
-        return
-    await embed_anchors(pool, settings, embedder, cid)
-    p = await store.load_params(pool, settings)
-    async with pool.connection() as conn, conn.transaction():
-        moves = await store.resort(conn, c, settings, p, dry_run=False)
-    log.info("re-sorted %s: %d moves", c.slug, len(moves))
+        collection = await store.collection_by_id(conn, collection_id)
+        if collection is None:
+            return
+        moves = await store.resort(conn, collection, settings, dry_run=False)
+    log.info("collection %s re-sorted: %d moves", collection_id, len(moves))
 
 
-async def enqueue_due_resorts(pool: Pool) -> int:
-    """A re-sort for every collection a week past its last one, if the owner wants them."""
-    if not await runtime.get(pool, "collections.weekly_resort"):
-        return 0
-    n = 0
+async def enqueue_unfiled(pool: Pool) -> int:
+    """Requests for live pictures with no job waiting: a crash between go-live and the
+    enqueue, or a picture republished since. Run at worker start."""
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "select id from collections where resorted_at is null or resorted_at < now() - %s",
-            (WEEK,),
+            f"""
+            insert into jobs (type, payload, dedupe_key)
+            select '{store.FILE_JOB}',
+                   jsonb_build_object('image_id', r.image_id, 'collection_id', r.collection_id),
+                   '{store.FILE_JOB}:' || r.image_id || ':' || r.collection_id
+              from collection_requests r
+              join images i on i.id = r.image_id
+             where i.status = 'live' and r.error is null
+             order by r.created_at
+            on conflict do nothing
+            """
         )
-        due = [int(r["id"]) for r in await cur.fetchall()]
-    for cid in due:
-        got = await enqueue(
-            pool, store.RESORT_JOB, {"collection_id": cid}, dedupe_key=f"{store.RESORT_JOB}:{cid}"
+        return cur.rowcount
+
+
+async def enqueue_anchors(pool: Pool, settings: Settings) -> int:
+    """One anchor job per collection with an anchor not embedded under today's model, so
+    the seed anchors and a model swap are made good without waiting for a filing."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"""
+            insert into jobs (type, payload, dedupe_key)
+            select distinct '{store.ANCHOR_JOB}',
+                   jsonb_build_object('collection_id', b.collection_id),
+                   '{store.ANCHOR_JOB}:' || b.collection_id
+              from collection_books b
+             where b.anchor_text <> ''
+               and (b.anchor_embedding is null or b.anchor_model is distinct from %(m)s
+                    or b.anchor_dim is distinct from %(d)s)
+            on conflict do nothing
+            """,
+            {"m": settings.embed_model, "d": settings.embed_dim},
         )
-        n += got is not None
+        return cur.rowcount
+
+
+async def enqueue_weekly(pool: Pool, now: datetime | None = None) -> int:
+    """A re-sort for each collection whose tuning asks for one weekly and is due."""
+    now = now or datetime.now(UTC)
+    n = 0
+    async with pool.connection() as conn:
+        cur = await conn.execute("select id, tuning, last_resort_at from collections")
+        for r in await cur.fetchall():
+            if not Tuning.from_json(r["tuning"]).weekly_resort:
+                continue
+            if r["last_resort_at"] is not None and now - r["last_resort_at"] < WEEK:
+                continue
+            cur2 = await conn.execute(
+                "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s)"
+                " on conflict do nothing",
+                (
+                    store.RESORT_JOB,
+                    Jsonb({"collection_id": r["id"]}),
+                    f"{store.RESORT_JOB}:{r['id']}",
+                ),
+            )
+            n += cur2.rowcount
     return n
 
 
-async def run_weekly(pool: Pool, stop: asyncio.Event) -> None:
+async def run_weekly(pool: Pool, stop: asyncio.Event, interval: float = WEEKLY_CHECK) -> None:
     while not stop.is_set():
         try:
-            n = await enqueue_due_resorts(pool)
+            n = await enqueue_weekly(pool)
             if n:
-                log.info("enqueued %d weekly collection re-sorts", n)
+                log.info("enqueued %d weekly re-sorts", n)
         except Exception:
-            # A database hiccup must not end the loop; the next hour tries again.
             log.exception("weekly re-sort check failed")
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=WEEKLY_CHECK_SECONDS)
-
-
-async def enqueue_stale_anchors(pool: Pool, settings: Settings) -> int:
-    async with pool.connection() as conn:
-        stale = await store.stale_anchors(conn, settings)
-    if not stale:
-        return 0
-    got = await enqueue(pool, store.ANCHOR_JOB, {}, dedupe_key=store.ANCHOR_JOB)
-    return int(got is not None)
+            await asyncio.wait_for(stop.wait(), timeout=interval)

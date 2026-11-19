@@ -4,8 +4,8 @@
 	import Picture from '../../../../lib/components/Picture.svelte';
 	import Cropper from '../../../../lib/components/admin/Cropper.svelte';
 	import * as pics from '../../../../lib/admin-pictures';
-	import * as col from '../../../../lib/admin-collections';
-	import { roman } from '../../../../lib/collections';
+	import * as cols from '../../../../lib/admin-collections';
+	import { roman } from '../../../../lib/roman';
 
 	let { data } = $props();
 	const id = $derived(data.id);
@@ -16,6 +16,9 @@
 	let cropping = $state(false);
 	let confirming = $state(false);
 	let typed = $state('');
+	// Book and leaf for each collection's file or move, blank meaning the filer picks.
+	// Seeded by load, one per collection, so the fields can bind to them.
+	let filing = $state<Record<string, { book: string; leaf: string }>>({});
 
 	type Draft = {
 		caption: string;
@@ -53,6 +56,7 @@
 			const kinds = x.nudity?.kinds ?? [];
 			if (picks.join(',') === seenPicks) picks = [...kinds];
 			seenPicks = kinds.join(',');
+			for (const c of x.collections) filing[c.slug] ??= { book: '', leaf: '' };
 			d = x;
 		} catch (e) {
 			if (!d) missing = true;
@@ -60,41 +64,7 @@
 		}
 	}
 
-	// One row per collection: in it or not, and the book and leaf to pin it to.
-	let cols = $state<col.PictureCollection[]>([]);
-	let colDraft = $state<Record<string, { on: boolean; book: string; leaf: string }>>({});
-	async function loadCols() {
-		try {
-			cols = (await col.forPicture(id)).collections;
-			colDraft = Object.fromEntries(
-				cols.map((x) => [x.slug, { on: Boolean(x.leaf || x.request), book: '', leaf: '' }])
-			);
-		} catch {
-			cols = [];
-		}
-	}
-	const colState = (x: col.PictureCollection) =>
-		x.leaf
-			? `${roman(x.leaf.book)}, leaf ${x.leaf.position}${x.leaf.pinned_position ? ', pinned' : x.leaf.pinned_book ? ', pinned to book' : ''}`
-			: x.request
-				? (x.request.error ?? 'waiting')
-				: '';
-	async function saveCol(x: col.PictureCollection) {
-		const dft = colDraft[x.slug];
-		msg = '';
-		try {
-			if (!dft.on) await col.unfile(x.slug, id);
-			else await col.place(x.slug, id, dft.book, dft.leaf);
-		} catch (e) {
-			msg = e instanceof col.CollectionError ? e.message : 'failed';
-		}
-		await Promise.all([loadCols(), load()]);
-	}
-
-	onMount(() => {
-		load();
-		loadCols();
-	});
+	onMount(load);
 
 	const running = $derived(d ? pics.active(d.jobs) : false);
 	const unpublished = $derived(d?.status === 'unpublished');
@@ -166,6 +136,40 @@
 			msg = 'failed';
 		}
 	}
+
+	const fields = (slug: string) => filing[slug] ?? { book: '', leaf: '' };
+	async function collect(fn: () => Promise<unknown>) {
+		msg = '';
+		try {
+			await fn();
+		} catch (e) {
+			msg = e instanceof cols.HttpError && e.detail ? e.detail : 'failed';
+		}
+		await load();
+	}
+	function member(c: pics.PictureCollection) {
+		if (c.leaf || c.request) return collect(() => cols.unfile(c.slug, id));
+		const f = fields(c.slug);
+		return collect(() =>
+			cols.place(c.slug, id, f.book ? Number(f.book) : null, f.book && f.leaf ? Number(f.leaf) : null)
+		);
+	}
+	function moveLeaf(c: pics.PictureCollection) {
+		const f = fields(c.slug);
+		if (!f.book) return;
+		return collect(() => cols.place(c.slug, id, Number(f.book), f.leaf ? Number(f.leaf) : null));
+	}
+	const where = (c: pics.PictureCollection) => {
+		if (c.leaf) {
+			const pin = c.leaf.pinned ? 'pinned' : c.leaf.book_pinned ? 'book pinned' : 'auto';
+			return `book ${roman(c.leaf.book)} leaf ${c.leaf.position} / ${pin}`;
+		}
+		if (c.request) {
+			const want = c.request.book ? ` ${roman(c.request.book)}${c.request.position ? ` ${c.request.position}` : ''}` : '';
+			return `unfiled${want}${c.request.error ? ` / ${c.request.error}` : ''}`;
+		}
+		return '';
+	};
 
 	const item = $derived(
 		d ? { slug: d.slug, width: d.width, height: d.height, blurhash: '', palette: [], variants: d.variants } : null
@@ -290,20 +294,36 @@
 				<button onclick={detect}>detect nudity</button>
 			</div>
 
-			{#each cols as x (x.slug)}
-				{@const dft = colDraft[x.slug]}
-				{#if dft}
-					<div class="row coll">
-						<label class="kind"><input type="checkbox" bind:checked={dft.on} /> {x.slug}</label>
-						<input class="num" placeholder="book" aria-label="book" bind:value={dft.book} disabled={!dft.on} />
-						<input class="num" placeholder="leaf" aria-label="leaf" bind:value={dft.leaf} disabled={!dft.on} />
-						<button
-							disabled={dft.on === Boolean(x.leaf || x.request) && !dft.book.trim() && !dft.leaf.trim()}
-							onclick={() => saveCol(x)}>save</button
-						>
-						<span class="dim" class:bad={Boolean(x.request?.error)}>{colState(x)}</span>
+			{#each d.collections as c (c.slug)}
+				<div class="nude">
+					<label class="kind">
+						<input type="checkbox" checked={!!(c.leaf || c.request)} onchange={() => member(c)} />
+						{c.slug}
+						<span class="dim">{where(c)}</span>
+					</label>
+					<div class="row">
+						<select aria-label="book" bind:value={filing[c.slug].book}>
+							<option value="">book</option>
+							{#each Array.from({ length: c.book_count }, (_, k) => k + 1) as n (n)}
+								<option value={String(n)}>{roman(n)}</option>
+							{/each}
+						</select>
+						<input
+							class="num"
+							type="number"
+							min="1"
+							max={c.leaves_per_book}
+							placeholder="leaf"
+							aria-label="leaf"
+							bind:value={filing[c.slug].leaf}
+							disabled={!filing[c.slug]?.book}
+						/>
+						{#if c.leaf}
+							<button disabled={!filing[c.slug]?.book} onclick={() => moveLeaf(c)}>move</button>
+						{/if}
+						<a class="dim" href="/admin/collections">{c.abbrev_latin.toLowerCase()}</a>
 					</div>
-				{/if}
+				</div>
 			{/each}
 
 			<div class="row all">
@@ -344,9 +364,6 @@
 {/if}
 
 <style>
-	.num {
-		width: 4rem;
-	}
 	.top {
 		margin: 0 0 1.5rem;
 	}
@@ -450,6 +467,20 @@
 		padding: 0;
 		border: 0;
 		accent-color: var(--primary);
+	}
+	select {
+		background: transparent;
+		color: var(--foreground);
+		border: 0;
+		border-bottom: 1px solid var(--ink-700);
+		font: inherit;
+		padding: 0.4rem 0;
+	}
+	select option {
+		background: var(--background);
+	}
+	.num {
+		width: 5rem;
 	}
 	.row {
 		display: flex;

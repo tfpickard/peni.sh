@@ -54,11 +54,6 @@ KEYS = (
     "mycelium.daily_calls",
     "log.level",
     "log.keep_days",
-    "collections.k",
-    "collections.alpha",
-    "collections.beta",
-    "collections.margin",
-    "collections.weekly_resort",
 )
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 PURPOSES = ("describe", "haiku", "grow", "extract", "name", "nudity")
@@ -78,16 +73,6 @@ LOG_LEVELS = ("debug", "info", "warning", "error")
 LOG_LEVEL_DEFAULT = "info"
 LOG_KEEP_DAYS_DEFAULT = 14
 LOG_KEEP_DAYS_MAX = 365
-# The filer's constants (penish/collections/filing.py), tunable without a deploy. k is
-# how many leaves it takes for a book to outweigh its anchor; alpha weighs tag hints;
-# beta is the pressure against a filling book; margin is how much better another book
-# must be before a re-sort moves a leaf there.
-COLLECTION_TUNABLES: dict[str, tuple[float, float, float]] = {
-    "collections.k": (3.0, 0.0, 1000.0),
-    "collections.alpha": (0.05, 0.0, 1.0),
-    "collections.beta": (0.05, 0.0, 1.0),
-    "collections.margin": (0.03, 0.0, 1.0),
-}
 
 
 def split_model(model: str) -> tuple[str | None, str]:
@@ -128,10 +113,6 @@ def default(key: str, settings: Settings | None = None) -> Any:
         return LOG_LEVEL_DEFAULT
     if key == "log.keep_days":
         return LOG_KEEP_DAYS_DEFAULT
-    if key in COLLECTION_TUNABLES:
-        return COLLECTION_TUNABLES[key][0]
-    if key == "collections.weekly_resort":
-        return False
     return (_PROMPTS / _PROMPT_FILES[key]).read_text()
 
 
@@ -158,17 +139,6 @@ def validate(key: str, value: Any) -> Any:
             raise ValueError(f"{key} must be an integer")
         if not 1 <= value <= LOG_KEEP_DAYS_MAX:
             raise ValueError(f"{key} must be between 1 and {LOG_KEEP_DAYS_MAX}")
-        return value
-    if key in COLLECTION_TUNABLES:
-        _, lo, hi = COLLECTION_TUNABLES[key]
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ValueError(f"{key} must be a number")
-        if not lo <= value <= hi:
-            raise ValueError(f"{key} must be between {lo:g} and {hi:g}")
-        return float(value)
-    if key == "collections.weekly_resort":
-        if not isinstance(value, bool):
-            raise ValueError(f"{key} must be true or false")
         return value
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")

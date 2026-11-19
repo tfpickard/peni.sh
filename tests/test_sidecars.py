@@ -23,6 +23,7 @@ from penish.worker.sidecars import SIDECARS, Embedding, GroupError, parse_group,
         ("my_cat_tags.txt", ("my_cat", "_tags")),
         ("my_cat_prompt.txt", ("my_cat", "_prompt")),
         ("my_cat_embedding.json", ("my_cat", "_embedding")),
+        ("my_cat_collection.txt", ("my_cat", "_collection")),
         ("a_caption_caption.txt", ("a_caption", "_caption")),
         # The suffix decides the kind even when the image itself has a suffix-like stem.
         ("x_caption.png", ("x_caption", "image")),

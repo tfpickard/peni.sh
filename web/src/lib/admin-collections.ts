@@ -1,8 +1,14 @@
+// Mirrors penish/api/admin_collections.py. Every write answers with the whole collection.
 const H = { 'X-Requested-With': 'penish' };
 
-// The server's detail is already in the site's words (`book vi, leaf 9 is taken`), so it
-// is what the page shows.
-export class CollectionError extends Error {}
+export class HttpError extends Error {
+	constructor(
+		public status: number,
+		public detail: string | null
+	) {
+		super(detail ?? String(status));
+	}
+}
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
 	const r = await fetch(`/api/admin/collections${path}`, {
@@ -12,101 +18,117 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
 		body: body === undefined ? undefined : JSON.stringify(body)
 	});
 	if (!r.ok) {
-		let detail = 'failed';
+		// A refused move says why (`book iii leaf 14 is taken`); the page shows it as is.
+		let detail: string | null = null;
 		try {
-			const d = (await r.json()).detail;
-			if (typeof d === 'string') detail = d;
+			const j = await r.json();
+			if (typeof j?.detail === 'string') detail = j.detail;
 		} catch {
-			// Not json; the generic word will do.
+			detail = null;
 		}
-		throw new CollectionError(detail);
+		throw new HttpError(r.status, detail);
 	}
-	const text = await r.text();
-	return (text ? JSON.parse(text) : null) as T;
+	return r.json();
 }
 
-export type Pos = { book: number; position: number };
-export type Pic = { image_id: number; slug: string | null; status: string | null; thumb: string | null };
-export type AdminLeaf = Pic & { position: number; pinned_book: boolean; pinned_position: boolean };
+export type Summary = {
+	slug: string;
+	title: string;
+	abbrev: string;
+	abbrev_latin: string;
+	book_count: number;
+	leaves_per_book: number;
+	published: boolean;
+};
+export type Tuning = {
+	anchor_k: number;
+	tag_alpha: number;
+	fill_beta: number;
+	book_margin: number;
+	weekly_resort: boolean;
+};
+export type AdminLeaf = {
+	image_id: number;
+	slug: string | null;
+	status: string;
+	thumb: string | null;
+	position: number;
+	pinned: boolean;
+	book_pinned: boolean;
+};
 export type AdminBook = {
 	number: number;
 	title: string | null;
 	anchor_text: string;
 	tag_hints: string[];
+	// Embedded under today's model; false while the worker has it queued.
 	anchored: boolean;
 	leaves: AdminLeaf[];
 };
-export type Request = Pic & {
+export type FilingRequest = {
+	image_id: number;
+	slug: string | null;
+	status: string;
+	thumb: string | null;
 	book: number | null;
 	position: number | null;
 	error: string | null;
+	job: string | null;
 	created_at: string;
 };
-export type HistoryRow = Pic & { from: Pos | null; to: Pos | null; reason: string; at: string };
-export type Move = Pic & { from: Pos; to: Pos; reason: string };
-export type AdminCollection = {
-	slug: string;
-	title: string;
-	abbrev: string;
-	abbrev_latin: string;
+export type HistoryRow = {
+	id: number;
+	image_id: number;
+	slug: string | null;
+	from_book: number | null;
+	from_position: number | null;
+	to_book: number | null;
+	to_position: number | null;
+	reason: 'auto' | 'resort' | 'owner';
+	at: string;
+};
+export type Detail = Summary & {
+	id: number;
 	preamble: string;
-	published: boolean;
-	book_count: number;
-	leaves_per_book: number;
-	resorted_at: string | null;
+	tuning: Tuning;
+	tuning_default: Tuning;
+	last_resort_at: string | null;
+	resort: { status: string; last_error: string | null } | null;
 	books: AdminBook[];
-	requests: Request[];
+	requests: FilingRequest[];
 	history: HistoryRow[];
 };
-export type Tuning = Record<string, { value: number | boolean; default: number | boolean }>;
+export type ProposedMove = {
+	image_id: number;
+	slug: string | null;
+	before: [number, number] | null;
+	after: [number, number] | null;
+};
 
-export const list = () => call<{ collections: AdminCollection[]; tuning: Tuning }>('GET', '');
+const at = (slug: string) => `/${encodeURIComponent(slug)}`;
 
-export const patch = (slug: string, body: Partial<Pick<AdminCollection, 'title' | 'preamble' | 'published'>>) =>
-	call<AdminCollection>('PATCH', `/${slug}`, body);
-
-export const patchBook = (
+export const list = () => call<{ collections: Summary[] }>('GET', '');
+export const detail = (slug: string) => call<Detail>('GET', at(slug));
+export const edit = (
+	slug: string,
+	body: Partial<Pick<Detail, 'title' | 'abbrev' | 'abbrev_latin' | 'preamble' | 'published'>> & {
+		tuning?: Partial<Tuning>;
+	}
+) => call<Detail>('PATCH', at(slug), body);
+export const editBook = (
 	slug: string,
 	n: number,
 	body: { title?: string; anchor_text?: string; tag_hints?: string[] }
-) => call<AdminCollection>('PATCH', `/${slug}/books/${n}`, body);
-
-// Book and leaf go as typed: the server reads roman or arabic.
-export const place = (slug: string, imageId: number, book: string, position: string) =>
-	call<{ state: string; moves: Move[] }>('PUT', `/${slug}/pictures/${imageId}`, {
-		book: book.trim() || null,
-		position: position.trim() || null
-	});
-export const unfile = (slug: string, imageId: number) => call('DELETE', `/${slug}/pictures/${imageId}`);
+) => call<Detail>('PATCH', `${at(slug)}/books/${n}`, body);
+// Filed: a move, pinned. Unfiled: a request the filer takes from there.
+export const place = (slug: string, imageId: number, book: number | null, position: number | null) =>
+	call<Detail>('PUT', `${at(slug)}/leaves/${imageId}`, { book, position });
+export const unfile = (slug: string, imageId: number) =>
+	call<Detail>('DELETE', `${at(slug)}/leaves/${imageId}`);
 export const pin = (slug: string, imageId: number, pinned: boolean) =>
-	call('POST', `/${slug}/pictures/${imageId}/pin`, { pinned });
+	call<Detail>('POST', `${at(slug)}/leaves/${imageId}/pin`, { pinned });
 export const retry = (slug: string, imageId: number) =>
-	call<{ queued: boolean }>('POST', `/${slug}/requests/${imageId}/retry`);
-export const resort = (slug: string, dryRun: boolean) =>
-	call<{ dry_run: boolean; moves: Move[] }>('POST', `/${slug}/resort`, { dry_run: dryRun });
-
-export type PictureCollection = {
-	slug: string;
-	title: string;
-	abbrev_latin: string;
-	book_count: number;
-	leaves_per_book: number;
-	leaf: { book: number; position: number; pinned_book: boolean; pinned_position: boolean } | null;
-	request: { book: number | null; position: number | null; error: string | null } | null;
-};
-export const forPicture = (imageId: number) =>
-	call<{ collections: PictureCollection[] }>('GET', `/picture/${imageId}`);
-
-// The tunables live with the models, under the same settings table.
-export async function tune(key: string, value: number | boolean): Promise<void> {
-	const r = await fetch('/api/admin/models', {
-		method: 'PUT',
-		credentials: 'same-origin',
-		headers: { ...H, 'Content-Type': 'application/json' },
-		body: JSON.stringify({ key, value })
-	});
-	if (!r.ok) {
-		const d = await r.json().catch(() => ({}));
-		throw new CollectionError(typeof d.detail === 'string' ? d.detail : 'failed');
-	}
-}
+	call<Detail>('POST', `${at(slug)}/requests/${imageId}/retry`, {});
+export const dryRun = (slug: string) =>
+	call<{ moves: ProposedMove[] }>('POST', `${at(slug)}/resort`, { dry_run: true });
+export const resort = (slug: string) => call<Detail>('POST', `${at(slug)}/resort`, { dry_run: false });

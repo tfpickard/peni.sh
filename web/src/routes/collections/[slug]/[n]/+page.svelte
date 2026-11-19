@@ -1,33 +1,37 @@
 <script lang="ts">
-	import type { PageProps } from './$types';
-	import { roman, smallest } from '../../../../lib/collections';
+	import Picture from '../../../../lib/components/Picture.svelte';
+	import { roman } from '../../../../lib/roman';
 
-	let { data }: PageProps = $props();
+	let { data } = $props();
 	const b = $derived(data.book);
+	// Only the filled slots, in leaf order. The leaf number stays on each one, so the
+	// book's shape is still there without anyone scrolling past the gaps.
+	const leaves = $derived(b ? b.slots.filter((s) => s !== null) : []);
 </script>
 
 <svelte:head>
-	<title>{b ? `book ${roman(b.number)} -- ${b.collection.title} -- peni.sh` : 'peni.sh'}</title>
+	<title>{b ? `${b.collection.abbrev} ${roman(b.number)}` : 'not here'} -- peni.sh</title>
 </svelte:head>
 
 {#if !b}
 	<p class="flat">not here</p>
 {:else}
-	<p class="up"><a href="/collections/{b.collection.slug}">{b.collection.title}</a></p>
-	<h1>book {roman(b.number)}{#if b.title}<span>{b.title}</span>{/if}</h1>
-
-	<!-- Empty leaves keep their place: the grid never closes up around what is missing. -->
-	<div class="leaves">
-		{#each b.slots as s, i (i)}
-			{#if s}
-				<a class="cell" href="/i/{s.slug}" style:background-color={s.palette?.[0]}>
-					<img src={smallest(s.variants, 240)} alt="" loading="lazy" decoding="async" />
+	<p class="up"><a href="/collections/{data.slug}">{b.collection.title}</a></p>
+	<h1>book {roman(b.number)}{#if b.title}<span class="title">{b.title}</span>{/if}</h1>
+	{#if leaves.length}
+		<div class="grid">
+			{#each leaves as s (s.position)}
+				<a class="leaf" href="/i/{s.slug}">
+					<span class="cell">
+						<Picture image={s} sizes="(min-width: 60rem) 5rem, (min-width: 48rem) 9vw, 14vw" />
+					</span>
+					<span class="n">{s.position}</span>
 				</a>
-			{:else}
-				<span class="cell empty"></span>
-			{/if}
-		{/each}
-	</div>
+			{/each}
+		</div>
+	{:else}
+		<p class="flat">0 leaves</p>
+	{/if}
 {/if}
 
 <style>
@@ -37,41 +41,63 @@
 	}
 	.up {
 		margin: 0 0 0.5rem;
-		font-size: 0.85rem;
+		font-size: 0.8rem;
+	}
+	.up a {
+		color: var(--muted-foreground);
 	}
 	h1 {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0 1rem;
 		margin: 0 0 2rem;
 		font-size: 1.25rem;
 		font-weight: 500;
 		line-height: 1.3;
 	}
-	h1 span {
-		margin-left: 1rem;
+	.title {
 		color: var(--muted-foreground);
 		font-weight: 400;
 	}
-	.leaves {
+	/* 7 across on a phone, 11 where there is room: the book's own 7 by 11. */
+	.grid {
 		display: grid;
-		grid-template-columns: repeat(11, minmax(0, 1fr));
-		gap: 2px;
+		grid-template-columns: repeat(7, 1fr);
+		gap: 0.25rem;
 	}
-	@media (max-width: 40rem) {
-		.leaves {
-			grid-template-columns: repeat(7, minmax(0, 1fr));
+	@media (min-width: 48rem) {
+		.grid {
+			grid-template-columns: repeat(11, 1fr);
+			gap: 0.5rem;
 		}
+	}
+	.leaf {
+		display: block;
+		min-width: 0;
 	}
 	.cell {
 		display: block;
 		aspect-ratio: 1;
 		overflow: hidden;
 	}
-	.cell img {
+	.n {
+		display: block;
+		margin-top: 0.15rem;
+		font-size: 0.7rem;
+		font-variant-numeric: tabular-nums;
+		color: var(--muted-foreground);
+	}
+	/* Square crops: the picture fills its slot like the rest of the leaves. */
+	.cell :global(.frame) {
 		display: block;
 		width: 100%;
 		height: 100%;
-		object-fit: cover;
+		aspect-ratio: auto !important;
 	}
-	.empty {
-		box-shadow: inset 0 0 0 1px var(--ink-800);
+	.cell :global(img),
+	.cell :global(canvas) {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
 	}
 </style>

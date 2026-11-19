@@ -1,6 +1,5 @@
 """Worker entrypoint: the inbox watcher, the job loop, the heartbeat, the mycelium tick, the
-naming scheduler, the weekly collection re-sort check and the internal embed server, side
-by side in one process."""
+naming scheduler and the internal embed server, side by side in one process."""
 
 from __future__ import annotations
 
@@ -12,7 +11,6 @@ from datetime import timedelta
 from pathlib import Path
 
 from penish import logs
-from penish.collections import store as collection_store
 from penish.config import get_settings
 from penish.db import make_pool
 from penish.mycelium.tick import run_loop as run_mycelium
@@ -114,12 +112,12 @@ async def main() -> None:
         n = await enqueue_unphrased(pool, settings)
         if n:
             log.info("enqueued %d pictures to embed offers and needs", n)
-        n = await collection_jobs.enqueue_stale_anchors(pool, settings)
-        if n:
-            log.info("enqueued collection anchors to embed")
-        n = await collection_store.enqueue_pending(pool)
+        n = await collection_jobs.enqueue_unfiled(pool)
         if n:
             log.info("enqueued %d pictures to file into collections", n)
+        n = await collection_jobs.enqueue_anchors(pool, settings)
+        if n:
+            log.info("enqueued %d collections to embed book anchors", n)
 
         watcher = InboxWatcher(settings, enqueue, has_job=has_job)
         await watcher.recover()

@@ -59,7 +59,7 @@ export type ImageDetail = Omit<ImageItem, 'overgrowth'> & {
 	next: string | null;
 	// Galleries it is in now (living, then fading), then the ones it was in.
 	galleries: ImageGallery[];
-	// Where it sits in a published collection, and where it sat before its last move.
+	// Its leaf in a published collection, with where it was filed before, if anywhere.
 	leaf: Leaf | null;
 };
 export type Leaf = {
@@ -443,8 +443,7 @@ export const getMap = (f: typeof fetch = fetch) =>
 		return r.json() as Promise<MyceliumMap>;
 	});
 
-// -- collections
-
+// Collections. Mirrors penish/api/routes_collections.py; only published ones exist.
 export type CollectionHead = {
 	slug: string;
 	title: string;
@@ -452,28 +451,37 @@ export type CollectionHead = {
 	abbrev_latin: string;
 	book_count: number;
 	leaves_per_book: number;
+	// Filed leaves whose pictures are live, of book_count * leaves_per_book.
+	leaves: number;
+	capacity: number;
 };
-export type CollectionCard = CollectionHead & { leaves: number; capacity: number };
-export type LeafTile = Omit<ImageItem, 'overgrowth'> & { position: number };
-export type Collection = CollectionCard & {
+export type StripLeaf = {
+	position: number;
+	slug: string;
+	blurhash: string;
+	palette: string[];
+	src: string | null;
+};
+export type Collection = CollectionHead & {
 	preamble: string;
-	books: { number: number; title: string | null; leaves: LeafTile[] }[];
+	books: { number: number; title: string | null; leaves: StripLeaf[] }[];
 };
-export type Book = {
+export type BookSlot = (ImageItem & { position: number }) | null;
+export type CollectionBook = {
 	collection: CollectionHead;
 	number: number;
 	title: string | null;
-	// One per leaf of the book, in order; null where no leaf has been found.
-	slots: (LeafTile | null)[];
+	// Every slot in leaf order, empty ones null.
+	slots: BookSlot[];
 };
 
 export const getCollections = (f: typeof fetch = fetch) =>
 	f('/api/collections').then((r) => {
 		if (!r.ok) throw new ApiError(r.status);
-		return r.json() as Promise<{ collections: CollectionCard[] }>;
+		return r.json() as Promise<{ collections: CollectionHead[] }>;
 	});
 
-// A collection or book that is not there loads as null and the page says `not here`.
+// null for anything that is not a published collection, so the page can say so.
 export const getCollection = (slug: string, f: typeof fetch = fetch) =>
 	f(`/api/collections/${encodeURIComponent(slug)}`).then((r) => {
 		if (r.status === 404) return null;
@@ -485,5 +493,5 @@ export const getBook = (slug: string, n: string, f: typeof fetch = fetch) =>
 	f(`/api/collections/${encodeURIComponent(slug)}/books/${encodeURIComponent(n)}`).then((r) => {
 		if (r.status === 404 || r.status === 422) return null;
 		if (!r.ok) throw new ApiError(r.status);
-		return r.json() as Promise<Book>;
+		return r.json() as Promise<CollectionBook>;
 	});

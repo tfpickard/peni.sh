@@ -1,366 +1,448 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import * as col from '../../../lib/admin-collections';
-	import { roman } from '../../../lib/collections';
+	import * as cols from '../../../lib/admin-collections';
+	import { roman } from '../../../lib/roman';
 
-	let all = $state<col.AdminCollection[]>([]);
-	let tuning = $state<col.Tuning>({});
-	let loaded = $state(false);
+	let summaries = $state<cols.Summary[]>([]);
+	let slug = $state('');
+	let d = $state<cols.Detail | null>(null);
 	let msg = $state('');
-	let pick = $state(0);
-	const c = $derived(all[pick] ?? null);
+	let loaded = $state(false);
 
-	// Drafts keyed by what they edit, filled from the server only where untouched.
-	let head = $state({ title: '', preamble: '' });
-	let books = $state<Record<number, { title: string; anchor: string; hints: string }>>({});
-	let tunes = $state<Record<string, string>>({});
-	let seenHead = { title: '', preamble: '' };
-	let seenBooks: Record<number, { title: string; anchor: string; hints: string }> = {};
+	// Drafts, so a reload after another action does not throw away what is being typed.
+	type Head = { title: string; abbrev: string; abbrev_latin: string; preamble: string };
+	let head = $state<Head>({ title: '', abbrev: '', abbrev_latin: '', preamble: '' });
+	let tuning = $state<cols.Tuning | null>(null);
+	type BookDraft = { title: string; anchor_text: string; tag_hints: string };
+	let books = $state<Record<number, BookDraft>>({});
 
-	let selected = $state<{ book: number; leaf: col.AdminLeaf } | null>(null);
-	let to = $state({ book: '', leaf: '' });
-	let proposal = $state<col.Move[] | null>(null);
+	// The leaf picked in a book's grid, and where to move it.
+	let picked = $state<{ book: number; leaf: cols.AdminLeaf } | null>(null);
+	let moveBook = $state('');
+	let moveLeaf = $state('');
+	let proposed = $state<cols.ProposedMove[] | null>(null);
 
-	async function load() {
+	const bookDraft = (b: cols.AdminBook): BookDraft => ({
+		title: b.title ?? '',
+		anchor_text: b.anchor_text,
+		tag_hints: b.tag_hints.join(', ')
+	});
+
+	function take(x: cols.Detail, fresh = false) {
+		if (fresh || !d) {
+			head = { title: x.title, abbrev: x.abbrev, abbrev_latin: x.abbrev_latin, preamble: x.preamble };
+			tuning = { ...x.tuning };
+			books = Object.fromEntries(x.books.map((b) => [b.number, bookDraft(b)]));
+		}
+		d = x;
+		if (picked) {
+			const b = x.books.find((bk) => bk.leaves.some((l) => l.image_id === picked?.leaf.image_id));
+			const l = b?.leaves.find((lf) => lf.image_id === picked?.leaf.image_id);
+			picked = b && l ? { book: b.number, leaf: l } : null;
+		}
+	}
+
+	async function open(s: string) {
+		slug = s;
+		picked = null;
+		proposed = null;
 		try {
-			const r = await col.list();
-			all = r.collections;
-			tuning = r.tuning;
-			const x = all[pick];
-			if (x) {
-				const h = { title: x.title, preamble: x.preamble };
-				if (head.title === seenHead.title) head.title = h.title;
-				if (head.preamble === seenHead.preamble) head.preamble = h.preamble;
-				seenHead = h;
-				const next: typeof books = {};
-				for (const b of x.books) {
-					const s = { title: b.title ?? '', anchor: b.anchor_text, hints: b.tag_hints.join(', ') };
-					const d = books[b.number];
-					const was = seenBooks[b.number];
-					next[b.number] =
-						d && was
-							? {
-									title: d.title === was.title ? s.title : d.title,
-									anchor: d.anchor === was.anchor ? s.anchor : d.anchor,
-									hints: d.hints === was.hints ? s.hints : d.hints
-								}
-							: s;
-					seenBooks[b.number] = s;
-				}
-				books = next;
-				if (selected) {
-					const lf = x.books.flatMap((b) => b.leaves.map((l) => ({ book: b.number, leaf: l })));
-					selected = lf.find((l) => l.leaf.image_id === selected!.leaf.image_id) ?? null;
-				}
-			}
-			for (const [k, v] of Object.entries(tuning)) if (!(k in tunes)) tunes[k] = String(v.value);
+			take(await cols.detail(s), true);
+		} catch {
+			msg = 'failed';
+		}
+	}
+
+	onMount(async () => {
+		try {
+			summaries = (await cols.list()).collections;
+			if (summaries.length) await open(summaries[0].slug);
 		} catch {
 			msg = 'failed';
 		}
 		loaded = true;
-	}
+	});
 
-	onMount(load);
-
-	async function act(fn: () => Promise<unknown>) {
+	async function act(fn: () => Promise<cols.Detail>, fresh = false) {
 		msg = '';
 		try {
-			await fn();
+			take(await fn(), fresh);
 		} catch (e) {
-			msg = e instanceof col.CollectionError ? e.message : 'failed';
+			msg = e instanceof cols.HttpError && e.detail ? e.detail : 'failed';
 		}
-		await load();
 	}
 
-	const slots = (b: col.AdminBook, n: number) => {
-		const out: (col.AdminLeaf | null)[] = Array(n).fill(null);
+	const saveHead = () => act(() => cols.edit(slug, { ...head }), true);
+	const flipPublished = () => act(() => cols.edit(slug, { published: !d?.published }));
+	const saveTuning = () => tuning && act(() => cols.edit(slug, { tuning: { ...tuning! } }), true);
+	function saveBook(n: number) {
+		const b = books[n];
+		const hints = b.tag_hints
+			.split(/[,\n]/)
+			.map((t) => t.trim())
+			.filter(Boolean);
+		return act(() => cols.editBook(slug, n, { title: b.title, anchor_text: b.anchor_text, tag_hints: hints }), true);
+	}
+	const bookDirty = (b: cols.AdminBook) => {
+		const x = books[b.number];
+		const y = bookDraft(b);
+		return !!x && (x.title !== y.title || x.anchor_text !== y.anchor_text || x.tag_hints !== y.tag_hints);
+	};
+	const headDirty = $derived(
+		!!d &&
+			(head.title !== d.title ||
+				head.abbrev !== d.abbrev ||
+				head.abbrev_latin !== d.abbrev_latin ||
+				head.preamble !== d.preamble)
+	);
+
+	function pick(book: number, leaf: cols.AdminLeaf) {
+		picked = picked?.leaf.image_id === leaf.image_id ? null : { book, leaf };
+		moveBook = String(book);
+		moveLeaf = '';
+	}
+	const move = () =>
+		picked &&
+		act(() =>
+			cols.place(slug, picked!.leaf.image_id, Number(moveBook), moveLeaf ? Number(moveLeaf) : null)
+		);
+	const pinFlip = () => picked && act(() => cols.pin(slug, picked!.leaf.image_id, !picked!.leaf.pinned));
+	async function unfile(imageId: number) {
+		await act(() => cols.unfile(slug, imageId));
+		if (picked?.leaf.image_id === imageId) picked = null;
+	}
+
+	async function dry() {
+		msg = '';
+		try {
+			proposed = (await cols.dryRun(slug)).moves;
+		} catch (e) {
+			msg = e instanceof cols.HttpError && e.detail ? e.detail : 'failed';
+		}
+	}
+	async function resortNow() {
+		proposed = null;
+		await act(() => cols.resort(slug));
+	}
+
+	// While a re-sort or a filing waits, keep the page current.
+	const busy = $derived(
+		!!d &&
+			(d.resort?.status === 'queued' ||
+				d.resort?.status === 'running' ||
+				d.requests.some((r) => r.job === 'queued' || r.job === 'running') ||
+				d.books.some((b) => !b.anchored && b.anchor_text))
+	);
+	$effect(() => {
+		if (!busy || !slug) return;
+		const t = setInterval(() => {
+			if (document.visibilityState === 'visible') act(() => cols.detail(slug));
+		}, 3000);
+		return () => clearInterval(t);
+	});
+
+	const place = (b: number | null, p: number | null) =>
+		b === null ? '' : p === null ? roman(b) : `${roman(b)} ${p}`;
+	const cells = (b: cols.AdminBook) => {
+		const out: (cols.AdminLeaf | null)[] = Array(d?.leaves_per_book ?? 0).fill(null);
 		for (const l of b.leaves) out[l.position - 1] = l;
 		return out;
 	};
-	const where = (p: col.Pos | null) => (p ? `${roman(p.book)}, ${p.position}` : '--');
-	const hints = (s: string) =>
-		s
-			.split(/[,\n]/)
-			.map((h) => h.trim())
-			.filter(Boolean);
-	const tuneKeys = ['collections.k', 'collections.alpha', 'collections.beta', 'collections.margin'];
-
-	function choose(book: number, leaf: col.AdminLeaf) {
-		selected = selected?.leaf.image_id === leaf.image_id ? null : { book, leaf };
-		to = { book: '', leaf: '' };
-	}
+	const pair = (x: [number, number] | null) => (x ? `${roman(x[0])} ${x[1]}` : '');
+	const when = (s: string) => s.replace('T', ' ').slice(0, 16);
 </script>
 
-{#if loaded && !c}
+{#if loaded && !summaries.length}
 	<p class="dim">0 collections</p>
-{:else if c}
-	{#if all.length > 1}
-		<p class="row">
-			{#each all as x, i (x.slug)}
-				<button class="link" class:on={i === pick} onclick={() => ((pick = i), load())}>{x.slug}</button>
-			{/each}
-		</p>
-	{/if}
+{/if}
 
-	<section class="form">
-		<label><span class="l">title</span><input bind:value={head.title} /></label>
-		<label><span class="l">preamble</span><textarea rows="5" bind:value={head.preamble}></textarea></label>
-		<div class="row">
-			<button
-				disabled={head.title === c.title && head.preamble === c.preamble}
-				onclick={() => act(() => col.patch(c.slug, { title: head.title, preamble: head.preamble }))}
-				>save</button
-			>
-			<label class="check">
-				<input
-					type="checkbox"
-					checked={c.published}
-					onchange={(e) => act(() => col.patch(c.slug, { published: e.currentTarget.checked }))}
-				/>
-				published
+{#if summaries.length > 1}
+	<div class="tabs">
+		{#each summaries as s (s.slug)}
+			<button class:on={s.slug === slug} class:link={s.slug !== slug} onclick={() => open(s.slug)}>
+				{s.slug}
+			</button>
+		{/each}
+	</div>
+{/if}
+
+{#if d}
+	<section class="head">
+		<label>
+			<span class="l">title</span>
+			<input bind:value={head.title} />
+		</label>
+		<div class="pair">
+			<label>
+				<span class="l">abbreviation</span>
+				<input bind:value={head.abbrev} />
+			</label>
+			<label>
+				<span class="l">latin</span>
+				<input bind:value={head.abbrev_latin} />
 			</label>
 		</div>
-	</section>
-
-	<section>
-		<h2>re-sort</h2>
+		<label>
+			<span class="l">preamble</span>
+			<textarea rows="5" bind:value={head.preamble}></textarea>
+		</label>
 		<div class="row">
-			<button onclick={() => act(async () => (proposal = (await col.resort(c.slug, true)).moves))}>preview</button>
-			<button
-				disabled={proposal === null}
-				onclick={() =>
-					act(async () => {
-						await col.resort(c.slug, false);
-						proposal = null;
-					})}>re-sort now</button
-			>
-			<span class="dim">{c.resorted_at ? `last ${c.resorted_at.slice(0, 16).replace('T', ' ')}` : ''}</span>
+			<button disabled={!headDirty} onclick={saveHead}>save</button>
+			<button class:link={d.published} onclick={flipPublished}>
+				{d.published ? 'unpublish' : 'publish'}
+			</button>
+			<span class="dim">{d.published ? 'published' : 'not published'}</span>
+			<a href="/collections/{d.slug}" class="dim">view</a>
 		</div>
-		{#if proposal}
-			{#if proposal.length}
-				<ul class="plain moves">
-					{#each proposal as m (m.image_id)}
-						<li>
-							<span>{m.slug ?? m.image_id}</span>
-							<span class="dim">{where(m.from)} to {where(m.to)}</span>
-							{#if m.from.book !== m.to.book}<span class="hot">book</span>{/if}
-						</li>
-					{/each}
-				</ul>
-			{:else}
-				<p class="dim">0 moves</p>
-			{/if}
-		{/if}
 	</section>
 
-	{#if c.requests.length}
-		<section>
-			<h2>unfiled</h2>
-			<ul class="plain">
-				{#each c.requests as r (r.image_id)}
-					<li class="row">
-						{#if r.thumb}<img class="t" src={r.thumb} alt="" />{/if}
-						<a href="/admin/pictures/{r.image_id}">{r.slug ?? r.image_id}</a>
-						<span class="dim">{r.status}</span>
-						{#if r.book}<span class="dim">{roman(r.book)}{r.position ? `, ${r.position}` : ''}</span>{/if}
-						{#if r.error}<span class="hot">{r.error}</span>{/if}
-						<button onclick={() => act(() => col.retry(c.slug, r.image_id))}>retry</button>
-						<button class="link" onclick={() => act(() => col.unfile(c.slug, r.image_id))}>drop</button>
-					</li>
-				{/each}
-			</ul>
-		</section>
+	{#if tuning}
+		<h2>filing</h2>
+		<div class="tuning">
+			{#each ['anchor_k', 'tag_alpha', 'fill_beta', 'book_margin'] as const as k (k)}
+				<label>
+					<span class="l">{k.replace('_', ' ')} <span class="dim">{d.tuning_default[k]}</span></span>
+					<input type="number" step="0.01" min="0" bind:value={tuning[k]} />
+				</label>
+			{/each}
+			<label class="tick">
+				<input type="checkbox" bind:checked={tuning.weekly_resort} />
+				weekly re-sort
+			</label>
+		</div>
+		<div class="row">
+			<button onclick={saveTuning}>save</button>
+		</div>
+	{/if}
+
+	<h2>re-sort</h2>
+	<div class="row">
+		<button onclick={dry}>dry run</button>
+		<button
+			disabled={d.resort?.status === 'queued' || d.resort?.status === 'running'}
+			onclick={resortNow}>re-sort now</button
+		>
+		{#if d.resort}<span class="dim" class:hot={d.resort.status === 'failed'}>{d.resort.status}</span>{/if}
+		{#if d.last_resort_at}<span class="dim">last {when(d.last_resort_at)}</span>{/if}
+	</div>
+	{#if d.resort?.last_error && d.resort.status === 'failed'}<p class="hot err">{d.resort.last_error}</p>{/if}
+	{#if proposed}
+		{#if proposed.length}
+			<table class="moves">
+				<tbody>
+					{#each proposed as m (m.image_id)}
+						<tr>
+							<td><a href="/admin/pictures/{m.image_id}">{m.slug ?? m.image_id}</a></td>
+							<td class="dim">{pair(m.before)}</td>
+							<td>{pair(m.after)}</td>
+							{#if m.before && m.after && m.before[0] !== m.after[0]}<td class="hot">book</td>{/if}
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+		{:else}
+			<p class="dim">0 moves</p>
+		{/if}
 	{/if}
 
 	{#if msg}<p class="hot">{msg}</p>{/if}
 
-	{#each c.books as b (b.number)}
-		{@const d = books[b.number]}
+	<h2>unfiled</h2>
+	{#if d.requests.length}
+		<ul class="plain">
+			{#each d.requests as r (r.image_id)}
+				<li class="row">
+					{#if r.thumb}<img class="thumb" src={r.thumb} alt="" />{/if}
+					<a href="/admin/pictures/{r.image_id}">{r.slug ?? r.image_id}</a>
+					<span class="dim">{r.status}</span>
+					{#if r.book !== null}<span>{place(r.book, r.position)}</span>{/if}
+					{#if r.job}<span class="dim">{r.job}</span>{/if}
+					{#if r.error}<span class="hot">{r.error}</span>{/if}
+					<button onclick={() => act(() => cols.retry(slug, r.image_id))}>retry</button>
+					<button class="link" onclick={() => unfile(r.image_id)}>drop</button>
+				</li>
+			{/each}
+		</ul>
+	{:else}
+		<p class="dim">0 unfiled</p>
+	{/if}
+
+	{#each d.books as b (b.number)}
 		<section class="book">
-			<h2>book {roman(b.number)} <span class="dim">{b.leaves.length} / {c.leaves_per_book}</span></h2>
-			<div class="cells" style:--n={c.leaves_per_book}>
-				{#each slots(b, c.leaves_per_book) as s, i (i)}
-					{#if s}
+			<h2>
+				book {roman(b.number)}
+				<span class="dim">{b.leaves.length} of {d.leaves_per_book}</span>
+				{#if b.anchor_text && !b.anchored}<span class="dim">anchor queued</span>{/if}
+			</h2>
+			{#if books[b.number]}
+				<label>
+					<span class="l">title</span>
+					<input bind:value={books[b.number].title} />
+				</label>
+				<label>
+					<span class="l">anchor</span>
+					<textarea rows="3" bind:value={books[b.number].anchor_text}></textarea>
+				</label>
+				<label>
+					<span class="l">tag hints</span>
+					<input bind:value={books[b.number].tag_hints} />
+				</label>
+				<div class="row">
+					<button disabled={!bookDirty(b)} onclick={() => saveBook(b.number)}>save</button>
+				</div>
+			{/if}
+			<div class="grid" style:--n={Math.min(d.leaves_per_book, 11)}>
+				{#each cells(b) as l, i (i)}
+					{#if l}
 						<button
 							class="cell"
-							class:pinned={s.pinned_position}
-							class:bound={s.pinned_book && !s.pinned_position}
-							class:sel={selected?.leaf.image_id === s.image_id}
-							onclick={() => choose(b.number, s)}
-							aria-label="{s.slug ?? s.image_id}, leaf {s.position}"
+							class:sel={picked?.leaf.image_id === l.image_id}
+							class:pin={l.pinned}
+							title="{i + 1} {l.slug ?? ''}"
+							onclick={() => pick(b.number, l)}
 						>
-							{#if s.thumb}<img src={s.thumb} alt="" loading="lazy" />{/if}
+							{#if l.thumb}<img src={l.thumb} alt="" loading="lazy" />{/if}
 						</button>
 					{:else}
-						<span class="cell empty"></span>
+						<span class="cell empty" title={String(i + 1)}></span>
 					{/if}
 				{/each}
 			</div>
-
-			{#if selected && selected.book === b.number}
-				{@const lf = selected.leaf}
-				<div class="row sel-row">
-					<a href="/admin/pictures/{lf.image_id}">{lf.slug ?? lf.image_id}</a>
-					<span class="dim">
-						leaf {lf.position}{lf.pinned_position ? ', pinned' : lf.pinned_book ? ', pinned to book' : ''}
-					</span>
-					<button onclick={() => act(() => col.pin(c.slug, lf.image_id, !lf.pinned_book))}>
-						{lf.pinned_book ? 'unpin' : 'pin'}
-					</button>
-					<input class="num" placeholder="book" aria-label="book" bind:value={to.book} />
-					<input class="num" placeholder="leaf" aria-label="leaf" bind:value={to.leaf} />
-					<button disabled={!to.book.trim()} onclick={() => act(() => col.place(c.slug, lf.image_id, to.book, to.leaf))}
-						>move</button
-					>
-					<button class="link" onclick={() => act(() => col.unfile(c.slug, lf.image_id))}>unfile</button>
-				</div>
-			{/if}
-
-			{#if d}
-				<div class="form">
-					<label><span class="l">title</span><input bind:value={d.title} /></label>
-					<label>
-						<span class="l">anchor <span class="dim">{b.anchored ? '' : 'not embedded'}</span></span>
-						<textarea rows="3" bind:value={d.anchor}></textarea>
-					</label>
-					<label><span class="l">hints</span><input bind:value={d.hints} /></label>
+			{#if picked && picked.book === b.number}
+				<div class="picked">
 					<div class="row">
-						<button
-							disabled={d.title === (b.title ?? '') && d.anchor === b.anchor_text && d.hints === b.tag_hints.join(', ')}
-							onclick={() =>
-								act(() =>
-									col.patchBook(c.slug, b.number, {
-										title: d.title,
-										anchor_text: d.anchor,
-										tag_hints: hints(d.hints)
-									})
-								)}>save</button
-						>
+						<a href="/admin/pictures/{picked.leaf.image_id}">{picked.leaf.slug ?? picked.leaf.image_id}</a>
+						<span>leaf {picked.leaf.position}</span>
+						<span class="dim">
+							{picked.leaf.pinned ? 'pinned' : picked.leaf.book_pinned ? 'book pinned' : 'auto'}
+						</span>
+						{#if picked.leaf.status !== 'live'}<span class="dim">{picked.leaf.status}</span>{/if}
+					</div>
+					<div class="row">
+						<select aria-label="book" bind:value={moveBook}>
+							{#each Array.from({ length: d.book_count }, (_, k) => k + 1) as n (n)}
+								<option value={String(n)}>{roman(n)}</option>
+							{/each}
+						</select>
+						<input
+							class="num"
+							type="number"
+							min="1"
+							max={d.leaves_per_book}
+							placeholder="leaf"
+							aria-label="leaf"
+							bind:value={moveLeaf}
+						/>
+						<button onclick={move}>move</button>
+						<button onclick={pinFlip}>{picked.leaf.pinned ? 'unpin' : 'pin'}</button>
+						<button class="link" onclick={() => unfile(picked!.leaf.image_id)}>unfile</button>
 					</div>
 				</div>
 			{/if}
 		</section>
 	{/each}
 
-	<section class="form">
-		<h2>tuning</h2>
-		{#each tuneKeys as k (k)}
-			<label class="row">
-				<span class="l">{k.replace('collections.', '')}</span>
-				<input class="num" bind:value={tunes[k]} />
-				<button
-					disabled={!tuning[k] || tunes[k] === String(tuning[k].value)}
-					onclick={() => act(() => col.tune(k, Number(tunes[k])))}>save</button
-				>
-				<span class="dim">{tuning[k]?.default}</span>
-			</label>
-		{/each}
-		<label class="check">
-			<input
-				type="checkbox"
-				checked={Boolean(tuning['collections.weekly_resort']?.value)}
-				onchange={(e) => act(() => col.tune('collections.weekly_resort', e.currentTarget.checked))}
-			/>
-			weekly re-sort
-		</label>
-	</section>
-
-	<section>
-		<h2>history</h2>
-		{#if c.history.length}
-			<ul class="plain moves">
-				{#each c.history as h, i (i)}
-					<li>
-						<span>{h.slug ?? h.image_id}</span>
-						<span class="dim">{where(h.from)} to {where(h.to)}</span>
-						<span class="dim">{h.reason}</span>
-						<span class="dim">{h.at.slice(0, 16).replace('T', ' ')}</span>
-					</li>
+	<h2>history</h2>
+	{#if d.history.length}
+		<table>
+			<tbody>
+				{#each d.history as h (h.id)}
+					<tr>
+						<td class="dim">{when(h.at)}</td>
+						<td><a href="/admin/pictures/{h.image_id}">{h.slug ?? h.image_id}</a></td>
+						<td class="dim">{place(h.from_book, h.from_position)}</td>
+						<td>{h.to_book === null ? 'out' : place(h.to_book, h.to_position)}</td>
+						<td class="dim">{h.reason}</td>
+					</tr>
 				{/each}
-			</ul>
-		{:else}
-			<p class="dim">0 moves</p>
-		{/if}
-	</section>
+			</tbody>
+		</table>
+	{:else}
+		<p class="dim">0 moves</p>
+	{/if}
 {/if}
 
 <style>
-	section {
-		margin-bottom: 2.5rem;
-	}
-	.form {
-		display: flex;
-		flex-direction: column;
-		gap: 0.75rem;
-		max-width: 40rem;
-	}
 	label {
 		display: flex;
 		flex-direction: column;
-		gap: 0.25rem;
-	}
-	label.row,
-	label.check {
-		flex-direction: row;
-		align-items: center;
-		gap: 0.75rem;
+		margin-top: 0.75rem;
+		max-width: 40rem;
 	}
 	.l {
-		font-size: 0.85rem;
-		color: var(--muted-foreground);
-	}
-	.row {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.5rem 1rem;
-	}
-	h2 {
-		font-size: 1rem;
-		font-weight: 500;
-		margin: 0 0 0.75rem;
-	}
-	.dim {
-		color: var(--muted-foreground);
-	}
-	.hot {
-		color: var(--primary);
-	}
-	.on {
 		color: var(--foreground);
 	}
-	.num {
-		width: 4rem;
+	textarea {
+		resize: vertical;
 	}
-	.t {
-		width: 2rem;
-		height: 2rem;
-		object-fit: cover;
+	.pair {
+		display: flex;
+		gap: 1.5rem;
 	}
-	.moves li {
+	.row {
+		margin-top: 0.75rem;
+	}
+	.tuning {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 0 1rem;
+		gap: 0 1.5rem;
+		align-items: flex-end;
 	}
-	.cells {
+	.tuning input[type='number'] {
+		width: 7rem;
+	}
+	.tick {
+		flex-direction: row;
+		align-items: center;
+		gap: 0.5rem;
+		color: var(--muted-foreground);
+	}
+	.tick input {
+		width: 1rem;
+		height: 1rem;
+		margin: 0;
+		accent-color: var(--primary);
+	}
+	.err {
+		font-size: 0.875rem;
+		overflow-wrap: anywhere;
+	}
+	.moves {
+		margin-top: 0.75rem;
+		width: auto;
+	}
+	.book h2 {
+		display: flex;
+		gap: 1rem;
+		align-items: baseline;
+	}
+	.grid {
 		display: grid;
-		grid-template-columns: repeat(var(--n), minmax(0, 1fr));
-		gap: 1px;
-		margin-bottom: 0.75rem;
-	}
-	@media (max-width: 48rem) {
-		.cells {
-			grid-template-columns: repeat(11, minmax(0, 1fr));
-		}
+		grid-template-columns: repeat(var(--n), 1fr);
+		gap: 0.25rem;
+		max-width: 40rem;
+		margin-top: 1rem;
 	}
 	.cell {
 		display: block;
 		aspect-ratio: 1;
+		min-width: 0;
 		padding: 0;
-		border: 0;
-		background: var(--ink-900);
 		overflow: hidden;
-		cursor: pointer;
+		outline: 1px solid var(--ink-800);
+		outline-offset: -1px;
+	}
+	button.cell {
+		outline: 0;
+		background: var(--muted);
+	}
+	button.cell.pin {
+		outline: 1px solid var(--secondary);
+		outline-offset: -1px;
+	}
+	button.cell.sel {
+		outline: 2px solid var(--primary);
+		outline-offset: -2px;
 	}
 	.cell img {
 		display: block;
@@ -368,22 +450,13 @@
 		height: 100%;
 		object-fit: cover;
 	}
-	.empty {
-		background: transparent;
-		box-shadow: inset 0 0 0 1px var(--ink-800);
-		cursor: default;
+	.picked {
+		margin-top: 0.75rem;
 	}
-	.pinned {
-		box-shadow: 0 0 0 1px var(--secondary);
+	.num {
+		width: 5rem;
 	}
-	.bound {
-		box-shadow: 0 0 0 1px var(--ink-500);
-	}
-	.sel {
-		outline: 2px solid var(--primary);
-		outline-offset: 1px;
-	}
-	.sel-row {
-		margin-bottom: 1rem;
+	td a {
+		overflow-wrap: anywhere;
 	}
 </style>

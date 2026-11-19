@@ -54,6 +54,17 @@ export type Detail = {
 	jobs: Job[];
 	// Unpublished only: the URLs Cloudflare may still hold, to purge by hand.
 	purge: string[] | null;
+	// Every collection, with this picture's leaf in it or its waiting request.
+	collections: PictureCollection[];
+};
+export type PictureCollection = {
+	slug: string;
+	title: string;
+	abbrev_latin: string;
+	book_count: number;
+	leaves_per_book: number;
+	leaf: { book: number; position: number; pinned: boolean; book_pinned: boolean } | null;
+	request: { book: number | null; position: number | null; error: string | null } | null;
 };
 
 const H = { 'X-Requested-With': 'penish' };
@@ -119,6 +130,7 @@ export async function detail(id: string | number): Promise<Detail> {
 		nudity_kinds: [],
 		jobs: [],
 		purge: null,
+		collections: [],
 		...d
 	};
 }

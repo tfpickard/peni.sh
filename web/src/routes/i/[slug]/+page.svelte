@@ -8,13 +8,30 @@
 	import Comments from '../../../lib/components/Comments.svelte';
 	import Overlap from '../../../lib/components/Overlap.svelte';
 	import { postView } from '../../../lib/api';
-	import { leafLine } from '../../../lib/collections';
 	import { markViewed } from '../../../lib/viewed';
+	import { roman } from '../../../lib/roman';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
 
 	const image = $derived(data.image);
+	// The abbreviation, never the nickname: `ptp iii, leaf 14`, with the latest earlier
+	// place when the leaf has moved, naming the book only when that changed too.
+	const leaf = $derived.by(() => {
+		const l = image?.leaf;
+		if (!l) return null;
+		const abbrev = l.collection.abbrev_latin.toLowerCase();
+		const p = l.previous;
+		return {
+			href: `/collections/${l.collection.slug}/${l.book}`,
+			text: `${abbrev} ${roman(l.book)}, leaf ${l.position}`,
+			was: !p
+				? null
+				: p.book === l.book
+					? `formerly leaf ${p.position}`
+					: `formerly ${abbrev} ${roman(p.book)}, leaf ${p.position}`
+		};
+	});
 	const sizes = '(min-width: 60rem) 57rem, 100vw';
 	const metrics = $derived(
 		image
@@ -37,15 +54,6 @@
 		});
 	});
 	const title = $derived(image?.caption?.body ? `${image.caption.body} -- peni.sh` : 'peni.sh');
-	const leaf = $derived(image?.leaf ?? null);
-	// The previous place in as few words as tell it apart: the leaf alone within one book.
-	const formerly = $derived.by(() => {
-		const p = leaf?.previous;
-		if (!leaf || !p) return '';
-		return p.book === leaf.book
-			? `leaf ${p.position}`
-			: leafLine(leaf.collection.abbrev_latin, p.book, p.position);
-	});
 	const inNow = $derived(image?.galleries?.filter((g) => g.current) ?? []);
 	const wasIn = $derived(image?.galleries?.filter((g) => !g.current) ?? []);
 
@@ -290,9 +298,7 @@
 	{/if}
 	{#if leaf}
 		<p class="leaf">
-			<a href="/collections/{leaf.collection.slug}/{leaf.book}"
-				>{leafLine(leaf.collection.abbrev_latin, leaf.book, leaf.position)}</a
-			>{#if formerly}{' '}<span class="formerly">(formerly {formerly})</span>{/if}
+			<a href={leaf.href}>{leaf.text}</a>{#if leaf.was}<span class="was">({leaf.was})</span>{/if}
 		</p>
 	{/if}
 	{#if image.tags.length}
@@ -394,15 +400,16 @@
 		margin-right: 1rem;
 	}
 	.leaf {
-		margin: 0.75rem 0 0;
-		font-size: 0.85rem;
+		margin: 1rem 0 0;
+		font-size: 0.9rem;
 	}
 	.leaf a {
 		color: var(--muted-foreground);
 	}
-	.formerly {
+	.was {
+		margin-left: 0.5rem;
+		font-size: 0.8rem;
 		color: var(--ink-500);
-		font-size: 0.75rem;
 	}
 	.tags {
 		margin: 1.5rem 0 0;

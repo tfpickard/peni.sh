@@ -7,9 +7,9 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from penish.api.media import variants_for, variants_for_many
-from penish.api.routes_collections import leaf_for
 from penish.api.social import approved_comments, vote_summary, voter_for
 from penish.categories import LABELS, SLUGS
+from penish.collection.store import leaf_for_image
 from penish.config import get_settings
 from penish.mycelium.store import galleries_for_image, hyphae_for, overgrowth_by_id
 from penish.similarity import Mode, image_metrics, neighbors
@@ -358,7 +358,7 @@ async def image_detail(
         prev, nxt = await _adjacent(conn, img)
         hyphae = await hyphae_for(conn, img["id"])
         galleries = await galleries_for_image(conn, img["id"])
-        leaf = await leaf_for(conn, img["id"])
+        leaf = await leaf_for_image(conn, img["id"])
 
     mode: Mode = sim or "auto"
     nb = await neighbors(pool, img["id"], k=_K, mode=mode)

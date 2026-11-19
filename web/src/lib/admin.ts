@@ -1,6 +1,8 @@
 export type AdminState = { state: string; slug?: string; error?: string };
 export type Recent = { slug: string | null; status: string; created_at: string; thumb: string | null };
 export type Fields = { caption: string; description: string; tags: string; prompt: string };
+// Written as a `_collection.txt` sidecar by the server. book and leaf blank: the filer picks.
+export type Filing = { collection: string; book: string; leaf: string };
 
 const H = { 'X-Requested-With': 'penish' };
 
@@ -23,40 +25,28 @@ export async function login(password: string): Promise<'ok' | 'no' | 'wait'> {
 export const logout = () => fetch('/api/admin/logout', { method: 'POST', headers: H });
 
 // XHR rather than fetch: fetch has no upload progress.
-// `shared` rides on every file of a batch (the collection); `fields` only on a lone one.
 export function upload(
 	file: File,
 	fields: Fields | null,
 	onProgress: (fraction: number) => void,
-	shared: Record<string, string> = {}
+	filing: Filing | null = null
 ): Promise<{ stem: string; sha256: string }> {
 	return new Promise((resolve, reject) => {
 		const body = new FormData();
 		body.append('image', file);
 		if (fields) for (const [k, v] of Object.entries(fields)) if (v) body.append(k, v);
-		for (const [k, v] of Object.entries(shared)) if (v) body.append(k, v);
+		if (filing?.collection) for (const [k, v] of Object.entries(filing)) if (v) body.append(k, v);
 		const xhr = new XMLHttpRequest();
 		xhr.open('POST', '/api/admin/upload');
 		xhr.setRequestHeader('X-Requested-With', 'penish');
 		xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
 		xhr.onload = () => {
 			if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
-			else reject(new Error(xhr.status === 413 ? 'too large' : xhr.status === 415 ? 'not an image' : detail(xhr)));
+			else reject(new Error(xhr.status === 413 ? 'too large' : xhr.status === 415 ? 'not an image' : 'failed'));
 		};
 		xhr.onerror = () => reject(new Error('failed'));
 		xhr.send(body);
 	});
-}
-
-// A refused collection line says why (`no book viii`); anything else is just failed.
-function detail(xhr: XMLHttpRequest): string {
-	if (xhr.status !== 422) return 'failed';
-	try {
-		const d = JSON.parse(xhr.responseText).detail;
-		return typeof d === 'string' ? d : 'failed';
-	} catch {
-		return 'failed';
-	}
 }
 
 export async function status(sha256: string, stem: string): Promise<AdminState> {

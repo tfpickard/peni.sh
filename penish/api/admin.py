@@ -22,8 +22,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from penish.api.media import variants_for_many
-from penish.collections import Placement, format_spec, parse_number
-from penish.collections import store as collection_store
+from penish.collection.numerals import Request as Filing
+from penish.collection.numerals import format_line, parse_line, parse_number
 from penish.config import Settings, get_settings
 
 MAX_BYTES = 50 * 1024 * 1024
@@ -188,6 +188,30 @@ def _tags(raw: str) -> str:
     return "\n".join(seen)
 
 
+def _collection_line(collection: object, book: object, leaf: object) -> str | None:
+    """The form's collection fields as the sidecar line rsync would carry, so both
+    arrivals take one path. Whether the book and leaf exist is ingest's to say."""
+    if not isinstance(collection, str) or not collection.strip():
+        return None
+
+    def num(v: object) -> int | None:
+        if not isinstance(v, str) or not v.strip():
+            return None
+        try:
+            return parse_number(v)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="bad leaf") from None
+
+    try:
+        req = parse_line(collection)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="bad collection") from None
+    b, n = num(book), num(leaf)
+    if n is not None and b is None:
+        raise HTTPException(status_code=422, detail="a leaf needs a book")
+    return format_line(Filing(req.collection, b, n))
+
+
 def _write_tmp(inbox: Path, name: str, data: bytes) -> Path:
     """Dotfile first, then the caller renames, so the watcher only sees finished files."""
     tmp = inbox / f".{name}.{uuid.uuid4().hex[:8]}"
@@ -214,32 +238,6 @@ def _stream(dest: Path, head: bytes, src: BinaryIO) -> str:
         f.flush()
         os.fsync(f.fileno())
     return digest.hexdigest()
-
-
-def _form_number(raw: object) -> int | None:
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    try:
-        return parse_number(raw)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from None
-
-
-async def _collection_line(request: Request, slug: object, book: object, leaf: object) -> str:
-    """The collection sidecar for an upload, checked now so a typo is refused at the form
-    instead of turning up later on the queue page."""
-    if not isinstance(slug, str) or not slug.strip():
-        return ""
-    async with request.app.state.pool.connection() as conn:
-        c = await collection_store.get(conn, slug=slug.strip())
-    if c is None:
-        raise HTTPException(status_code=422, detail="no such collection")
-    want = Placement(c.slug, _form_number(book), _form_number(leaf))
-    try:
-        collection_store.check_numbers(c, want.book, want.position)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from None
-    return format_spec(want)
 
 
 @router.post("/upload", dependencies=[Depends(require_admin)])
@@ -275,11 +273,9 @@ async def upload(request: Request) -> dict[str, str]:
             raw_tags = form.get("tags")
             if isinstance(raw_tags, str) and _tags(raw_tags):
                 sidecars.append((f"{stem}_tags.txt", _tags(raw_tags) + "\n"))
-            spec = await _collection_line(
-                request, form.get("collection"), form.get("book"), form.get("leaf")
-            )
-            if spec:
-                sidecars.append((f"{stem}_collection.txt", spec + "\n"))
+            line = _collection_line(form.get("collection"), form.get("book"), form.get("leaf"))
+            if line:
+                sidecars.append((f"{stem}_collection.txt", line + "\n"))
 
         # Sidecars land before the image: the settle timer is keyed by stem, and an image
         # arriving first could be claimed without them.

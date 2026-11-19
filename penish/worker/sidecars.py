@@ -45,10 +45,10 @@ def _lines(p: Path) -> list[str]:
     return list(dict.fromkeys(t for t in tags if t))
 
 
-def _lenient(p: Path) -> str:
-    # Never raises: a bad collection line must not fail the picture, so it is read as
-    # whatever it is and judged by ingest, which can report it without stopping.
-    return p.read_text(encoding="utf-8", errors="replace").strip()
+def _raw(p: Path) -> str:
+    # Never raises on content: a bad collection line must not fail the picture, so it is
+    # read as whatever it is and judged later, where a mistake can be reported instead.
+    return p.read_bytes().decode("utf-8", errors="replace").strip()
 
 
 def _embedding(p: Path) -> Embedding:
@@ -87,7 +87,7 @@ SIDECARS: dict[str, SidecarSpec] = {
     "_tags": SidecarSpec("tags", _lines),
     "_prompt": SidecarSpec("prompt", _text),
     "_embedding": SidecarSpec("embedding", _embedding, ".json"),
-    "_collection": SidecarSpec("collection", _lenient),
+    "_collection": SidecarSpec("collection", _raw),
 }
 
 

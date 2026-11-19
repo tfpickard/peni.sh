@@ -1,5 +1,8 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import * as admin from '../../admin';
+	import * as cols from '../../admin-collections';
+	import { roman } from '../../roman';
 
 	type Row = {
 		name: string;
@@ -17,14 +20,25 @@
 	let fields = $state<admin.Fields>({ caption: '', description: '', tags: '', prompt: '' });
 	let busy = $state(false);
 	let over = $state(false);
-	// One checkbox while there is one collection; book and leaf pin the placement.
-	let filing = $state({ on: false, book: '', leaf: '' });
-	const filed = (): Record<string, string> =>
-		filing.on
-			? { collection: 'pansophicon', book: filing.book.trim(), leaf: single ? filing.leaf.trim() : '' }
-			: {};
+	// One sidecar names one collection, so ticking one unticks any other.
+	let collections = $state<cols.Summary[]>([]);
+	const noFiling: admin.Filing = { collection: '', book: '', leaf: '' };
+	let filing = $state<admin.Filing>({ ...noFiling });
+	const chosen = $derived(collections.find((c) => c.slug === filing.collection) ?? null);
 
 	const single = $derived(rows.length === 1);
+
+	onMount(async () => {
+		try {
+			collections = (await cols.list()).collections;
+		} catch {
+			collections = [];
+		}
+	});
+
+	function tick(slug: string) {
+		filing = filing.collection === slug ? { ...noFiling } : { ...noFiling, collection: slug };
+	}
 
 	function pick(files: FileList | File[] | null) {
 		if (!files) return;
@@ -73,12 +87,9 @@
 		for (const row of rows) {
 			try {
 				row.state = 'uploading';
-				const { sha256, stem } = await admin.upload(
-					row.file,
-					text,
-					(f) => (row.progress = f),
-					filed()
-				);
+				// A leaf is one slot; several pictures can share a book but not a leaf.
+				const f = filing.collection ? { ...filing, leaf: single ? filing.leaf : '' } : null;
+				const { sha256, stem } = await admin.upload(row.file, text, (p) => (row.progress = p), f);
 				row.progress = 1;
 				row.state = 'waiting';
 				pending.push(track(row, sha256, stem));
@@ -89,7 +100,7 @@
 		}
 		busy = false;
 		fields = { caption: '', description: '', tags: '', prompt: '' };
-		filing = { on: false, book: '', leaf: '' };
+		filing = { ...noFiling };
 		await Promise.all(pending);
 		ondone?.();
 	}
@@ -140,17 +151,32 @@
 	></textarea>
 	<textarea placeholder="prompt" rows="3" bind:value={fields.prompt} disabled={!single}></textarea>
 
-	<div class="filing">
-		<label class="check"><input type="checkbox" bind:checked={filing.on} /> pansophicon</label>
-		<input class="num" placeholder="book" aria-label="book" bind:value={filing.book} disabled={!filing.on} />
-		<input
-			class="num"
-			placeholder="leaf"
-			aria-label="leaf"
-			bind:value={filing.leaf}
-			disabled={!filing.on || !single}
-		/>
-	</div>
+	{#each collections as c (c.slug)}
+		<label class="tick">
+			<input type="checkbox" checked={filing.collection === c.slug} onchange={() => tick(c.slug)} />
+			{c.slug}
+		</label>
+	{/each}
+	{#if chosen}
+		<div class="place">
+			<select aria-label="book" bind:value={filing.book}>
+				<option value="">book</option>
+				{#each Array.from({ length: chosen.book_count }, (_, i) => i + 1) as n (n)}
+					<option value={String(n)}>{roman(n)}</option>
+				{/each}
+			</select>
+			<input
+				class="leaf"
+				type="number"
+				min="1"
+				max={chosen.leaves_per_book}
+				placeholder="leaf"
+				aria-label="leaf"
+				bind:value={filing.leaf}
+				disabled={!single || !filing.book}
+			/>
+		</div>
+	{/if}
 
 	<div class="actions">
 		<button disabled={busy || !rows.length}>post</button>
@@ -198,22 +224,35 @@
 		color: var(--ink-500);
 		cursor: default;
 	}
-	.filing {
-		display: flex;
-		align-items: center;
-		gap: 1rem;
+	select {
+		background: transparent;
+		color: var(--foreground);
+		border: 0;
+		border-bottom: 1px solid var(--ink-700);
+		font: inherit;
+		padding: 0.4rem 0;
 	}
-	.check {
+	select option {
+		background: var(--background);
+	}
+	.tick {
 		display: flex;
 		align-items: center;
 		gap: 0.5rem;
 		color: var(--muted-foreground);
 	}
-	.check input {
+	.tick input {
+		width: 1rem;
+		height: 1rem;
+		margin: 0;
 		accent-color: var(--primary);
 	}
-	.num {
-		width: 4rem;
+	.place {
+		display: flex;
+		gap: 1.5rem;
+	}
+	.leaf {
+		width: 5rem;
 	}
 	.up {
 		padding: 0.75rem;
