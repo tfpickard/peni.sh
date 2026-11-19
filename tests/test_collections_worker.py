@@ -11,7 +11,7 @@ import pytest
 
 from penish.collection import store
 from penish.config import Settings
-from penish.worker import collection_jobs
+from penish.worker import collection_jobs, unpublish
 from penish.worker.jobs import Job, SoftError
 from tests.test_ingest import DIM, FakeEmbedder, drop, png, q, run
 
@@ -424,3 +424,31 @@ async def test_anchor_edit_race_keeps_the_new_text(p: Any, settings: Settings) -
             conn, c["id"], 1, stale[0]["anchor_text"], np.asarray(e(0)), settings
         )
     assert not stored
+
+
+async def test_republish_files_a_request_made_while_down(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    image_id = await picture(p, settings, 1, e(2), status="unpublished")
+    c = await collection(p)
+    async with p.connection() as conn:
+        await store.request(conn, c, image_id, None, None)
+    assert await q(p, "select * from jobs where type = %s", store.FILE_JOB) == []
+    # Media present where an unpublished picture keeps it, so the republish goes through.
+    settings.media_held.mkdir(parents=True, exist_ok=True)
+    for ext in ("avif", "webp"):
+        (settings.media_held / f"{1:064x}-10.{ext}").write_bytes(b"x")
+    await unpublish.handle_republish(
+        Job(
+            id=0,
+            type=unpublish.REPUBLISH,
+            payload={"image_id": image_id},
+            attempts=1,
+            last_error=None,
+        ),
+        pool=p,
+        settings=settings,
+    )
+    rows = await q(p, "select payload from jobs where type = %s", store.FILE_JOB)
+    assert [r["payload"] for r in rows] == [{"image_id": image_id, "collection_id": c["id"]}]
+    await file(p, settings, image_id)
+    assert (await leaves(p))[image_id][0] == 3

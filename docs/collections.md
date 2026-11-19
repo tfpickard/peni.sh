@@ -278,7 +278,8 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   start for any anchor without a vector under today's model and whenever an anchor's text
   changes. A filing or re-sort embeds any stale anchor first.
 - `tag_overlap` is the overlap coefficient between the hints and the picture's tags and
-  their words, so `serpent` matches `coiled serpent`.
+  their words, so `serpent` matches `coiled serpent`. It is capped at 1: one tag can meet
+  several hints (`alchemy lab` meets `alchemy` and `lab`).
 - When scoring a leaf against its own book during a re-sort, the leaf is left out of that
   book's centroid and fill, so staying put earns no self-similarity.
 - The re-sort runs leaf by leaf against everyone else's current book and repeats until a
@@ -288,7 +289,9 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   current model or is not live. The second kind keeps its slot unless an owner pin takes it.
 - Positions: the fixed leaves cut the book into segments. Each free leaf goes to the
   segment beside the fixed leaf (or the anchor, for the opening segment) it is nearest, with
-  room permitting. Inside a segment the chain starts at the left fixed leaf, or at the leaf
+  room permitting. The two segments on either side of one fixed leaf are equally near any
+  leaf that is nearest it; that tie goes to the segment with more room, so a lone pin at 14
+  does not crowd the book into leaves 1 to 13. Inside a segment the chain starts at the left fixed leaf, or at the leaf
   nearest the anchor; greedy nearest neighbor, then 2-opt with both ends held. Cumulative
   length maps onto the segment's slots between its two fixed leaves. Collisions shift
   forward then back, keeping chain order.
@@ -300,6 +303,8 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
 - A malformed sidecar, an unknown collection, or a book or leaf outside the collection's
   shape becomes a failed `collection_file` job on `/admin/queue` with
   `collection sidecar: ...`. The picture publishes regardless.
+- A request for a picture that is down waits. Going live, republishing, and the worker
+  start sweep each queue its filing.
 
 ### Site
 

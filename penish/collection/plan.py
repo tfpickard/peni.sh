@@ -131,7 +131,9 @@ def tag_overlap(tags: Iterable[str], hints: Iterable[str]) -> float:
     if not words:
         return 0.0
     hit = len(h & words)
-    return hit / min(len(h), len(set(tags)) or 1)
+    # Capped: one tag can match several hints (`alchemy lab` meets `alchemy` and `lab`),
+    # which would otherwise score past 1 and give the hints more say than alpha means.
+    return min(1.0, hit / min(len(h), len(set(tags)) or 1))
 
 
 def centroid(
@@ -395,10 +397,15 @@ def positions(book: Book, leaves: list[Leaf], cap: int) -> dict[int, int]:
             ds.append(_dist(leaf.vec, book.anchor))
         return min(ds) if ds else 0.0
 
-    # Most decided first, so a leaf that clearly belongs in a small gap gets it.
+    # Most decided first, so a leaf that clearly belongs in a small gap gets it. Two gaps
+    # on either side of one fixed leaf are equally near every leaf that is nearest it; the
+    # tie goes to the gap with more room, or a lone pin at 14 would crowd the whole book
+    # into leaves 1 to 13 and leave 15 to 77 empty.
     ranked = sorted(free, key=lambda x: (min((near(x, s) for s in segs), default=0.0), x.image_id))
     for leaf in ranked:
-        options = sorted((s for s in segs if s.room > 0), key=lambda s: (near(leaf, s), s.a))
+        options = sorted(
+            (s for s in segs if s.room > 0), key=lambda s: (near(leaf, s), -s.room, s.a)
+        )
         options[0].members.append(leaf)
     for s in segs:
         out |= _lay(s, book.anchor)

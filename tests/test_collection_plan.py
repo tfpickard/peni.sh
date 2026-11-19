@@ -152,6 +152,8 @@ def test_tag_overlap() -> None:
     assert tag_overlap([], ["serpent"]) == 0.0
     assert tag_overlap(["x"], []) == 0.0
     assert tag_overlap(["Moon"], ["moon"]) == 1.0
+    # One tag meeting two hints is a full match, not a double one.
+    assert tag_overlap(["alchemy lab"], ["alchemy", "lab", "flask"]) == 1.0
 
 
 def test_fill_pressure_spreads_a_near_tie() -> None:
@@ -319,3 +321,28 @@ def test_tuning_from_json_ignores_rubbish() -> None:
     assert t.weekly_resort is False
     assert Tuning.from_json({"weekly_resort": True}).weekly_resort is True
     assert Tuning.from_json(None) == Tuning()
+
+
+def test_a_lone_pin_leaves_the_long_side_to_the_rest() -> None:
+    # No anchor, so both gaps beside the pin are equally near every free leaf.
+    book = Book(1, None)
+    pin = leaf(1, 1, 14, e(0), pinned=True, book_pinned=True)
+    free = [leaf(10 + k, 1, 0, e(1, k + 2, w=(1.0, 0.2))) for k in range(4)]
+    pos = positions(book, [pin, *free], 77)
+    _check(pos, 77)
+    assert pos[1] == 14
+    assert all(pos[x.image_id] > 14 for x in free) and max(pos.values()) == 77
+
+
+def test_a_tie_between_gaps_goes_to_the_roomier_one() -> None:
+    # Two pins on one vector: the gaps on either side of each tie. The anchor points
+    # elsewhere, so it does not pull anyone into the opening gap.
+    book = Book(1, e(5))
+    pins = [
+        leaf(1, 1, 20, e(0), pinned=True, book_pinned=True),
+        leaf(2, 1, 60, e(0), pinned=True, book_pinned=True),
+    ]
+    free = [leaf(10 + k, 1, 0, e(1, k + 6, w=(1.0, 0.2))) for k in range(4)]
+    pos = positions(book, [*pins, *free], 77)
+    _check(pos, 77)
+    assert all(20 < pos[x.image_id] < 60 for x in free)
