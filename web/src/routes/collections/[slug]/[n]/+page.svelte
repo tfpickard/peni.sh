@@ -4,6 +4,9 @@
 
 	let { data } = $props();
 	const b = $derived(data.book);
+	// Only the filled slots, in leaf order. The leaf number stays on each one, so the
+	// book's shape is still there without anyone scrolling past the gaps.
+	const leaves = $derived(b ? b.slots.filter((s) => s !== null) : []);
 </script>
 
 <svelte:head>
@@ -15,18 +18,20 @@
 {:else}
 	<p class="up"><a href="/collections/{data.slug}">{b.collection.title}</a></p>
 	<h1>book {roman(b.number)}{#if b.title}<span class="title">{b.title}</span>{/if}</h1>
-	<!-- The grid never closes up around an empty slot. -->
-	<div class="grid">
-		{#each b.slots as s, i (i)}
-			{#if s}
-				<a class="cell" href="/i/{s.slug}">
-					<Picture image={s} sizes="(min-width: 60rem) 5rem, (min-width: 48rem) 9vw, 14vw" />
+	{#if leaves.length}
+		<div class="grid">
+			{#each leaves as s (s.position)}
+				<a class="leaf" href="/i/{s.slug}">
+					<span class="cell">
+						<Picture image={s} sizes="(min-width: 60rem) 5rem, (min-width: 48rem) 9vw, 14vw" />
+					</span>
+					<span class="n">{s.position}</span>
 				</a>
-			{:else}
-				<span class="cell empty"></span>
-			{/if}
-		{/each}
-	</div>
+			{/each}
+		</div>
+	{:else}
+		<p class="flat">0 leaves</p>
+	{/if}
 {/if}
 
 <style>
@@ -54,7 +59,7 @@
 		color: var(--muted-foreground);
 		font-weight: 400;
 	}
-	/* 7 by 11 on a phone, 11 by 7 where there is room. */
+	/* 7 across on a phone, 11 where there is room: the book's own 7 by 11. */
 	.grid {
 		display: grid;
 		grid-template-columns: repeat(7, 1fr);
@@ -66,15 +71,21 @@
 			gap: 0.5rem;
 		}
 	}
+	.leaf {
+		display: block;
+		min-width: 0;
+	}
 	.cell {
 		display: block;
 		aspect-ratio: 1;
-		min-width: 0;
 		overflow: hidden;
 	}
-	.empty {
-		outline: 1px solid var(--ink-800);
-		outline-offset: -1px;
+	.n {
+		display: block;
+		margin-top: 0.15rem;
+		font-size: 0.7rem;
+		font-variant-numeric: tabular-nums;
+		color: var(--muted-foreground);
 	}
 	/* Square crops: the picture fills its slot like the rest of the leaves. */
 	.cell :global(.frame) {

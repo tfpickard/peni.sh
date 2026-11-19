@@ -6,7 +6,7 @@ This spec describes what to build and why. Where it guesses at existing code (ta
 
 ## What it is
 
-The Pansophicon is a subset of peni.sh pictures presented as leaves from a pre-modern codex that is being restored. Its full title is Greek: **Πανσοφικὸν τῶν πάντων** (*Pansophikon ton panton*), abbreviated **ΠΤΠ** or **PTP**. It is believed to have had **7 books of 77 leaves** each. That number is the shape of the thing. It will never be filled, and the empty slots are part of the presentation.
+The Pansophicon is a subset of peni.sh pictures presented as leaves from a pre-modern codex that is being restored. Its full title is Greek: **Πανσοφικὸν τῶν πάντων** (*Pansophikon ton panton*), abbreviated **ΠΤΠ** or **PTP**. It is believed to have had **7 books of 77 leaves** each. That number is the shape of the thing. It will never be filled. The shape shows in the leaf numbers, not in drawn empty slots: the site never makes anyone scroll past gaps.
 
 Three rules shape the whole design:
 
@@ -135,7 +135,7 @@ A list with one entry. It shows the full Greek title, the abbreviation, and a co
 
 - The title `Πανσοφικὸν τῶν πάντων`, set in the site's normal heading treatment, not the tendril font. The tendril font stays the site's own flourish.
 - The `preamble`, as owner text. Seed it with the draft below, but it is Tom's to edit.
-- Seven rows, one per book. Each row has a label (`book iii`, plus the owner title if set) and a compact strip of 77 cells. Filled cells show a tiny thumbnail or blurhash and link to `/i/<slug>`. Empty cells are a faint outline with no hover text and no link.
+- Seven rows, one per book. Each row has a label (`book iii`, plus the owner title if set, plus `3 leaves`) and a compact strip of the filled leaves only, in leaf order, as small thumbnails linking to `/i/<slug>`. Empty slots are not drawn.
 
 Seed preamble (owner can replace):
 
@@ -143,7 +143,7 @@ Seed preamble (owner can replace):
 
 ### `/collections/pansophicon/<n>`
 
-The book page: a grid of 77 cells in leaf order, larger than the strip. Filled cells show the picture and link through. Empty cells stay empty, and the grid does not collapse around them. On a phone, a 7-wide grid with 11 rows is fine. The emptiness is the point.
+The book page: a sparse table drawn collapsed. Only filled leaves are shown, in leaf order, each with its leaf number under it, so leaf 2 is followed directly by leaf 19 with nothing drawn between. The grid keeps the book's 7 by 11 as its width: 7 across on a phone, 11 elsewhere. A book with no leaves says `0 leaves`. The API still returns all 77 slots with nulls; the page drops them.
 
 ### Picture page `/i/<slug>`
 
@@ -305,9 +305,13 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
 
 - The nav fetches `/api/collections` once and adds `collections` only when the list is not
   empty.
-- The collection page strip is one row of every slot at every width. On a phone the cells
-  are ticks of colour; the book page is where they get room.
-- The book page is 7 wide on a phone and 11 wide elsewhere, empty slots kept.
+- Empty slots are never drawn on the public site. The collection page shows each book's
+  filled leaves as a row of small thumbnails with a count; the book page shows them in a
+  7-wide (phone) or 11-wide grid, in leaf order, each labelled with its leaf number. An
+  earlier version drew all 77 cells; Tom ruled it out, since a book with 5 leaves meant
+  scrolling past 72 empty squares.
+- `/admin/collections` still draws all 77 cells per book: there the empty slots are where
+  a pin or move can go.
 - The picture page line uses `abbrev_latin` lowercased: `ptp iii, leaf 14`, then
   `(formerly leaf 22)` within a book or `(formerly ptp v, leaf 3)` across books.
 - Server-rendered titles: the Greek title for `/collections/<slug>`, `ΠΤΠ iii` for a book.

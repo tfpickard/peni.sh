@@ -1,5 +1,4 @@
 <script lang="ts">
-	import type { StripLeaf } from '../../../lib/api';
 	import { roman } from '../../../lib/roman';
 
 	let { data } = $props();
@@ -12,12 +11,7 @@
 			.filter(Boolean)
 	);
 
-	// Every slot of a book, filled or not, so the strip keeps the book's shape.
-	function cells(leaves: StripLeaf[], n: number): (StripLeaf | null)[] {
-		const out: (StripLeaf | null)[] = Array(n).fill(null);
-		for (const l of leaves) if (l.position >= 1 && l.position <= n) out[l.position - 1] = l;
-		return out;
-	}
+	const count = (n: number) => (n === 1 ? '1 leaf' : `${n} leaves`);
 </script>
 
 <svelte:head><title>{c ? c.title : 'not here'} -- peni.sh</title></svelte:head>
@@ -35,23 +29,23 @@
 			<li>
 				<a class="label" href="/collections/{c.slug}/{b.number}">
 					book {roman(b.number)}{#if b.title}<span class="title">{b.title}</span>{/if}
+					<span>{count(b.leaves.length)}</span>
 				</a>
-				<div class="strip" style:--n={c.leaves_per_book}>
-					{#each cells(b.leaves, c.leaves_per_book) as l, i (i)}
-						{#if l}
+				<!-- Only the leaves that survive, in leaf order; the gaps between them are not drawn. -->
+				{#if b.leaves.length}
+					<div class="strip">
+						{#each b.leaves as l (l.position)}
 							<a
-								class="cell filled"
+								class="cell"
 								href="/i/{l.slug}"
 								style:background-color={l.palette?.[0]}
 								aria-label={l.slug}
 							>
 								{#if l.src}<img src={l.src} alt="" loading="lazy" decoding="async" />{/if}
 							</a>
-						{:else}
-							<span class="cell"></span>
-						{/if}
-					{/each}
-				</div>
+						{/each}
+					</div>
+				{/if}
 			</li>
 		{/each}
 	</ol>
@@ -90,29 +84,17 @@
 	.title {
 		color: var(--foreground);
 	}
-	/* Every slot in one row, at any width. On a phone the cells are ticks; the book page
-	   is where they get room. */
 	.strip {
-		display: grid;
-		grid-template-columns: repeat(var(--n), 1fr);
-		gap: 1px;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
 	}
 	.cell {
 		display: block;
-		aspect-ratio: 1;
-		min-width: 0;
+		flex: none;
+		width: 2.75rem;
+		height: 2.75rem;
 		overflow: hidden;
-		background: var(--ink-900);
-	}
-	@media (min-width: 48rem) {
-		.cell {
-			background: none;
-			outline: 1px solid var(--ink-800);
-			outline-offset: -1px;
-		}
-	}
-	.filled {
-		outline: 0;
 	}
 	.cell img {
 		display: block;
