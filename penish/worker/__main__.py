@@ -14,7 +14,7 @@ from penish import logs
 from penish.config import get_settings
 from penish.db import make_pool
 from penish.mycelium.tick import run_loop as run_mycelium
-from penish.worker import jobs
+from penish.worker import collection_jobs, jobs
 from penish.worker.admin_jobs import make_handlers
 from penish.worker.categorize import enqueue_uncategorized, handle_categorize
 from penish.worker.embed import Embedder
@@ -112,6 +112,12 @@ async def main() -> None:
         n = await enqueue_unphrased(pool, settings)
         if n:
             log.info("enqueued %d pictures to embed offers and needs", n)
+        n = await collection_jobs.enqueue_unfiled(pool)
+        if n:
+            log.info("enqueued %d pictures to file into collections", n)
+        n = await collection_jobs.enqueue_anchors(pool, settings)
+        if n:
+            log.info("enqueued %d collections to embed book anchors", n)
 
         watcher = InboxWatcher(settings, enqueue, has_job=has_job)
         await watcher.recover()
@@ -133,6 +139,7 @@ async def main() -> None:
             run_mycelium(pool, stop),
             run_naming(pool, stop),
             logs.run_prune_loop(pool, stop),
+            collection_jobs.run_weekly(pool, stop),
             serve_embed(embedder, stop, port=settings.embed_server_port),
         )
         warm.cancel()

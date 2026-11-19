@@ -1,6 +1,8 @@
 export type AdminState = { state: string; slug?: string; error?: string };
 export type Recent = { slug: string | null; status: string; created_at: string; thumb: string | null };
 export type Fields = { caption: string; description: string; tags: string; prompt: string };
+// Written as a `_collection.txt` sidecar by the server. book and leaf blank: the filer picks.
+export type Filing = { collection: string; book: string; leaf: string };
 
 const H = { 'X-Requested-With': 'penish' };
 
@@ -26,12 +28,14 @@ export const logout = () => fetch('/api/admin/logout', { method: 'POST', headers
 export function upload(
 	file: File,
 	fields: Fields | null,
-	onProgress: (fraction: number) => void
+	onProgress: (fraction: number) => void,
+	filing: Filing | null = null
 ): Promise<{ stem: string; sha256: string }> {
 	return new Promise((resolve, reject) => {
 		const body = new FormData();
 		body.append('image', file);
 		if (fields) for (const [k, v] of Object.entries(fields)) if (v) body.append(k, v);
+		if (filing?.collection) for (const [k, v] of Object.entries(filing)) if (v) body.append(k, v);
 		const xhr = new XMLHttpRequest();
 		xhr.open('POST', '/api/admin/upload');
 		xhr.setRequestHeader('X-Requested-With', 'penish');

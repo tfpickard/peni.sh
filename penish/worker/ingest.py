@@ -22,6 +22,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
+from penish.collection import store as collection
 from penish.config import Settings
 from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
@@ -429,6 +430,8 @@ async def _go_live(conn: Conn, image_id: int, base: str, surprise: float | None)
                             " on conflict do nothing",
                             (kind, Jsonb({"image_id": image_id}), f"{kind}:{image_id}"),
                         )
+                    # Filing waits for publish; a request written at ingest is filed now.
+                    await conn.execute(collection.ENQUEUE_FOR_IMAGE, (image_id,))
                     # A new picture starts as just seen, not as neglected since upload.
                     # A row left from an earlier stint (or an older backfill) would carry
                     # a stale clock, so going live resets it; views stay counted.
@@ -612,6 +615,10 @@ async def _ingest_locked(
         )
 
     caption_changed = await _apply_owner(conn, image_id, group)
+    line = group.values.get("collection")
+    if line is not None:
+        # Before the publish gate, so the request is waiting when the picture goes live.
+        await collection.request_from_line(conn, image_id, line)
 
     img_bytes: bytes | None = None
     kinds = await nudity.kinds_for(conn, image_id)

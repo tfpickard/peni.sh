@@ -59,6 +59,14 @@ export type ImageDetail = Omit<ImageItem, 'overgrowth'> & {
 	next: string | null;
 	// Galleries it is in now (living, then fading), then the ones it was in.
 	galleries: ImageGallery[];
+	// Its leaf in a published collection, with where it was filed before, if anywhere.
+	leaf: Leaf | null;
+};
+export type Leaf = {
+	collection: { slug: string; abbrev: string; abbrev_latin: string };
+	book: number;
+	position: number;
+	previous: { book: number; position: number } | null;
 };
 export type ImageRedirect = { redirect: string };
 
@@ -433,4 +441,57 @@ export const getMap = (f: typeof fetch = fetch) =>
 	f('/api/mycelium').then((r) => {
 		if (!r.ok) throw new ApiError(r.status);
 		return r.json() as Promise<MyceliumMap>;
+	});
+
+// Collections. Mirrors penish/api/routes_collections.py; only published ones exist.
+export type CollectionHead = {
+	slug: string;
+	title: string;
+	abbrev: string;
+	abbrev_latin: string;
+	book_count: number;
+	leaves_per_book: number;
+	// Filed leaves whose pictures are live, of book_count * leaves_per_book.
+	leaves: number;
+	capacity: number;
+};
+export type StripLeaf = {
+	position: number;
+	slug: string;
+	blurhash: string;
+	palette: string[];
+	src: string | null;
+};
+export type Collection = CollectionHead & {
+	preamble: string;
+	books: { number: number; title: string | null; leaves: StripLeaf[] }[];
+};
+export type BookSlot = (ImageItem & { position: number }) | null;
+export type CollectionBook = {
+	collection: CollectionHead;
+	number: number;
+	title: string | null;
+	// Every slot in leaf order, empty ones null.
+	slots: BookSlot[];
+};
+
+export const getCollections = (f: typeof fetch = fetch) =>
+	f('/api/collections').then((r) => {
+		if (!r.ok) throw new ApiError(r.status);
+		return r.json() as Promise<{ collections: CollectionHead[] }>;
+	});
+
+// null for anything that is not a published collection, so the page can say so.
+export const getCollection = (slug: string, f: typeof fetch = fetch) =>
+	f(`/api/collections/${encodeURIComponent(slug)}`).then((r) => {
+		if (r.status === 404) return null;
+		if (!r.ok) throw new ApiError(r.status);
+		return r.json() as Promise<Collection>;
+	});
+
+export const getBook = (slug: string, n: string, f: typeof fetch = fetch) =>
+	f(`/api/collections/${encodeURIComponent(slug)}/books/${encodeURIComponent(n)}`).then((r) => {
+		if (r.status === 404 || r.status === 422) return null;
+		if (!r.ok) throw new ApiError(r.status);
+		return r.json() as Promise<CollectionBook>;
 	});
