@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+# Compared lowercased, so iOS names like IMG_0938.HEIC count too.
+IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"})
 
 # Editors and partial transfers leave these next to real files. Dotfiles are
 # handled separately and also cover rsync temp names like `.x.png.AbC123`.

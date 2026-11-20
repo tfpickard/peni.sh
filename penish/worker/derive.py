@@ -1,8 +1,9 @@
+import functools
 import hashlib
 import io
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -17,13 +18,30 @@ WIDTHS = (480, 960, 1600)
 MIN_CROP = 32
 
 # Keyed on vips' own loader name rather than the file extension or sniffed
-# magic bytes, so what we accept is exactly what libvips actually decoded.
+# magic bytes, so what we accept is exactly what libvips actually decoded. The
+# two exceptions, Ultra HDR and HEIF, are handled by name in _decode.
 _LOADERS = {
     "pngload_buffer": ("image/png", "png"),
     "jpegload_buffer": ("image/jpeg", "jpg"),
     "webpload_buffer": ("image/webp", "webp"),
 }
 _SAVE_SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+# A JPEG with a gain map. libvips' Ultra HDR loader is set aside for the plain JPEG
+# loader on the same bytes: the site shows SDR and everything downstream assumes
+# 8-bit sRGB, so the gain map is dropped and the SDR base is the picture.
+_UHDR_LOADER = "uhdrload_buffer"
+# HEIC, HEIF and AVIF all arrive here. The wheel's libvips has no HEVC decoder, so
+# HEIC falls through to pillow-heif; AVIF decodes in libvips. Stored as lossless PNG
+# so the kept original is not compressed a second time.
+_HEIF_LOADER = "heifload_buffer"
+_HEIF_MIME = "image/png"
+# ftyp brands of HEVC-coded HEIF, the ones pillow-heif's bundled libheif can decode.
+# AVIF brands are absent on purpose: that build has no AV1 decoder.
+_HEVC_BRANDS = frozenset(
+    {b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs", b"mif1", b"msf1"}
+)
+# nclx colour_primaries code for P3 (SMPTE EG 432-1).
+_NCLX_P3 = 12
 
 
 class UndecodableImage(Exception):
@@ -49,22 +67,8 @@ class Derivative:
 
 
 def load_and_validate(data: bytes) -> Decoded:
+    img, mime = _decode(data)
     try:
-        # fail=True makes libvips error on truncation instead of padding with grey.
-        img = pyvips.Image.new_from_buffer(data, "", access="sequential", fail=True)
-    except pyvips.Error as e:
-        raise UndecodableImage("not a readable image") from e
-
-    loader = str(img.get("vips-loader")) if img.get_typeof("vips-loader") else ""
-    if loader not in _LOADERS:
-        raise UndecodableImage(
-            f"unsupported format ({loader or 'unknown'}); need png, jpeg or webp"
-        )
-    mime, _ = _LOADERS[loader]
-
-    try:
-        # Forces a full decode now, so a truncated file fails here and not mid-pipeline.
-        img = img.copy_memory()
         img = img.autorot()
         if img.get_typeof("icc-profile-data"):
             # Metadata is stripped later, so bake the profile into pixels first or
@@ -73,6 +77,9 @@ def load_and_validate(data: bytes) -> Decoded:
                 img = img.icc_transform("srgb")
             except pyvips.Error:
                 log.warning("icc transform failed; keeping pixels as-is")
+        if mime == _HEIF_MIME and img.format != "uchar":
+            # 10- and 12-bit HEIF/AVIF; everything downstream expects 8 bits.
+            img = img.colourspace("srgb" if img.bands >= 3 else "b-w")
     except pyvips.Error as e:
         raise UndecodableImage("image data is truncated or corrupt") from e
 
@@ -83,6 +90,109 @@ def load_and_validate(data: bytes) -> Decoded:
         sha256=hashlib.sha256(data).hexdigest(),
         image=img,
     )
+
+
+def _decode(data: bytes) -> tuple[pyvips.Image, str]:
+    """Fully decoded pixels, still carrying orientation and ICC metadata, and the mime
+    the cleaned original is stored as."""
+    try:
+        # fail=True makes libvips error on truncation instead of padding with grey.
+        img = pyvips.Image.new_from_buffer(data, "", access="sequential", fail=True)
+    except pyvips.Error as e:
+        # libvips can refuse a HEIC at the header that libheif with HEVC still reads.
+        if _is_hevc_heif(data):
+            return _heif_via_pillow(data), _HEIF_MIME
+        raise UndecodableImage("not a readable image") from e
+
+    loader = str(img.get("vips-loader")) if img.get_typeof("vips-loader") else ""
+    if loader == _UHDR_LOADER:
+        try:
+            img = pyvips.Image.jpegload_buffer(data, access="sequential", fail=True)
+        except pyvips.Error as e:
+            raise UndecodableImage("not a readable image") from e
+        loader = "jpegload_buffer"
+    if loader == _HEIF_LOADER:
+        try:
+            return img.copy_memory(), _HEIF_MIME
+        except pyvips.Error:
+            # Opens lazily, fails at decode: the HEVC plugin is missing from the wheel.
+            return _heif_via_pillow(data), _HEIF_MIME
+    if loader not in _LOADERS:
+        raise UndecodableImage(
+            f"unsupported format ({loader or 'unknown'}); need png, jpeg, webp, heic or avif"
+        )
+    try:
+        # Forces a full decode now, so a truncated file fails here and not mid-pipeline.
+        return img.copy_memory(), _LOADERS[loader][0]
+    except pyvips.Error as e:
+        raise UndecodableImage("image data is truncated or corrupt") from e
+
+
+def _is_hevc_heif(data: bytes) -> bool:
+    if data[4:8] != b"ftyp":
+        return False
+    # The major brand alone misses files that only list mif1/heic as compatible.
+    end = min(len(data), int.from_bytes(data[:4], "big"), 256)
+    brands = {data[8:12]} | {data[i : i + 4] for i in range(16, end - 3, 4)}
+    return bool(brands & _HEVC_BRANDS)
+
+
+@functools.cache
+def _open_heif() -> Callable[..., Any] | None:
+    # Imported on first HEIC, not at module import: the api imports this module and
+    # never decodes, and a broken install must fail one picture, not the worker.
+    try:
+        from pillow_heif import open_heif
+    except ImportError:
+        log.warning("pillow-heif is not importable; heic cannot be decoded")
+        return None
+    return open_heif
+
+
+@functools.cache
+def _p3_profile() -> bytes:
+    probe = pyvips.Image.black(1, 1, bands=3).cast("uchar").copy(interpretation="srgb")
+    return bytes(probe.icc_transform("p3").get("icc-profile-data"))
+
+
+def _heif_via_pillow(data: bytes) -> pyvips.Image:
+    open_heif = _open_heif()
+    if open_heif is None:
+        raise UndecodableImage("heic decoder not installed")
+    try:
+        heif = open_heif(io.BytesIO(data), convert_hdr_to_8bit=True)
+        # libheif applies the irot/imir transforms here and pillow-heif resets the
+        # EXIF orientation to 1; no EXIF is carried over, so autorot() leaves it be.
+        im = heif.to_pillow()
+        im.load()
+    except (ValueError, EOFError, SyntaxError, RuntimeError, OSError) as e:
+        reason = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+        raise UndecodableImage(f"heif image cannot be decoded: {reason}") from e
+
+    icc = im.info.get("icc_profile")
+    nclx = im.info.get("nclx_profile") or {}
+    if im.mode in ("RGBa", "La"):
+        im = im.convert(im.mode[0:-1] + "A")
+    if im.mode.startswith("I;16"):
+        # High-bit monochrome stays 16-bit here; load_and_validate brings it to 8.
+        px = np.asarray(im, dtype=np.uint16)
+        img = pyvips.Image.new_from_memory(px.tobytes(), im.width, im.height, 1, "ushort")
+        img = img.copy(interpretation="grey16")
+    else:
+        if im.mode not in ("RGB", "RGBA", "L", "LA"):
+            im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+        bands = len(im.getbands())
+        img = pyvips.Image.new_from_memory(im.tobytes(), im.width, im.height, bands, "uchar")
+        img = img.copy(interpretation="srgb" if bands >= 3 else "b-w")
+
+    if not icc and img.bands >= 3 and nclx.get("color_primaries") == _NCLX_P3:
+        # No ICC block, only nclx naming P3: attach libvips' own P3 so the sRGB bake
+        # in load_and_validate still runs.
+        icc = _p3_profile()
+    if icc:
+        img = img.copy()
+        img.set_type(pyvips.GValue.blob_type, "icc-profile-data", bytes(icc))
+    return img
 
 
 def _save(img: pyvips.Image, suffix: str, **opts: object) -> bytes:

@@ -16,6 +16,10 @@ from penish.worker.sidecars import SIDECARS, Embedding, GroupError, parse_group,
         ("x.jpg", ("x", "image")),
         ("x.JPEG", ("x", "image")),
         ("x.webp", ("x", "image")),
+        ("x.heic", ("x", "image")),
+        ("IMG_0938.HEIC", ("IMG_0938", "image")),
+        ("x.heif", ("x", "image")),
+        ("x.HEIF", ("x", "image")),
         ("my_cat.png", ("my_cat", "image")),
         ("my_cat_caption.txt", ("my_cat", "_caption")),
         ("my_cat_description.txt", ("my_cat", "_description")),
@@ -105,6 +109,15 @@ def test_parse_group_image_only(tmp_path: Path) -> None:
     _write(tmp_path, {"x.jpg": "img"})
     g = parse_group(tmp_path)
     assert g.stem == "x" and g.values == {} and g.unknown == []
+
+
+@pytest.mark.parametrize("image", ["x.heic", "IMG_0938.HEIC", "x.heif"])
+def test_parse_group_heic_with_collection(tmp_path: Path, image: str) -> None:
+    stem = image.rsplit(".", 1)[0]
+    _write(tmp_path, {image: "img", f"{stem}_collection.txt": "  the line  \n"})
+    g = parse_group(tmp_path)
+    assert g.stem == stem and g.image == tmp_path / image
+    assert g.values == {"collection": "the line"} and g.unknown == []
 
 
 def test_parse_group_no_image(tmp_path: Path) -> None:
