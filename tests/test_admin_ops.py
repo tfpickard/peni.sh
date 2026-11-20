@@ -1,4 +1,8 @@
+import errno
+import json
 import os
+import shutil
+import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -336,6 +340,137 @@ async def test_failed_retry_collision_suffixes_whole_group(
     assert not (data(tmp_path) / "failed" / "cat").exists()
 
 
+def cross_device(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fail_final: str | None = None
+) -> list[tuple[str, str]]:
+    """failed/ and the inbox are separate mounts in production, so a rename between them is
+    EXDEV. Returns the renames that land on a final name in the inbox, in order. With
+    `fail_final`, the rename onto that file name fails too."""
+    real = os.rename
+    failed = str(data(tmp_path) / "failed")
+    landed: list[tuple[str, str]] = []
+
+    def rename(src: Any, dst: Any) -> None:
+        if str(src).startswith(failed) and str(dst).startswith(str(data(tmp_path) / "inbox")):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        if fail_final is not None and Path(dst) == data(tmp_path) / "inbox" / fail_final:
+            raise OSError(errno.EIO, "input/output error")
+        real(src, dst)
+        if not Path(dst).name.startswith("."):
+            landed.append((Path(src).name, Path(dst).name))
+
+    monkeypatch.setattr(os, "rename", rename)
+    return landed
+
+
+async def test_failed_retry_across_filesystems(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = make_failed(
+        tmp_path,
+        "cat",
+        {
+            "cat.png": "img" * 100_000,
+            "cat_caption.txt": "c",
+            "cat_tags.txt": "t",
+            "cat.err": "boom",
+        },
+    )
+    landed = cross_device(monkeypatch, tmp_path)
+    r = await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)
+    assert r.status_code == 200
+    assert r.json()["files"] == ["cat.png", "cat_caption.txt", "cat_tags.txt"]
+    inbox = data(tmp_path) / "inbox"
+    # No dotfile temp is left, nothing but the three files, and the picture is whole.
+    assert sorted(p.name for p in inbox.iterdir()) == ["cat.png", "cat_caption.txt", "cat_tags.txt"]
+    assert (inbox / "cat.png").read_text() == "img" * 100_000
+    assert (inbox / "cat_caption.txt").read_text() == "c"
+    # The watcher claims on the image, so every sidecar has to be in place before it appears.
+    assert [dst for _src, dst in landed][-1] == "cat.png"
+    assert {dst for _src, dst in landed[:-1]} == {"cat_caption.txt", "cat_tags.txt"}
+    assert not d.exists()
+
+
+@pytest.mark.parametrize("cross", [True, False])
+async def test_failed_retry_that_dies_partway_loses_nothing(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cross: bool
+) -> None:
+    files = {"cat.png": "img", "cat_caption.txt": "c", "cat_tags.txt": "t", "cat.err": "boom"}
+    d = make_failed(tmp_path, "cat", files)
+    if cross:
+        cross_device(monkeypatch, tmp_path, fail_final="cat.png")
+    else:
+        real = os.rename
+
+        def rename(src: Any, dst: Any) -> None:
+            if Path(dst) == data(tmp_path) / "inbox" / "cat.png":
+                raise OSError(errno.EIO, "input/output error")
+            real(src, dst)
+
+        monkeypatch.setattr(os, "rename", rename)
+    r = await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)
+    assert r.status_code == 409 and r.json()["detail"] == "cannot move"
+    # Not a picture half in each place: the folder is as it was and the inbox is empty.
+    assert {p.name: p.read_text() for p in d.iterdir()} == files
+    assert list((data(tmp_path) / "inbox").iterdir()) == []
+    # So the owner can press retry again.
+    monkeypatch.undo()
+    r = await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)
+    assert r.status_code == 200 and not d.exists()
+
+
+async def test_failed_retry_copy_error_leaves_no_temp(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = make_failed(tmp_path, "cat", {"cat.png": "img", "cat_caption.txt": "c"})
+    cross_device(monkeypatch, tmp_path)
+    real = shutil.copyfileobj
+
+    def copy(src: Any, dst: Any, *a: Any) -> None:
+        # The image goes last, so the sidecar has already been copied by now.
+        if str(src.name).endswith("cat.png"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real(src, dst, *a)
+
+    monkeypatch.setattr(shutil, "copyfileobj", copy)
+    r = await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)
+    assert r.status_code == 409
+    assert sorted(p.name for p in d.iterdir()) == ["cat.png", "cat_caption.txt"]
+    assert list((data(tmp_path) / "inbox").iterdir()) == []
+
+
+async def test_failed_retry_unwritable_moves_nothing(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = make_failed(tmp_path, "cat", {"cat.png": "img", "cat_caption.txt": "c"})
+    monkeypatch.setattr(os, "access", lambda *a, **k: False)
+    r = await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)
+    assert r.status_code == 409 and r.json()["detail"] == "cannot move"
+    assert sorted(p.name for p in d.iterdir()) == ["cat.png", "cat_caption.txt"]
+    assert list((data(tmp_path) / "inbox").iterdir()) == []
+
+
+async def test_failed_retry_stuck_source_still_answers_ok(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Once the files are in the inbox the watcher may have them; an error here would invite
+    # a second retry and a second copy of the picture.
+    make_failed(tmp_path, "cat", {"cat.png": "img", "cat_caption.txt": "c"})
+    cross_device(monkeypatch, tmp_path)
+    real = Path.unlink
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        if "failed" in self.parts:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    r = await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)
+    assert r.status_code == 200
+    inbox = data(tmp_path) / "inbox"
+    assert sorted(p.name for p in inbox.iterdir()) == ["cat.png", "cat_caption.txt"]
+
+
 def ingest_job(dsn: str, tmp_path: Path, stem: str) -> tuple[int, Path]:
     directory = data(tmp_path) / "processing" / f"{stem}-claimed"
     job_id = sql(
@@ -520,7 +655,7 @@ async def test_system(
         )
     backups = tmp_path / "backups"
     backups.mkdir()
-    (backups / "a.sql").write_text("x")
+    (backups / "a.dump").write_text("x")
     monkeypatch.setenv("BACKUP_DIR", str(backups))
     body = (await client.get("/api/admin/system")).json()
     assert body["worker_heartbeat_at"] and body["worker_info"] == {"queue": 2}
@@ -530,3 +665,152 @@ async def test_system(
 
     monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "missing"))
     assert (await client.get("/api/admin/system")).json()["last_backup_at"] is None
+
+
+DRILL = {
+    "dump": "2026-11-20.dump",
+    "ran_at": "2026-11-20T05:00:03Z",
+    "ok": True,
+    "seconds": 4,
+    "counts": {"images": 187, "votes": 3},
+    "reason": None,
+    "local_only": True,
+}
+
+
+async def test_system_backup_reports_the_newest_dump_only(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data(tmp_path).mkdir(exist_ok=True)
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    monkeypatch.setenv("BACKUP_DIR", str(backups))
+    old, new = backups / "2026-11-19.dump", backups / "2026-11-20.dump"
+    old.write_text("x")
+    new.write_text("x")
+    os.utime(old, (1_000_000_000, 1_000_000_000))
+    os.utime(new, (1_700_000_000, 1_700_000_000))
+    # Newer than any dump, and neither a dump: the drill's result and a half-written dump.
+    for other in ("restore-drill.json", "2026-11-21.dump.tmp"):
+        (backups / other).write_text("{}")
+    body = (await client.get("/api/admin/system")).json()
+    assert body["last_backup_at"].startswith("2023-11-14T22:13:20")
+    assert body["restore_drill"] is None and body["backup_local_only"] is None
+
+
+async def test_system_reports_the_restore_drill(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data(tmp_path).mkdir(exist_ok=True)
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    monkeypatch.setenv("BACKUP_DIR", str(backups))
+    (backups / "restore-drill.json").write_text(json.dumps(DRILL))
+    body = (await client.get("/api/admin/system")).json()
+    assert body["restore_drill"] == {
+        "ok": True,
+        "ran_at": "2026-11-20T05:00:03Z",
+        "dump": "2026-11-20.dump",
+        "reason": None,
+        "counts": {"images": 187, "votes": 3},
+        "local_only": True,
+    }
+    assert body["backup_local_only"] is True
+
+    failed = {**DRILL, "ok": False, "reason": "restored zero pictures", "local_only": False}
+    (backups / "restore-drill.json").write_text(json.dumps(failed))
+    body = (await client.get("/api/admin/system")).json()
+    assert body["restore_drill"]["ok"] is False
+    assert body["restore_drill"]["reason"] == "restored zero pictures"
+    assert body["backup_local_only"] is False
+
+
+@pytest.mark.parametrize(
+    "content",
+    [None, "", "not json", "[1, 2]", "null", '{"dump": "x"}', '{"ok": "yes"}', b"\xff\xfe\x00"],
+)
+async def test_system_missing_or_corrupt_drill_is_no_drill(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str | bytes | None,
+) -> None:
+    data(tmp_path).mkdir(exist_ok=True)
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    monkeypatch.setenv("BACKUP_DIR", str(backups))
+    (backups / "a.dump").write_text("x")
+    if isinstance(content, str):
+        (backups / "restore-drill.json").write_text(content)
+    elif content is not None:
+        (backups / "restore-drill.json").write_bytes(content)
+    r = await client.get("/api/admin/system")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["restore_drill"] is None and body["backup_local_only"] is None
+    assert body["last_backup_at"]
+
+
+async def test_system_drill_tolerates_odd_fields(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data(tmp_path).mkdir(exist_ok=True)
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    monkeypatch.setenv("BACKUP_DIR", str(backups))
+    odd = {"ok": True, "ran_at": 5, "counts": {"images": "many", "votes": 2, "x": True}}
+    (backups / "restore-drill.json").write_text(json.dumps(odd))
+    drill = (await client.get("/api/admin/system")).json()["restore_drill"]
+    assert drill == {
+        "ok": True,
+        "ran_at": None,
+        "dump": None,
+        "reason": None,
+        "counts": {"votes": 2},
+        "local_only": None,
+    }
+
+
+async def test_system_unreadable_backup_dir_is_not_an_error(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The mount is there but this process is not allowed to list it.
+    data(tmp_path).mkdir(exist_ok=True)
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    monkeypatch.setenv("BACKUP_DIR", str(backups))
+
+    def deny(self: Path, pattern: str) -> Any:
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(Path, "glob", deny)
+    r = await client.get("/api/admin/system")
+    assert r.status_code == 200 and r.json()["last_backup_at"] is None
+
+
+DRILL_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "penish-restore-drill"
+
+
+def test_restore_drill_script_parses() -> None:
+    subprocess.run(["bash", "-n", str(DRILL_SCRIPT)], check=True)
+
+
+def test_restore_drill_without_a_dump_fails_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Fails before docker is asked for anything, so it runs anywhere.
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    env = {**os.environ, "APP_ROOT": str(tmp_path), "BACKUP_DIR": str(backups)}
+    done = subprocess.run([str(DRILL_SCRIPT)], env=env, capture_output=True, text=True)
+    assert done.returncode != 0
+    result = json.loads((backups / "restore-drill.json").read_text())
+    assert result["ok"] is False and result["dump"] is None
+    assert result["reason"] == f"no dump in {backups}"
+    assert result["counts"] == {}
+    # No temp file is left beside it.
+    assert sorted(p.name for p in backups.iterdir()) == ["restore-drill.json"]
+    # And the api reads what the script wrote.
+    monkeypatch.setenv("BACKUP_DIR", str(backups))
+    drill = admin_ops._restore_drill()
+    assert drill is not None and drill["ok"] is False and drill["reason"] == result["reason"]

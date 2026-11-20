@@ -14,6 +14,7 @@ import psycopg
 import pytest
 
 from penish import logs, runtime
+from penish.config import Settings
 from penish.worker import embed_server, jobs
 
 # Nothing listens on port 1, so a connect fails at once instead of timing out.
@@ -209,6 +210,16 @@ def test_secrets_and_image_data_never_stored(clean_db: str, test_logger: logging
     assert "<image image/png" in got[3]["message"]
     assert got[5]["context"]["body"].startswith("<base64 ")
     assert "<secret>" in got[6]["exc"]
+
+
+def test_read_token_is_a_known_secret() -> None:
+    token = "r" * 8 + "-read-token-" + "x" * 24
+    known = logs.secrets_from(Settings(admin_read_token=token))
+    assert token in known
+    # Bare, as in a repr or a url, where no Authorization header marks it.
+    line = logs.scrub(f"GET /api/x?t={token} headers=<{token}>", known)
+    assert token not in line and line.count("<secret>") == 2
+    assert token not in logs.secrets_from(Settings())
 
 
 def test_noisy_library_debug_is_not_kept(clean_db: str) -> None:

@@ -83,11 +83,13 @@ usermod -aG docker,upload deploy
 step "directories"
 # An existing app root (and its app/, media/, www/ dirs) is left alone; only missing pieces are created.
 [ -d "$BASE" ] || install -d -o deploy -g deploy -m 0755 "$BASE"
+# deploy writes here (backup, restore drill). Group upload, gid 1002, is the api container's gid,
+# so the read-only mount in compose.yaml can list it for /admin/system; others get nothing.
 if [ -d "$BASE/backups" ]; then
-  # Pre-existing and empty, but the backup timer runs as deploy and has to write here.
-  chown deploy:deploy "$BASE/backups"
+  chown deploy:upload "$BASE/backups"
+  chmod 0750 "$BASE/backups"
 else
-  install -d -o deploy -g deploy -m 0750 "$BASE/backups"
+  install -d -o deploy -g upload -m 0750 "$BASE/backups"
 fi
 # setgid + group write: deploy (via the upload group) can write deployed_sha/pinned_sha here.
 for d in "$DATA" "$DATA/inbox" "$DATA/processing" "$DATA/failed" "$DATA/media" "$DATA/media/orig" "$DATA/media/pub"; do
@@ -127,12 +129,14 @@ if [ "$SKIP_INSTALL" != 1 ] && have_systemd; then
   step "systemd units"
   install -m 0755 "$REPO_DIR/scripts/penish-deploy" /usr/local/bin/penish-deploy
   install -m 0755 "$REPO_DIR/scripts/penish-backup" /usr/local/bin/penish-backup
-  for u in penish-deploy.service penish-deploy.timer penish-backup.service penish-backup.timer; do
+  install -m 0755 "$REPO_DIR/scripts/penish-restore-drill" /usr/local/bin/penish-restore-drill
+  for u in penish-deploy.service penish-deploy.timer penish-backup.service penish-backup.timer \
+    penish-restore-drill.service penish-restore-drill.timer; do
     install -m 0644 "$REPO_DIR/ops/systemd/$u" "/etc/systemd/system/$u"
   done
   systemctl daemon-reload
   # The deploy script exits quietly until .env has GH_READ_TOKEN, so enabling now is safe.
-  systemctl enable --now penish-deploy.timer penish-backup.timer
+  systemctl enable --now penish-deploy.timer penish-backup.timer penish-restore-drill.timer
 fi
 
 cat <<NEXT

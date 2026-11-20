@@ -1,0 +1,11 @@
+[Unit]
+Description=penish weekly restore drill
+
+[Timer]
+# Sunday, well after the 03:30 backup has finished.
+OnCalendar=Sun *-*-* 05:00:00
+# Catches up after downtime instead of skipping the week.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

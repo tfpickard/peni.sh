@@ -98,12 +98,23 @@ export type Stats = {
 };
 export const stats = () => get<Stats>('/stats');
 
+export type RestoreDrill = {
+	ok: boolean;
+	ran_at: string | null;
+	dump: string | null;
+	reason: string | null;
+	counts: Record<string, number>;
+	local_only: boolean | null;
+};
+
 export type System = {
 	deployed_sha: string | null;
 	worker_heartbeat_at: string | null;
 	worker_info: unknown;
 	disk: { total: number; used: number; free: number };
 	last_backup_at: string | null;
+	restore_drill: RestoreDrill | null;
+	backup_local_only: boolean | null;
 	db_size: number;
 	recent_errors: { id: number; type: string; status: string; attempts: number; error: string; at: string }[];
 };

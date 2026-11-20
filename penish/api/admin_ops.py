@@ -5,10 +5,15 @@ Mounted under /api/admin next to admin.router, so the no_store middleware covers
 
 from __future__ import annotations
 
+import errno
+import json
+import logging
 import os
 import re
 import secrets
 import shutil
+import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -25,6 +30,8 @@ from penish.config import get_settings
 from penish.text import no_em_dash
 from penish.worker.jobs import enqueue
 from penish.worker.sidecars import stem_of
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -502,12 +509,69 @@ def _suffixed(name: str, suffix: str) -> str:
     return p.stem + suffix + p.suffix
 
 
+@dataclass
+class _Staged:
+    src: Path
+    at: Path
+    # False: `at` is a copy and `src` is still in place, because failed/ and the inbox are
+    # separate mounts in production and a rename between them is EXDEV.
+    renamed: bool
+
+
+def _stage(src: Path, inbox: Path, name: str) -> _Staged:
+    """Bring one file into the inbox under a dotfile name, which the watcher ignores."""
+    tmp = inbox / f".{name}.{uuid.uuid4().hex[:8]}"
+    try:
+        os.rename(src, tmp)
+        return _Staged(src, tmp, True)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    try:
+        with open(src, "rb") as r, open(tmp, "wb") as w:
+            shutil.copyfileobj(r, w)
+            w.flush()
+            os.fsync(w.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return _Staged(src, tmp, False)
+
+
+def _put_back(staged: list[_Staged]) -> None:
+    """Undo a half-done move so the owner can retry from the same state: renamed files go
+    home, copies are dropped (their source never left)."""
+    for s in reversed(staged):
+        try:
+            if s.renamed:
+                os.rename(s.at, s.src)
+            else:
+                s.at.unlink(missing_ok=True)
+        except OSError:
+            log.exception("retry: could not undo %s", s.at)
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _move_back(directory: Path, inbox: Path) -> list[str]:
     # The .err is a diagnostic for the admin, not input; the watcher would treat it as noise.
-    files = sorted(f for f in directory.iterdir() if f.is_file() and f.suffix != ".err")
+    files = [f for f in directory.iterdir() if f.is_file() and f.suffix != ".err"]
     if not files:
         raise HTTPException(status_code=422, detail="nothing to retry")
+    # Sidecars first and the image last, as the upload endpoint does: the watcher keys its
+    # settle timer by stem and could claim an image that arrived without its sidecars.
+    files.sort(key=lambda f: (stem_of(f.name)[1] == "image", f.name))
     inbox.mkdir(parents=True, exist_ok=True)
+    # Checked up front: a source that cannot be removed would leave the picture in both places.
+    if not all(os.access(d, os.W_OK | os.X_OK) for d in (directory, directory.parent, inbox)):
+        log.error("retry: %s or the inbox is not writable by this process", directory)
+        raise HTTPException(status_code=409, detail="cannot move")
     names = {f: f.name for f in files}
     if any((inbox / n).exists() for n in names.values()):
         # One suffix for the whole group, or the sidecars would stop pairing with the image.
@@ -516,9 +580,34 @@ def _move_back(directory: Path, inbox: Path) -> list[str]:
             names = {f: _suffixed(f.name, suffix) for f in files}
             if not any((inbox / n).exists() for n in names.values()):
                 break
-    for f in files:
-        os.rename(f, inbox / names[f])
-    shutil.rmtree(directory)
+    staged: list[_Staged] = []
+    try:
+        for f in files:
+            staged.append(_stage(f, inbox, names[f]))
+        for s, f in zip(staged, files, strict=True):
+            final = inbox / names[f]
+            os.rename(s.at, final)
+            s.at = final
+    except OSError:
+        log.exception("retry: moving %s to the inbox failed; nothing was moved", directory)
+        _put_back(staged)
+        raise HTTPException(status_code=409, detail="cannot move") from None
+    # Everything is in the inbox from here on and the watcher may already have claimed it, so
+    # nothing below may fail the request: that would invite a retry and a second copy.
+    try:
+        _fsync_dir(inbox)
+    except OSError:
+        log.warning("retry: could not sync the inbox", exc_info=True)
+    for s in staged:
+        if not s.renamed:
+            try:
+                s.src.unlink()
+            except OSError:
+                log.warning("retry: could not remove %s", s.src, exc_info=True)
+    try:
+        shutil.rmtree(directory)
+    except OSError:
+        log.warning("retry: could not remove %s", directory, exc_info=True)
     return sorted(names.values())
 
 
@@ -604,14 +693,52 @@ async def stats(request: Request) -> dict[str, Any]:
 # -- system ---------------------------------------------------------------
 
 
-def _last_backup_at() -> str | None:
+def _backup_dir() -> Path | None:
     root = os.environ.get("BACKUP_DIR")
-    if not root or not Path(root).is_dir():
+    return Path(root) if root and Path(root).is_dir() else None
+
+
+def _last_backup_at() -> str | None:
+    root = _backup_dir()
+    if root is None:
         return None
-    mtimes = [f.stat().st_mtime for f in Path(root).iterdir() if f.is_file()]
+    try:
+        # Only the dumps count: the restore drill leaves its own file next to them, and a
+        # drill that ran tonight says nothing about whether a backup did.
+        mtimes = [f.stat().st_mtime for f in root.glob("*.dump") if f.is_file()]
+    except OSError:
+        return None
     if not mtimes:
         return None
     return datetime.fromtimestamp(max(mtimes), UTC).isoformat()
+
+
+def _restore_drill() -> dict[str, Any] | None:
+    """The last restore drill, as scripts/penish-restore-drill wrote it. Absent, unreadable
+    or not shaped like a result all read as no drill yet: this is a status line, not a gate."""
+    root = _backup_dir()
+    if root is None:
+        return None
+    try:
+        raw = json.loads((root / "restore-drill.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("ok"), bool):
+        return None
+    ran_at, reason, counts = raw.get("ran_at"), raw.get("reason"), raw.get("counts")
+    dump = raw.get("dump")
+    return {
+        "ok": raw["ok"],
+        "ran_at": ran_at if isinstance(ran_at, str) else None,
+        "dump": dump if isinstance(dump, str) else None,
+        "reason": reason if isinstance(reason, str) else None,
+        "counts": {
+            str(k): v for k, v in counts.items() if isinstance(v, int) and not isinstance(v, bool)
+        }
+        if isinstance(counts, dict)
+        else {},
+        "local_only": raw["local_only"] if isinstance(raw.get("local_only"), bool) else None,
+    }
 
 
 def _disk(path: Path) -> dict[str, int]:
@@ -633,12 +760,16 @@ async def system(request: Request) -> dict[str, Any]:
         )
         errors = await cur.fetchall()
     disk_path = settings.data_dir if settings.data_dir.exists() else Path("/")
+    drill = await run_in_threadpool(_restore_drill)
     return {
         "deployed_sha": settings.git_sha,
         "worker_heartbeat_at": _iso(beat["at"]) if beat else None,
         "worker_info": beat["info"] if beat else None,
         "disk": await run_in_threadpool(_disk, disk_path),
         "last_backup_at": await run_in_threadpool(_last_backup_at),
+        "restore_drill": drill,
+        # The drill reads .env, which the api cannot see; None until a drill has said.
+        "backup_local_only": drill["local_only"] if drill else None,
         "db_size": size,
         "recent_errors": [
             {

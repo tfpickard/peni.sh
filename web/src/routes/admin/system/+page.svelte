@@ -19,6 +19,19 @@
 		s?.worker_heartbeat_at ? Math.max(0, Math.round((now - Date.parse(s.worker_heartbeat_at)) / 1000)) : null
 	);
 	const gb = (n: number) => (n / 1024 ** 3).toFixed(1) + ' GB';
+	const when = (iso: string) => new Date(iso).toISOString().slice(0, 16).replace('T', ' ');
+	const drill = $derived(
+		s?.restore_drill
+			? [
+					s.restore_drill.ran_at ? when(s.restore_drill.ran_at) : '',
+					s.restore_drill.ok
+						? `ok ${s.restore_drill.counts.images ?? 0} pictures`
+						: (s.restore_drill.reason ?? 'failed')
+				]
+					.filter(Boolean)
+					.join(' ')
+			: 'none'
+	);
 </script>
 
 {#if s}
@@ -32,7 +45,9 @@
 		<dt>db</dt>
 		<dd>{gb(s.db_size)}</dd>
 		<dt>backup</dt>
-		<dd>{s.last_backup_at ? new Date(s.last_backup_at).toISOString().slice(0, 16).replace('T', ' ') : 'none'}</dd>
+		<dd>{s.last_backup_at ? when(s.last_backup_at) : 'none'}{s.backup_local_only ? ' local' : ''}</dd>
+		<dt>restore drill</dt>
+		<dd class:hot={s.restore_drill !== null && !s.restore_drill.ok}>{drill}</dd>
 	</dl>
 
 	<h2>errors</h2>
