@@ -417,6 +417,7 @@
 	label {
 		display: flex;
 		flex-direction: column;
+		gap: 0.35rem;
 		margin-top: 0.75rem;
 	}
 	.l {
@@ -428,17 +429,6 @@
 	}
 	p.dim {
 		margin: 0.75rem 0 0;
-	}
-	input,
-	textarea {
-		background: transparent;
-		color: var(--foreground);
-		border: 0;
-		border-bottom: 1px solid var(--ink-700);
-		border-radius: 0;
-		font: inherit;
-		padding: 0.4rem 0;
-		resize: vertical;
 	}
 	.nude {
 		margin-top: 0.75rem;
@@ -456,6 +446,7 @@
 		flex-direction: row;
 		align-items: center;
 		gap: 0.4rem;
+		min-height: 44px;
 		margin-top: 0;
 		font-size: 0.875rem;
 		color: var(--muted-foreground);
@@ -468,24 +459,14 @@
 		border: 0;
 		accent-color: var(--primary);
 	}
-	select {
-		background: transparent;
-		color: var(--foreground);
-		border: 0;
-		border-bottom: 1px solid var(--ink-700);
-		font: inherit;
-		padding: 0.4rem 0;
-	}
-	select option {
-		background: var(--background);
-	}
 	.num {
 		width: 5rem;
 	}
 	.row {
 		display: flex;
-		gap: 1.5rem;
-		align-items: baseline;
+		flex-wrap: wrap;
+		gap: 0.5rem 1.5rem;
+		align-items: center;
 		margin-top: 0.5rem;
 	}
 	.all {

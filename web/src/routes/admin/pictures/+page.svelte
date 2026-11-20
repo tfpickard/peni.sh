@@ -19,6 +19,21 @@
 	let busy = $state(false);
 	let dialog = $state<HTMLDialogElement>();
 
+	// Thumbnail size, remembered per browser. Storage can be missing or refuse (private
+	// mode), and then the page just starts at m.
+	const SIZES = { s: '3rem', m: '6rem', l: '10rem' } as const;
+	type Size = keyof typeof SIZES;
+	const SIZE_KEY = 'admin.pictures.thumbs';
+	let size = $state<Size>('m');
+	function setSize(s: Size) {
+		size = s;
+		try {
+			localStorage.setItem(SIZE_KEY, s);
+		} catch {
+			// Not remembered; the choice still holds for this visit.
+		}
+	}
+
 	// A newer query invalidates responses still in flight for an older one.
 	let gen = 0;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -58,6 +73,12 @@
 	}
 
 	onMount(() => {
+		try {
+			const s = localStorage.getItem(SIZE_KEY);
+			if (s && s in SIZES) size = s as Size;
+		} catch {
+			// Default size.
+		}
 		reload();
 		const io = new IntersectionObserver((e) => e[0].isIntersecting && more(false), {
 			rootMargin: '600px'
@@ -181,13 +202,20 @@
 		<option value="votes">votes</option>
 		<option value="lonely">lonely</option>
 	</select>
+	<div class="sizes" role="group" aria-label="thumbnail size">
+		{#each Object.keys(SIZES) as Size[] as k (k)}
+			<button class:on={size === k} class:link={size !== k} aria-pressed={size === k} onclick={() => setSize(k)}
+				>{k}</button
+			>
+		{/each}
+	</div>
 </div>
 
 {#if note}<p class="dim">{note}</p>{/if}
 
 {#if items.length}
 	<div class="bar" class:on={picked.size > 0}>
-		<label class="box"><input type="checkbox" checked={all} disabled={busy} onchange={pickAll} aria-label="all" /></label>
+		<label class="hit"><input type="checkbox" checked={all} disabled={busy} onchange={pickAll} aria-label="all" /></label>
 		{#if picked.size}
 			<span class="dim">{picked.size} selected</span>
 			{#each Object.entries(LABEL) as [action, label] (action)}
@@ -198,8 +226,11 @@
 				>clear</button
 			>
 		{:else}
-			<button onclick={detectAll}>{armed ? 'sure' : 'detect nudity in all'}</button>
-			{#if armed}<button class="dim" onclick={() => (armed = false)}>cancel</button>{/if}
+			<!-- At the far end, so it never reads as the select-all box's label. -->
+			<span class="end-acts">
+				{#if armed}<button class="dim" onclick={() => (armed = false)}>cancel</button>{/if}
+				<button onclick={detectAll}>{armed ? 'sure' : 'detect nudity in all'}</button>
+			</span>
 		{/if}
 	</div>
 {/if}
@@ -212,29 +243,38 @@
 	</div>
 </dialog>
 
-<table>
+<table style:--t={SIZES[size]}>
 	<tbody>
 		{#each items as it (it.id)}
 			<tr class:sel={picked.has(it.id)}>
 				<td class="box">
-					<input
-						type="checkbox"
-						checked={picked.has(it.id)}
-						disabled={busy}
-						onclick={(e) => pick(it.id, e)}
-						aria-label="select {it.caption ?? it.slug ?? it.id}"
-					/>
+					<!-- The label is the 44px target; a tap on it clicks the box. -->
+					<label class="hit">
+						<input
+							type="checkbox"
+							checked={picked.has(it.id)}
+							disabled={busy}
+							onclick={(e) => pick(it.id, e)}
+							aria-label="select {it.caption ?? it.slug ?? it.id}"
+						/>
+					</label>
 				</td>
 				<td class="th">
 					<a href="/admin/pictures/{it.id}" aria-label={it.caption ?? it.slug ?? String(it.id)}>
 						{#if it.thumb}<img src={it.thumb} alt="" loading="lazy" />{:else}<span class="blank"></span>{/if}
 					</a>
 				</td>
-				<td class="cap"><a href="/admin/pictures/{it.id}">{it.caption ?? it.slug ?? it.id}</a></td>
+				<td class="cap">
+					<a href="/admin/pictures/{it.id}">{it.caption ?? it.slug ?? it.id}</a>
+					<!-- The columns on the right, folded under the caption where there is no room. -->
+					<span class="sub" class:bad={it.status === 'failed'}>
+						{it.status} / {net(it.net)} / <span class="nowrap">{day(it.created_at)}</span>
+					</span>
+				</td>
 				<td class="nude">{it.nudity?.length ? 'nude' : ''}</td>
-				<td class="dim" class:bad={it.status === 'failed'}>{it.status}</td>
-				<td class="dim num">{net(it.net)}</td>
-				<td class="dim num">{day(it.created_at)}</td>
+				<td class="meta" class:bad={it.status === 'failed'}>{it.status}</td>
+				<td class="meta num">{net(it.net)}</td>
+				<td class="meta num">{day(it.created_at)}</td>
 			</tr>
 		{/each}
 	</tbody>
@@ -246,55 +286,48 @@
 <style>
 	.filters {
 		display: flex;
-		gap: 1.5rem;
-		align-items: baseline;
+		gap: 0.75rem 1rem;
+		align-items: center;
 		flex-wrap: wrap;
 		margin: 2.5rem 0 1rem;
-	}
-	input,
-	select {
-		background: transparent;
-		color: var(--foreground);
-		border: 0;
-		border-bottom: 1px solid var(--ink-700);
-		font: inherit;
-		padding: 0.4rem 0;
-		border-radius: 0;
-	}
-	select {
-		color: var(--muted-foreground);
-	}
-	option {
-		background: var(--background);
-	}
-	input::placeholder {
-		color: var(--ink-500);
 	}
 	input[type='search'] {
 		flex: 1;
 		min-width: 10rem;
 		appearance: none;
 	}
+	.sizes {
+		display: flex;
+		gap: 0;
+	}
+	.sizes button {
+		min-width: 44px;
+		min-height: 44px;
+	}
 	table {
 		width: 100%;
 		border-collapse: collapse;
 	}
-	td {
-		padding: 0.3rem 0.75rem 0.3rem 0;
+	tr {
+		border-bottom: 1px solid var(--ink-800);
+	}
+	/* tbody, to outrank the layout's shared top-aligned table cells. */
+	tbody td {
+		padding: 0.5rem 0.75rem 0.5rem 0;
 		vertical-align: middle;
 	}
-	td:last-child {
+	tbody td:last-child {
 		padding-right: 0;
 	}
 	.th {
-		width: 3rem;
+		width: var(--t);
 		line-height: 0;
 	}
 	.th img,
 	.blank {
 		display: block;
-		width: 3rem;
-		height: 3rem;
+		width: var(--t);
+		height: var(--t);
 		object-fit: cover;
 		background: var(--muted);
 	}
@@ -305,18 +338,26 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
+	/* Magenta is for hover and actions; a list of captions in it is a wall of pink. */
+	.cap a {
+		color: var(--foreground);
+	}
+	.cap a:hover {
+		color: var(--primary);
+	}
 	.num {
 		text-align: right;
 		font-variant-numeric: tabular-nums;
 		white-space: nowrap;
 	}
-	.dim {
+	.dim,
+	.meta {
 		color: var(--muted-foreground);
 	}
 	.bad {
 		color: var(--primary);
 	}
-	td.dim,
+	td.meta,
 	td.nude {
 		font-size: 0.875rem;
 		white-space: nowrap;
@@ -332,8 +373,13 @@
 		flex-wrap: wrap;
 		align-items: center;
 		gap: 0.5rem 1.25rem;
-		padding: 0.6rem 0;
+		padding: 0.25rem 0;
 		font-size: 0.875rem;
+	}
+	.end-acts {
+		display: flex;
+		gap: 1.25rem;
+		margin-left: auto;
 	}
 	/* Stays in reach while picking far down a long list. */
 	.bar.on {
@@ -343,16 +389,34 @@
 		background: var(--background);
 		border-bottom: 1px solid var(--ink-700);
 	}
-	.box {
-		width: 1.5rem;
+	tbody td.box {
+		width: 44px;
+		padding: 0 0.25rem 0 0;
 		line-height: 0;
 	}
-	input[type='checkbox'] {
-		width: 1.1rem;
-		height: 1.1rem;
-		margin: 0;
-		accent-color: var(--primary);
-		cursor: pointer;
+	.sub {
+		display: none;
+		font-size: 0.875rem;
+		color: var(--muted-foreground);
+	}
+	.nowrap {
+		white-space: nowrap;
+	}
+	@media (max-width: 40rem) {
+		.cap {
+			white-space: normal;
+		}
+		.cap a {
+			display: block;
+			overflow-wrap: anywhere;
+		}
+		.sub {
+			display: block;
+			margin-top: 0.25rem;
+		}
+		td.meta {
+			display: none;
+		}
 	}
 	tr.sel td {
 		background: var(--ink-900);
