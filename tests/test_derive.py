@@ -200,6 +200,25 @@ def test_heic_nclx_p3_is_baked_in() -> None:
     assert _near(_px(d.image, 10, 10), _p3_to_srgb(rgb))
 
 
+@pytest.mark.parametrize("transfer", [16, 18, 2])  # PQ, HLG, unspecified
+def test_heic_nclx_p3_other_curve_left_as_decoded(transfer: int) -> None:
+    rgb = (200, 30, 90)
+    nclx = {
+        "color_primaries": 12,
+        "transfer_characteristics": transfer,
+        "matrix_coefficients": 6,
+        "full_range_flag": 1,
+    }
+    data = _heic(Image.new("RGB", (64, 48), rgb), nclx_profile=nclx)
+    info = pillow_heif.open_heif(io.BytesIO(data)).info
+    assert info["nclx_profile"]["transfer_characteristics"] == transfer
+    assert not info.get("icc_profile")
+    d = load_and_validate(data)
+    # The P3 bake would move red by about 18; untouched it stays near the source.
+    assert not _near(_p3_to_srgb(rgb), list(map(float, rgb)))
+    assert _near(_px(d.image, 10, 10), [200, 30, 90])
+
+
 def test_heic_alpha_survives() -> None:
     d = load_and_validate(_heic(Image.new("RGBA", (64, 48), (200, 30, 90, 128))))
     assert (d.image.bands, d.image.format, d.mime) == (4, "uchar", "image/png")

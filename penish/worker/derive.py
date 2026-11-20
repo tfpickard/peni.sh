@@ -40,8 +40,10 @@ _HEIF_MIME = "image/png"
 _HEVC_BRANDS = frozenset(
     {b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs", b"mif1", b"msf1"}
 )
-# nclx colour_primaries code for P3 (SMPTE EG 432-1).
+# nclx colour_primaries code for P3 (SMPTE EG 432-1) and transfer_characteristics
+# code for the sRGB curve (IEC 61966-2-1).
 _NCLX_P3 = 12
+_NCLX_SRGB_CURVE = 13
 
 
 class UndecodableImage(Exception):
@@ -155,6 +157,16 @@ def _p3_profile() -> bytes:
     return bytes(probe.icc_transform("p3").get("icc-profile-data"))
 
 
+def _is_display_p3(nclx: Mapping[str, Any]) -> bool:
+    # libvips' built-in P3 carries the sRGB curve. PQ, HLG or an unknown curve under
+    # it would be decoded with the wrong transfer function, which is a worse shift
+    # than leaving the pixels as decoded, so those get no profile at all.
+    return (
+        nclx.get("color_primaries") == _NCLX_P3
+        and nclx.get("transfer_characteristics") == _NCLX_SRGB_CURVE
+    )
+
+
 def _heif_via_pillow(data: bytes) -> pyvips.Image:
     open_heif = _open_heif()
     if open_heif is None:
@@ -185,9 +197,9 @@ def _heif_via_pillow(data: bytes) -> pyvips.Image:
         img = pyvips.Image.new_from_memory(im.tobytes(), im.width, im.height, bands, "uchar")
         img = img.copy(interpretation="srgb" if bands >= 3 else "b-w")
 
-    if not icc and img.bands >= 3 and nclx.get("color_primaries") == _NCLX_P3:
-        # No ICC block, only nclx naming P3: attach libvips' own P3 so the sRGB bake
-        # in load_and_validate still runs.
+    if not icc and img.bands >= 3 and _is_display_p3(nclx):
+        # No ICC block, only nclx naming Display P3: attach libvips' own P3 so the sRGB
+        # bake in load_and_validate still runs.
         icc = _p3_profile()
     if icc:
         img = img.copy()
