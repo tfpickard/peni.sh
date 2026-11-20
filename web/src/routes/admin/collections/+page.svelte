@@ -10,8 +10,34 @@
 	let loaded = $state(false);
 
 	// Drafts, so a reload after another action does not throw away what is being typed.
-	type Head = { title: string; abbrev: string; abbrev_latin: string; preamble: string };
-	let head = $state<Head>({ title: '', abbrev: '', abbrev_latin: '', preamble: '' });
+	type Row = { label: string; value: string };
+	type Head = {
+		title: string;
+		abbrev: string;
+		abbrev_latin: string;
+		gloss: string;
+		preamble: string;
+		record: Row[];
+		vendor_text: string;
+	};
+	const headOf = (x: cols.Detail): Head => ({
+		title: x.title,
+		abbrev: x.abbrev,
+		abbrev_latin: x.abbrev_latin,
+		gloss: x.gloss,
+		preamble: x.preamble,
+		record: x.record.map(([label, value]) => ({ label, value })),
+		vendor_text: x.vendor_text ?? ''
+	});
+	let head = $state<Head>({
+		title: '',
+		abbrev: '',
+		abbrev_latin: '',
+		gloss: '',
+		preamble: '',
+		record: [],
+		vendor_text: ''
+	});
 	let tuning = $state<cols.Tuning | null>(null);
 	type BookDraft = { title: string; anchor_text: string; tag_hints: string };
 	let books = $state<Record<number, BookDraft>>({});
@@ -30,7 +56,7 @@
 
 	function take(x: cols.Detail, fresh = false) {
 		if (fresh || !d) {
-			head = { title: x.title, abbrev: x.abbrev, abbrev_latin: x.abbrev_latin, preamble: x.preamble };
+			head = headOf(x);
 			tuning = { ...x.tuning };
 			books = Object.fromEntries(x.books.map((b) => [b.number, bookDraft(b)]));
 		}
@@ -72,7 +98,34 @@
 		}
 	}
 
-	const saveHead = () => act(() => cols.edit(slug, { ...head }), true);
+	const saveHead = () =>
+		act(
+			() =>
+				cols.edit(slug, {
+					title: head.title,
+					abbrev: head.abbrev,
+					abbrev_latin: head.abbrev_latin,
+					gloss: head.gloss,
+					preamble: head.preamble,
+					record: head.record.map((r) => [r.label, r.value] as [string, string]),
+					vendor_text: head.vendor_text
+				}),
+			true
+		);
+	// Rows for a value as it wraps at the field's width (about 55 characters), so a long
+	// provenance line is not cut off; browsers with field-sizing size it exactly anyway.
+	const fit = (v: string) =>
+		v.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / 55)), 0);
+	const addRow = () => (head.record = [...head.record, { label: '', value: '' }]);
+	const dropRow = (i: number) => (head.record = head.record.filter((_, k) => k !== i));
+	function shift(i: number, by: -1 | 1) {
+		const j = i + by;
+		if (j < 0 || j >= head.record.length) return;
+		const next = [...head.record];
+		[next[i], next[j]] = [next[j], next[i]];
+		head.record = next;
+	}
+	const writeMissing = () => act(() => cols.writeMissingNotes(slug));
 	const flipPublished = () => act(() => cols.edit(slug, { published: !d?.published }));
 	const saveTuning = () => tuning && act(() => cols.edit(slug, { tuning: { ...tuning! } }), true);
 	function saveBook(n: number) {
@@ -88,13 +141,7 @@
 		const y = bookDraft(b);
 		return !!x && (x.title !== y.title || x.anchor_text !== y.anchor_text || x.tag_hints !== y.tag_hints);
 	};
-	const headDirty = $derived(
-		!!d &&
-			(head.title !== d.title ||
-				head.abbrev !== d.abbrev ||
-				head.abbrev_latin !== d.abbrev_latin ||
-				head.preamble !== d.preamble)
-	);
+	const headDirty = $derived(!!d && JSON.stringify(head) !== JSON.stringify(headOf(d)));
 
 	function pick(book: number, leaf: cols.AdminLeaf) {
 		picked = picked?.leaf.image_id === leaf.image_id ? null : { book, leaf };
@@ -131,6 +178,7 @@
 			(d.resort?.status === 'queued' ||
 				d.resort?.status === 'running' ||
 				d.requests.some((r) => r.job === 'queued' || r.job === 'running') ||
+				d.notes_queued > 0 ||
 				d.books.some((b) => !b.anchored && b.anchor_text))
 	);
 	$effect(() => {
@@ -183,11 +231,43 @@
 			</label>
 		</div>
 		<label>
+			<span class="l">gloss</span>
+			<input bind:value={head.gloss} />
+		</label>
+		<label>
 			<span class="l">preamble</span>
 			<textarea rows="5" bind:value={head.preamble}></textarea>
 		</label>
+
+		<div class="record">
+			<span class="l">record</span>
+			{#each head.record as r, i (i)}
+				<div class="rec">
+					<input class="lab" bind:value={r.label} aria-label="label {i + 1}" placeholder="label" />
+					<textarea
+						rows={fit(r.value)}
+						bind:value={r.value}
+						aria-label="value {i + 1}"
+						placeholder="value, one line per line"
+					></textarea>
+					<div class="recacts">
+						<button class="link" disabled={i === 0} onclick={() => shift(i, -1)}>up</button>
+						<button class="link" disabled={i === head.record.length - 1} onclick={() => shift(i, 1)}
+							>down</button
+						>
+						<button class="link" onclick={() => dropRow(i)}>remove</button>
+					</div>
+				</div>
+			{/each}
+			<div class="row"><button class="link" onclick={addRow}>add row</button></div>
+		</div>
+
+		<label>
+			<span class="l">vendor's description</span>
+			<textarea rows="3" bind:value={head.vendor_text}></textarea>
+		</label>
 		<div class="row">
-			<button disabled={!headDirty} onclick={saveHead}>save</button>
+			<button class="go" disabled={!headDirty} onclick={saveHead}>save</button>
 			<button class:link={d.published} onclick={flipPublished}>
 				{d.published ? 'unpublish' : 'publish'}
 			</button>
@@ -214,6 +294,16 @@
 			<button onclick={saveTuning}>save</button>
 		</div>
 	{/if}
+
+	<h2>conservator notes</h2>
+	<div class="row">
+		<button onclick={writeMissing}>write missing notes</button>
+		{#if d.notes_queued}<span class="dim">{d.notes_queued} queued</span>{/if}
+		<span class="dim">
+			{d.books.reduce((n, b) => n + b.leaves.filter((l) => l.note).length, 0)} of
+			{d.books.reduce((n, b) => n + b.leaves.length, 0)} leaves noted
+		</span>
+	</div>
 
 	<h2>re-sort</h2>
 	<div class="row">
@@ -377,7 +467,37 @@
 	}
 	.pair {
 		display: flex;
-		gap: 1.5rem;
+		flex-wrap: wrap;
+		gap: 0 1.5rem;
+	}
+	.record {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		margin-top: 0.75rem;
+		max-width: 40rem;
+	}
+	.rec {
+		display: grid;
+		grid-template-columns: 9rem 1fr;
+		gap: 0.35rem 0.75rem;
+	}
+	.rec textarea {
+		field-sizing: content;
+	}
+	.recacts {
+		grid-column: 2;
+		display: flex;
+		gap: 1.25rem;
+		font-size: 0.875rem;
+	}
+	@media (max-width: 30rem) {
+		.rec {
+			grid-template-columns: 1fr;
+		}
+		.recacts {
+			grid-column: 1;
+		}
 	}
 	.row {
 		margin-top: 0.75rem;

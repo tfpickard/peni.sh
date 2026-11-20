@@ -19,6 +19,10 @@
 	// Book and leaf for each collection's file or move, blank meaning the filer picks.
 	// Seeded by load, one per collection, so the fields can bind to them.
 	let filing = $state<Record<string, { book: string; leaf: string }>>({});
+	// The conservator note per collection, kept like a draft: a poll only replaces it
+	// while it still matches what the server last said.
+	let notes = $state<Record<string, string>>({});
+	let seenNotes: Record<string, string> = {};
 
 	type Draft = {
 		caption: string;
@@ -56,7 +60,12 @@
 			const kinds = x.nudity?.kinds ?? [];
 			if (picks.join(',') === seenPicks) picks = [...kinds];
 			seenPicks = kinds.join(',');
-			for (const c of x.collections) filing[c.slug] ??= { book: '', leaf: '' };
+			for (const c of x.collections) {
+				filing[c.slug] ??= { book: '', leaf: '' };
+				const n = c.leaf?.note ?? '';
+				if ((notes[c.slug] ?? '') === (seenNotes[c.slug] ?? '')) notes[c.slug] = n;
+				seenNotes[c.slug] = n;
+			}
 			d = x;
 		} catch (e) {
 			if (!d) missing = true;
@@ -159,6 +168,18 @@
 		if (!f.book) return;
 		return collect(() => cols.place(c.slug, id, Number(f.book), f.leaf ? Number(f.leaf) : null));
 	}
+	const noteDirty = (c: pics.PictureCollection) => (notes[c.slug] ?? '') !== (c.leaf?.note ?? '');
+	const saveNote = (c: pics.PictureCollection) =>
+		collect(() => cols.setNote(c.slug, id, notes[c.slug] ?? ''));
+	// Only offered on an empty field. An owner note emptied here is cleared first, since
+	// the conservator never writes over the owner's.
+	const askNote = (c: pics.PictureCollection) =>
+		collect(async () => {
+			if (c.leaf?.note_source === 'owner') await cols.setNote(c.slug, id, '');
+			await cols.writeNote(c.slug, id);
+		});
+	const noteBy = (c: pics.PictureCollection) =>
+		!c.leaf?.note ? '' : c.leaf.note_source === 'owner' ? 'owner' : (c.leaf.note_model ?? '');
 	const where = (c: pics.PictureCollection) => {
 		if (c.leaf) {
 			const pin = c.leaf.pinned ? 'pinned' : c.leaf.book_pinned ? 'book pinned' : 'auto';
@@ -323,6 +344,18 @@
 						{/if}
 						<a class="dim" href="/admin/collections">{c.abbrev_latin.toLowerCase()}</a>
 					</div>
+					{#if c.leaf}
+						<label>
+							<span class="l">conservator note <span class="dim">{noteBy(c)}</span></span>
+							<textarea rows="4" bind:value={notes[c.slug]}></textarea>
+						</label>
+						<div class="row">
+							<button disabled={!noteDirty(c)} onclick={() => saveNote(c)}>save</button>
+							{#if !(notes[c.slug] ?? '').trim()}
+								<button onclick={() => askNote(c)}>write note</button>
+							{/if}
+						</div>
+					{/if}
 				</div>
 			{/each}
 

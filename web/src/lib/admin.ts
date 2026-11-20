@@ -2,7 +2,8 @@ export type AdminState = { state: string; slug?: string; error?: string };
 export type Recent = { slug: string | null; status: string; created_at: string; thumb: string | null };
 export type Fields = { caption: string; description: string; tags: string; prompt: string };
 // Written as a `_collection.txt` sidecar by the server. book and leaf blank: the filer picks.
-export type Filing = { collection: string; book: string; leaf: string };
+// note, if any, becomes `_note.txt`: the owner's conservator note for the leaf.
+export type Filing = { collection: string; book: string; leaf: string; note: string };
 
 const H = { 'X-Requested-With': 'penish' };
 

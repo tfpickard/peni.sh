@@ -27,6 +27,7 @@ from penish.mycelium import store as mycelium
 from penish.storage import LocalStorage
 from penish.worker import (
     collection_jobs,
+    conservator,
     facet_jobs,
     name_jobs,
     nudity,
@@ -696,6 +697,13 @@ def _nudity_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) 
     return go
 
 
+def _note_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
+    async def go(job: Job) -> None:
+        await conservator.handle_note(job, pool=pool, settings=settings)
+
+    return go
+
+
 def _nudity_all_handler(pool: Pool, settings: Settings, embedder: DocumentEmbedder) -> Handler:
     async def go(job: Job) -> None:
         await nudity.handle_nudity_all(job, pool=pool)
@@ -741,6 +749,7 @@ HANDLERS: dict[str, HandlerFactory] = {
     collection.FILE_JOB: _collection_handler(collection_jobs.handle_file),
     collection.ANCHOR_JOB: _collection_handler(collection_jobs.handle_anchor),
     collection.RESORT_JOB: _collection_handler(collection_jobs.handle_resort),
+    collection.NOTE_JOB: _note_handler,
 }
 
 

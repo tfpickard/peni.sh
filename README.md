@@ -32,6 +32,7 @@ quiet for 10 seconds, then takes it.
 | `x_prompt.txt` | prompt |
 | `x_embedding.json` | embedding, if it names the current model and width |
 | `x_collection.txt` | a collection, as `pansophicon`, `pansophicon iii` or `pansophicon iii 14` |
+| `x_note.txt` | the conservator note for that leaf, kept as the owner's (needs `x_collection.txt`) |
 
 A missing caption, description, analysis or tags are written by a model. A
 missing prompt stays missing. Anything supplied is kept. A model never

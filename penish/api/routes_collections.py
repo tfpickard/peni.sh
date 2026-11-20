@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from penish.api.media import variants_for_many
 from penish.api.routes_images import grid_items
+from penish.collection.store import record_pairs
 from penish.mycelium.store import overgrowth_by_id
 
 router = APIRouter(prefix="/api/collections")
@@ -99,6 +100,11 @@ async def collection(request: Request, slug: str) -> dict[str, Any]:
     return {
         **_head(c, len(filled)),
         "preamble": c["preamble"],
+        # Owner text, stated as written: the gloss under the title, the catalogue record
+        # as [label, value] pairs, and the dealer's description, quoted apart.
+        "gloss": c["gloss"],
+        "record": [list(p) for p in record_pairs(c["record"])],
+        "vendor_text": c["vendor_text"],
         "books": [
             {"number": b["number"], "title": b["title"], "leaves": by_book.get(b["number"], [])}
             for b in books

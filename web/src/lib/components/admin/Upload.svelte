@@ -22,7 +22,7 @@
 	let over = $state(false);
 	// One sidecar names one collection, so ticking one unticks any other.
 	let collections = $state<cols.Summary[]>([]);
-	const noFiling: admin.Filing = { collection: '', book: '', leaf: '' };
+	const noFiling: admin.Filing = { collection: '', book: '', leaf: '', note: '' };
 	let filing = $state<admin.Filing>({ ...noFiling });
 	const chosen = $derived(collections.find((c) => c.slug === filing.collection) ?? null);
 
@@ -90,8 +90,11 @@
 		for (const row of rows) {
 			try {
 				row.state = 'uploading';
-				// A leaf is one slot; several pictures can share a book but not a leaf.
-				const f = filing.collection ? { ...filing, leaf: single ? filing.leaf : '' } : null;
+				// A leaf is one slot, and a note is about one leaf; several pictures can share
+				// a book but neither of those.
+				const f = filing.collection
+					? { ...filing, leaf: single ? filing.leaf : '', note: single ? filing.note : '' }
+					: null;
 				const { sha256, stem } = await admin.upload(row.file, text, (p) => (row.progress = p), f);
 				row.progress = 1;
 				row.state = 'waiting';
@@ -197,6 +200,13 @@
 				/>
 			</label>
 		</div>
+	{/if}
+
+	{#if chosen && single}
+		<label class="field">
+			<span class="l">conservator note</span>
+			<textarea rows="4" bind:value={filing.note}></textarea>
+		</label>
 	{/if}
 
 	<div class="actions">

@@ -616,9 +616,15 @@ async def _ingest_locked(
 
     caption_changed = await _apply_owner(conn, image_id, group)
     line = group.values.get("collection")
+    note = group.values.get("note")
+    if "note" in group.sidecars and note is None:
+        log.warning("ingest: image %s note sidecar is empty or not utf-8; dropped", image_id)
     if line is not None:
         # Before the publish gate, so the request is waiting when the picture goes live.
-        await collection.request_from_line(conn, image_id, line)
+        await collection.request_from_line(conn, image_id, line, note)
+    elif note is not None:
+        # A note belongs to a leaf, and without a collection line there is none to file.
+        log.warning("ingest: image %s has a note but no collection; dropped", image_id)
 
     img_bytes: bytes | None = None
     kinds = await nudity.kinds_for(conn, image_id)

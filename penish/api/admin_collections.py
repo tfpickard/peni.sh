@@ -81,7 +81,7 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
     books = list(await cur.fetchall())
     cur = await conn.execute(
         f"""
-        select {_PICTURE}, l.book, l.position, l.pinned, l.book_pinned
+        select {_PICTURE}, l.book, l.position, l.pinned, l.book_pinned, l.note, l.note_source
           from collection_leaves l join images i on i.id = l.image_id
          where l.collection_id = %s order by l.book, l.position
         """.encode(),
@@ -132,8 +132,16 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
                 "position": r["position"],
                 "pinned": r["pinned"],
                 "book_pinned": r["book_pinned"],
+                "note": r["note"],
+                "note_source": r["note_source"],
             }
         )
+    cur = await conn.execute(
+        "select count(*)::int as n from jobs where type = %s and status in ('queued', 'running')"
+        " and payload->>'collection_id' = %s",
+        (store.NOTE_JOB, str(c["id"])),
+    )
+    noting = (await cur.fetchone() or {"n": 0})["n"]
     return {
         "id": c["id"],
         "slug": c["slug"],
@@ -141,6 +149,10 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
         "abbrev": c["abbrev"],
         "abbrev_latin": c["abbrev_latin"],
         "preamble": c["preamble"],
+        "gloss": c["gloss"],
+        "record": [list(p) for p in store.record_pairs(c["record"])],
+        "vendor_text": c["vendor_text"],
+        "notes_queued": noting,
         "book_count": c["book_count"],
         "leaves_per_book": c["leaves_per_book"],
         "published": c["published"],
@@ -210,6 +222,11 @@ class CollectionEdit(BaseModel):
     abbrev: str | None = Field(None, min_length=1, max_length=20)
     abbrev_latin: str | None = Field(None, min_length=1, max_length=20)
     preamble: str | None = Field(None, max_length=20000)
+    gloss: str | None = Field(None, max_length=2000)
+    # Ordered [label, value] pairs; a value may hold several lines.
+    record: list[tuple[str, str]] | None = Field(None, max_length=60)
+    # Empty or null: no vendor's description is shown.
+    vendor_text: str | None = Field(None, max_length=20000)
     published: bool | None = None
     tuning: dict[str, float | bool] | None = None
 
@@ -219,11 +236,27 @@ async def edit_collection(request: Request, slug: str, body: CollectionEdit) -> 
     given = body.model_fields_set
     sets: list[str] = []
     params: list[Any] = []
-    for f in ("title", "abbrev", "abbrev_latin", "preamble", "published"):
+    for f in ("title", "abbrev", "abbrev_latin", "preamble", "gloss", "published"):
         v = getattr(body, f)
         if f in given and v is not None:
             sets.append(f"{f} = %s")
             params.append(v.strip() if isinstance(v, str) else v)
+    if "vendor_text" in given:
+        sets.append("vendor_text = %s")
+        params.append((body.vendor_text or "").strip() or None)
+    if "record" in given and body.record is not None:
+        rows: list[list[str]] = []
+        for label, value in body.record:
+            label = label.strip()
+            # Each line trimmed, blank lines dropped: the page shows one line per line.
+            value = "\n".join(x.strip() for x in value.splitlines() if x.strip())
+            if not label and not value:
+                continue
+            if not label or len(label) > 100 or len(value) > 4000:
+                raise HTTPException(status_code=422, detail="bad record")
+            rows.append([label, value])
+        sets.append("record = %s")
+        params.append(Jsonb(rows))
     if "tuning" in given and body.tuning is not None:
         for k, v in body.tuning.items():
             if k == "weekly_resort":
@@ -365,6 +398,50 @@ async def pin_leaf(request: Request, slug: str, image_id: int, body: Pin) -> dic
     return await _answer(request, slug)
 
 
+class NoteBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Null or empty clears the note, and the leaf is the conservator's again.
+    note: str | None = Field(None, max_length=store.NOTE_MAX)
+
+
+@router.put("/{slug}/leaves/{image_id}/note")
+async def put_note(request: Request, slug: str, image_id: int, body: NoteBody) -> dict[str, Any]:
+    async with request.app.state.pool.connection() as conn:
+        c = await _collection(conn, slug)
+        if not await store.set_note(conn, c["id"], image_id, body.note):
+            raise _not_here()
+    return await _answer(request, slug)
+
+
+@router.post("/{slug}/leaves/{image_id}/note")
+async def write_note(request: Request, slug: str, image_id: int) -> dict[str, Any]:
+    """Ask the conservator for this leaf. An owner note is left alone; a model note is
+    written again."""
+    async with request.app.state.pool.connection() as conn:
+        c = await _collection(conn, slug)
+        cur = await conn.execute(
+            "select note_source from collection_leaves where image_id = %s and collection_id = %s",
+            (image_id, c["id"]),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise _not_here()
+        if row["note_source"] == "owner":
+            raise HTTPException(status_code=409, detail="the note is the owner's")
+        await store.enqueue_note(conn, image_id, c["id"], rewrite=True)
+    return await _answer(request, slug)
+
+
+@router.post("/{slug}/notes")
+async def write_missing_notes(request: Request, slug: str) -> dict[str, Any]:
+    async with request.app.state.pool.connection() as conn:
+        c = await _collection(conn, slug)
+        n = await store.enqueue_missing_notes(conn, c["id"])
+    log.info("collection %s: %d notes queued", slug, n)
+    return await _answer(request, slug)
+
+
 @router.post("/{slug}/requests/{image_id}/retry")
 async def retry_request(request: Request, slug: str, image_id: int) -> dict[str, Any]:
     async with request.app.state.pool.connection() as conn, conn.transaction():
@@ -426,7 +503,7 @@ async def for_picture(conn: Any, image_id: int) -> list[dict[str, Any]]:
     cur = await conn.execute(
         """
         select c.slug, c.title, c.abbrev_latin, c.book_count, c.leaves_per_book,
-               l.book, l.position, l.pinned, l.book_pinned,
+               l.book, l.position, l.pinned, l.book_pinned, l.note, l.note_source, l.note_model,
                r.book as req_book, r.position as req_position, r.error as req_error,
                r.image_id is not null as requested
           from collections c
@@ -452,6 +529,9 @@ async def for_picture(conn: Any, image_id: int) -> list[dict[str, Any]]:
                     "position": r["position"],
                     "pinned": r["pinned"],
                     "book_pinned": r["book_pinned"],
+                    "note": r["note"],
+                    "note_source": r["note_source"],
+                    "note_model": r["note_model"],
                 },
                 "request": None
                 if not r["requested"]

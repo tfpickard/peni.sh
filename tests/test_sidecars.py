@@ -66,6 +66,7 @@ def test_registry_shape() -> None:
         "_prompt",
         "_embedding",
         "_collection",
+        "_note",
     }
 
 

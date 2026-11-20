@@ -37,6 +37,9 @@ Reason = Literal["auto", "resort", "owner"]
 FILE_JOB = "collection_file"
 ANCHOR_JOB = "collection_anchor"
 RESORT_JOB = "collection_resort"
+NOTE_JOB = "collection_note"
+# An owner note is shown as written; this only keeps a runaway paste out of the page.
+NOTE_MAX = 4000
 # The embedding kind the similar lists use; the vectors under it are made from the analysis.
 KIND = "description"
 
@@ -449,18 +452,23 @@ async def request(
     image_id: int,
     book: int | None,
     position: int | None,
+    note: str | None = None,
 ) -> None:
     """Mark a picture for the collection. A live picture is queued for filing now; one
-    still in ingest is queued when it goes live."""
+    still in ingest is queued when it goes live. `note` is an owner note, written to the
+    leaf once it is filed."""
     _check_shape(collection, book, position)
+    note = clean_note(note)
     await conn.execute(
         """
-        insert into collection_requests (image_id, collection_id, book, position)
-        values (%s, %s, %s, %s)
+        insert into collection_requests (image_id, collection_id, book, position, note)
+        values (%s, %s, %s, %s, %s)
         on conflict (image_id, collection_id) do update set
-          book = excluded.book, position = excluded.position, error = null, updated_at = now()
+          book = excluded.book, position = excluded.position,
+          note = coalesce(excluded.note, collection_requests.note),
+          error = null, updated_at = now()
         """,
-        (image_id, collection["id"], book, position),
+        (image_id, collection["id"], book, position, note),
     )
     cur = await conn.execute("select status::text as s from images where id = %s", (image_id,))
     row = await cur.fetchone()
@@ -468,15 +476,16 @@ async def request(
         await enqueue_file(conn, image_id, collection["id"])
 
 
-async def request_from_line(conn: Conn, image_id: int, line: str) -> None:
-    """A `_collection.txt` sidecar. Anything wrong with it is logged and left as a failed
-    job on the queue page, and the picture carries on without it."""
+async def request_from_line(conn: Conn, image_id: int, line: str, note: str | None = None) -> None:
+    """A `_collection.txt` sidecar, with the `_note.txt` beside it if there was one.
+    Anything wrong with the line is logged and left as a failed job on the queue page,
+    and the picture carries on without it (and without the note, which has no leaf)."""
     try:
         req = parse_line(line)
         collection = await collection_by_slug(conn, req.collection)
         if collection is None:
             raise ValueError(f"no collection {req.collection!r}")
-        await request(conn, collection, image_id, req.book, req.position)
+        await request(conn, collection, image_id, req.book, req.position, note)
     except (ValueError, Refused) as e:
         log.warning("image %s: collection sidecar %r dropped: %s", image_id, line[:200], e)
         # Once per picture and line: an ingest retried for an unrelated reason reads the
@@ -533,12 +542,207 @@ async def file_request(
             )
             log.warning("collection %s: image %s not filed: %s", collection_id, image_id, e)
             return str(e)
+        if req["note"]:
+            await set_note(conn, collection_id, image_id, req["note"])
+        # Same transaction as the filing, so a filed leaf never waits on a lost job.
+        await enqueue_note(conn, image_id, collection_id, only_missing=True)
         await conn.execute(
             "delete from collection_requests where image_id = %s and collection_id = %s",
             (image_id, collection_id),
         )
     log.info("collection %s: image %s filed, %d moves", collection_id, image_id, len(moves))
     return "filed"
+
+
+# -- conservator notes --------------------------------------------------------------
+
+
+def clean_note(text: str | None) -> str | None:
+    """Owner text as written, trimmed; empty means no note."""
+    if text is None:
+        return None
+    text = text.strip()[:NOTE_MAX].strip()
+    return text or None
+
+
+async def set_note(conn: Conn, collection_id: int, image_id: int, text: str | None) -> bool:
+    """The owner's note, which nothing generated replaces. Empty clears it, and the leaf
+    is then the conservator's to write again. False when the picture is not filed."""
+    text = clean_note(text)
+    cur = await conn.execute(
+        """
+        update collection_leaves
+           set note = %s, note_source = case when %s::text is null then null else 'owner' end,
+               note_model = null, updated_at = now()
+         where image_id = %s and collection_id = %s
+        """,
+        (text, text, image_id, collection_id),
+    )
+    return cur.rowcount > 0
+
+
+async def store_model_note(
+    conn: Conn,
+    collection_id: int,
+    image_id: int,
+    text: str,
+    model: str,
+    *,
+    rewrite: bool = False,
+) -> bool:
+    """A conservator's note. Conditional in the statement itself, so an owner note saved
+    while the model ran is never overwritten; without `rewrite` a model note is kept too."""
+    cur = await conn.execute(
+        """
+        update collection_leaves
+           set note = %(t)s, note_source = 'model', note_model = %(m)s, updated_at = now()
+         where image_id = %(i)s and collection_id = %(c)s
+           and note_source is distinct from 'owner'
+           and (%(rewrite)s or note is null)
+        """,
+        {"t": text, "m": model, "i": image_id, "c": collection_id, "rewrite": rewrite},
+    )
+    return cur.rowcount > 0
+
+
+def _note_key(image_id: int, collection_id: int, rewrite: bool) -> str:
+    # Separate key space, as nudity's forced check has: an asked-for rewrite must not fold
+    # into a queued fill-the-gap job that would keep the note it was asked to replace.
+    key = f"{NOTE_JOB}:{image_id}:{collection_id}"
+    return key + ":rewrite" if rewrite else key
+
+
+async def enqueue_note(
+    conn: Conn,
+    image_id: int,
+    collection_id: int,
+    *,
+    rewrite: bool = False,
+    only_missing: bool = False,
+) -> bool:
+    """A note job for one leaf. Never for an owner note; `only_missing` also skips a leaf
+    that already has a model note. True when a job was queued."""
+    cur = await conn.execute(
+        """
+        insert into jobs (type, payload, dedupe_key)
+        select %(t)s, %(p)s, %(k)s
+          from collection_leaves l
+         where l.image_id = %(i)s and l.collection_id = %(c)s
+           and l.note_source is distinct from 'owner'
+           and (not %(missing)s or l.note is null)
+        on conflict do nothing
+        """,
+        {
+            "t": NOTE_JOB,
+            "p": Jsonb({"image_id": image_id, "collection_id": collection_id, "rewrite": rewrite}),
+            "k": _note_key(image_id, collection_id, rewrite),
+            "i": image_id,
+            "c": collection_id,
+            "missing": only_missing,
+        },
+    )
+    return cur.rowcount > 0
+
+
+async def enqueue_missing_notes(conn: Conn, collection_id: int) -> int:
+    """One job per leaf with no note at all, in book and leaf order."""
+    cur = await conn.execute(
+        """
+        insert into jobs (type, payload, dedupe_key)
+        select %(t)s,
+               jsonb_build_object('image_id', l.image_id, 'collection_id', l.collection_id,
+                                  'rewrite', false),
+               %(t)s || ':' || l.image_id || ':' || l.collection_id
+          from collection_leaves l
+         where l.collection_id = %(c)s and l.note is null
+         order by l.book, l.position
+        on conflict do nothing
+        """,
+        {"t": NOTE_JOB, "c": collection_id},
+    )
+    return cur.rowcount
+
+
+@dataclass(frozen=True)
+class NoteContext:
+    """What the conservator is told besides the picture."""
+
+    sha256: str
+    crop: Any
+    record: list[tuple[str, str]]
+    book: int
+    position: int
+    leaves_per_book: int
+    note: str | None
+    note_source: str | None
+    # The latest earlier place, (book, position), when the leaf has moved.
+    previous: tuple[int, int] | None
+    # (position, note) for the other leaves in the book that have one, in leaf order.
+    book_notes: list[tuple[int, str]]
+
+
+def record_pairs(raw: Any) -> list[tuple[str, str]]:
+    """The stored record as pairs, skipping anything that is not a [label, value] pair of
+    strings. The admin only writes pairs; this keeps a hand edit from breaking a page."""
+    out: list[tuple[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if (
+            isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and isinstance(item[1], str)
+        ):
+            out.append((item[0], item[1]))
+    return out
+
+
+async def note_context(conn: Conn, collection_id: int, image_id: int) -> NoteContext | None:
+    cur = await conn.execute(
+        """
+        select i.sha256, i.crop, c.record, c.leaves_per_book, l.book, l.position, l.note,
+               l.note_source,
+               (select array[h.from_book, h.from_position]
+                  from collection_leaf_history h
+                 where h.image_id = l.image_id and h.collection_id = l.collection_id
+                   and h.from_book is not null
+                 order by h.id desc limit 1) as previous
+          from collection_leaves l
+          join images i on i.id = l.image_id
+          join collections c on c.id = l.collection_id
+         where l.image_id = %s and l.collection_id = %s
+        """,
+        (image_id, collection_id),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    cur = await conn.execute(
+        """
+        select position, note from collection_leaves
+         where collection_id = %s and book = %s and image_id <> %s and note is not null
+         order by position
+        """,
+        (collection_id, row["book"], image_id),
+    )
+    others = [(int(r["position"]), str(r["note"])) for r in await cur.fetchall()]
+    prev = row["previous"]
+    previous = (int(prev[0]), int(prev[1])) if prev else None
+    if previous == (row["book"], row["position"]):
+        previous = None
+    return NoteContext(
+        sha256=row["sha256"],
+        crop=row["crop"],
+        record=record_pairs(row["record"]),
+        book=int(row["book"]),
+        position=int(row["position"]),
+        leaves_per_book=int(row["leaves_per_book"]),
+        note=row["note"],
+        note_source=row["note_source"],
+        previous=previous,
+        book_notes=others,
+    )
 
 
 # -- anchors -------------------------------------------------------------------
@@ -580,7 +784,7 @@ async def leaf_for_image(conn: Conn, image_id: int) -> dict[str, Any] | None:
     was filed before (null when it has never been anywhere else)."""
     cur = await conn.execute(
         """
-        select c.slug, c.title, c.abbrev, c.abbrev_latin, l.book, l.position,
+        select c.slug, c.title, c.abbrev, c.abbrev_latin, l.book, l.position, l.note,
                (select row_to_json(h) from (
                   select from_book as book, from_position as position
                     from collection_leaf_history
@@ -612,4 +816,5 @@ async def leaf_for_image(conn: Conn, image_id: int) -> dict[str, Any] | None:
         "book": row["book"],
         "position": row["position"],
         "previous": prev,
+        "note": row["note"],
     }

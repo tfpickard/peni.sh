@@ -39,6 +39,16 @@ def leaf(dsn: str, image_id: int, book: int, position: int, pinned: bool = False
     )
 
 
+def noted(dsn: str, image_id: int, note: str, source: str = "owner") -> None:
+    sql(
+        dsn,
+        "update collection_leaves set note = %s, note_source = %s where image_id = %s",
+        note,
+        source,
+        image_id,
+    )
+
+
 def moved(dsn: str, image_id: int, frm: tuple[int, int] | None, to: tuple[int, int]) -> None:
     sql(
         dsn,
@@ -58,6 +68,12 @@ def moved(dsn: str, image_id: int, frm: tuple[int, int] | None, to: tuple[int, i
 async def test_unpublished_is_not_here(client: httpx.AsyncClient, clean_db: str) -> None:
     i = add(clean_db, 1, vec=[1, 0, 0, 0])
     leaf(clean_db, i, 3, 14)
+    noted(clean_db, i, "Vellum. Hand A.")
+    # None of the collection's own text, nor the leaf's note, shows anywhere.
+    for path in (PUB, f"{PUB}/{SLUG}", "/api/images/img-1"):
+        text = (await client.get(path)).text
+        for word in ("Pansophikon ton panton", "Ioannina", "IMPORTANT BYZANTINE", "Hand A"):
+            assert word not in text
     assert (await client.get(PUB)).json() == {"collections": []}
     assert (await client.get(f"{PUB}/{SLUG}")).status_code == 404
     assert (await client.get(f"{PUB}/{SLUG}/books/3")).status_code == 404
@@ -133,11 +149,39 @@ async def test_picture_leaf_and_previous(client: httpx.AsyncClient, clean_db: st
         "book": 3,
         "position": 14,
         "previous": None,
+        "note": None,
     }
     moved(clean_db, a, (5, 3), (3, 22))
     moved(clean_db, a, (3, 22), (3, 14))
     got = (await client.get("/api/images/img-1")).json()["leaf"]
     assert got["previous"] == {"book": 3, "position": 22}
+
+
+async def test_owner_text_and_leaf_note(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    leaf(clean_db, a, 3, 14)
+    noted(clean_db, a, "Ledger paper, machine-ruled.", "model")
+    publish(clean_db)
+    c = (await client.get(f"{PUB}/{SLUG}")).json()
+    assert c["gloss"] == "Pansophikon ton panton. The all-wise thing of all things."
+    assert [label for label, _ in c["record"]] == [
+        "extent",
+        "languages",
+        "support",
+        "condition",
+        "provenance",
+        "exhibited",
+        "literature",
+    ]
+    provenance = dict(c["record"])["provenance"].split("\n")
+    assert len(provenance) == 5 and provenance[-1].startswith("Acquired 2026")
+    assert c["vendor_text"].startswith("IMPORTANT BYZANTINE CODEX")
+    assert (await client.get("/api/images/img-1")).json()["leaf"]["note"] == (
+        "Ledger paper, machine-ruled."
+    )
+    # A leaf's note is public; the filer's internals and the note's source stay private.
+    text = (await client.get("/api/images/img-1")).text
+    assert "note_source" not in text and "note_model" not in text
 
 
 # -- admin ---------------------------------------------------------------------------
@@ -165,6 +209,8 @@ async def test_admin_detail(client: httpx.AsyncClient, clean_db: str) -> None:
             "position": 7,
             "pinned": True,
             "book_pinned": True,
+            "note": None,
+            "note_source": None,
         }
     ]
 
@@ -286,7 +332,15 @@ async def test_admin_picture_shows_collections(client: httpx.AsyncClient, clean_
     ]
     leaf(clean_db, a, 6, 2, pinned=True)
     d = (await client.get(f"/api/admin/pictures/{a}")).json()["collections"]
-    assert d[0]["leaf"] == {"book": 6, "position": 2, "pinned": True, "book_pinned": True}
+    assert d[0]["leaf"] == {
+        "book": 6,
+        "position": 2,
+        "pinned": True,
+        "book_pinned": True,
+        "note": None,
+        "note_source": None,
+        "note_model": None,
+    }
 
 
 # -- upload --------------------------------------------------------------------------
@@ -321,3 +375,68 @@ async def test_upload_refuses_a_bad_collection(client: httpx.AsyncClient) -> Non
     assert (await _upload(client, {"collection": "two words here too"})).status_code == 422
     assert (await _upload(client, {"collection": SLUG, "leaf": "3"})).status_code == 422
     assert (await _upload(client, {"collection": SLUG, "book": "iiii"})).status_code == 422
+
+
+async def test_admin_edits_owner_text(client: httpx.AsyncClient, clean_db: str) -> None:
+    r = await client.patch(
+        f"{ADM}/{SLUG}",
+        json={
+            "gloss": " The all-wise thing. ",
+            "record": [
+                ["extent", "one book"],
+                ["provenance", " A shed.\n\n By descent. "],
+                ["", ""],
+            ],
+            "vendor_text": "  ",
+        },
+    )
+    d = r.json()
+    assert d["gloss"] == "The all-wise thing."
+    assert d["record"] == [["extent", "one book"], ["provenance", "A shed.\nBy descent."]]
+    assert d["vendor_text"] is None
+    bad = await client.patch(f"{ADM}/{SLUG}", json={"record": [["", "a value with no label"]]})
+    assert bad.status_code == 422
+    # Leaving a field out leaves it alone.
+    d = (await client.patch(f"{ADM}/{SLUG}", json={"preamble": "x"})).json()
+    assert d["gloss"] == "The all-wise thing." and len(d["record"]) == 2
+
+
+async def test_admin_notes(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    b = add(clean_db, 2, vec=[0, 1, 0, 0])
+    leaf(clean_db, a, 3, 14)
+    leaf(clean_db, b, 3, 15)
+    r = await client.put(f"{ADM}/{SLUG}/leaves/{a}/note", json={"note": " Vellum. "})
+    got = r.json()["books"][2]["leaves"][0]
+    assert (got["note"], got["note_source"]) == ("Vellum.", "owner")
+    assert (await client.post(f"{ADM}/{SLUG}/leaves/{a}/note", headers=XHR)).status_code == 409
+    # Missing notes: only b, which has none.
+    r = await client.post(f"{ADM}/{SLUG}/notes", headers=XHR)
+    assert r.json()["notes_queued"] == 1
+    payloads = [
+        x[0] for x in sql(clean_db, "select payload from jobs where type = 'collection_note'")
+    ]
+    assert payloads == [{"image_id": b, "collection_id": cid(clean_db), "rewrite": False}]
+    # One leaf on demand is a rewrite, in its own key space.
+    r = await client.post(f"{ADM}/{SLUG}/leaves/{b}/note", headers=XHR)
+    assert r.status_code == 200 and r.json()["notes_queued"] == 2
+    # Clearing the owner's note gives the leaf back.
+    r = await client.put(f"{ADM}/{SLUG}/leaves/{a}/note", json={"note": ""})
+    got = r.json()["books"][2]["leaves"][0]
+    assert (got["note"], got["note_source"]) == (None, None)
+    assert (
+        await client.put(f"{ADM}/{SLUG}/leaves/999/note", json={"note": "x"})
+    ).status_code == 404
+    assert (await client.post(f"{ADM}/{SLUG}/leaves/999/note", headers=XHR)).status_code == 404
+
+
+async def test_upload_writes_note_sidecar_with_a_collection(client: httpx.AsyncClient) -> None:
+    inbox = get_settings().inbox
+    r = await _upload(client, {"collection": SLUG, "book": "3", "note": " Vellum.\nPatched. "})
+    stem = r.json()["stem"]
+    assert (inbox / f"{stem}_note.txt").read_text() == "Vellum.\nPatched.\n"
+    # A note needs a leaf to belong to.
+    r = await _upload(client, {"note": "Vellum."})
+    assert not (inbox / f"{r.json()['stem']}_note.txt").exists()
+    r = await _upload(client, {"collection": SLUG, "note": "  "})
+    assert not (inbox / f"{r.json()['stem']}_note.txt").exists()

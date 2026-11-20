@@ -13,6 +13,12 @@
 	);
 
 	const count = (n: number) => (n === 1 ? '1 leaf' : `${n} leaves`);
+	// A value may hold several lines (a provenance chain); each is shown as its own line.
+	const lines = (v: string) =>
+		v
+			.split('\n')
+			.map((x) => x.trim())
+			.filter(Boolean);
 </script>
 
 <svelte:head><title>{c ? c.title : 'not here'} -- peni.sh</title></svelte:head>
@@ -22,9 +28,31 @@
 {:else}
 	<PtpLogo size="large" title={c.title} />
 	<h1>{c.title}</h1>
+	{#if c.gloss}<p class="gloss">{c.gloss}</p>{/if}
 	{#each paragraphs as p}
 		<p class="preamble">{p}</p>
 	{/each}
+
+	{#if c.record.length}
+		<dl class="record">
+			{#each c.record as [label, value], i (i)}
+				<div>
+					<dt>{label}</dt>
+					<dd>
+						{#each lines(value) as line}<span>{line}</span>{/each}
+					</dd>
+				</div>
+			{/each}
+		</dl>
+	{/if}
+
+	{#if c.vendor_text}
+		<!-- Quoted as the dealer wrote it, set apart and smaller; never answered. -->
+		<figure class="vendor">
+			<figcaption>vendor's description</figcaption>
+			<blockquote>{c.vendor_text}</blockquote>
+		</figure>
+	{/if}
 
 	<ol>
 		{#each c.books as b (b.number)}
@@ -59,14 +87,64 @@
 		color: var(--muted-foreground);
 	}
 	h1 {
-		margin: 0 0 1.5rem;
+		margin: 0 0 0.35rem;
 		font-size: 1.25rem;
 		font-weight: 500;
 		line-height: 1.3;
 	}
+	.gloss {
+		margin: 0 0 1.5rem;
+		color: var(--muted-foreground);
+	}
 	.preamble {
 		margin: 0 0 0.75rem;
 		max-width: 40rem;
+	}
+	.record {
+		margin: 2.5rem 0 0;
+		max-width: 40rem;
+	}
+	.record div {
+		display: grid;
+		grid-template-columns: 7rem 1fr;
+		gap: 0 1rem;
+	}
+	.record div + div {
+		margin-top: 0.5rem;
+	}
+	dt {
+		color: var(--muted-foreground);
+		font-size: 0.8rem;
+		line-height: 1.6rem;
+	}
+	dd {
+		margin: 0;
+	}
+	dd span {
+		display: block;
+	}
+	/* Narrow: the label sits over its value. */
+	@media (max-width: 30rem) {
+		.record div {
+			grid-template-columns: 1fr;
+		}
+		.record div + div {
+			margin-top: 0.75rem;
+		}
+	}
+	.vendor {
+		margin: 2.5rem 0 0;
+		max-width: 34rem;
+		font-size: 0.85rem;
+		color: var(--muted-foreground);
+	}
+	figcaption {
+		font-size: 0.8rem;
+		margin-bottom: 0.25rem;
+	}
+	blockquote {
+		margin: 0;
+		color: var(--ink-400);
 	}
 	ol {
 		list-style: none;

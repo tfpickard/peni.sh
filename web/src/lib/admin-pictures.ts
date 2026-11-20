@@ -63,7 +63,15 @@ export type PictureCollection = {
 	abbrev_latin: string;
 	book_count: number;
 	leaves_per_book: number;
-	leaf: { book: number; position: number; pinned: boolean; book_pinned: boolean } | null;
+	leaf: {
+		book: number;
+		position: number;
+		pinned: boolean;
+		book_pinned: boolean;
+		note: string | null;
+		note_source: 'owner' | 'model' | null;
+		note_model: string | null;
+	} | null;
 	request: { book: number | null; position: number | null; error: string | null } | null;
 };
 

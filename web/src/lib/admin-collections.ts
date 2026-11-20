@@ -55,6 +55,8 @@ export type AdminLeaf = {
 	position: number;
 	pinned: boolean;
 	book_pinned: boolean;
+	note: string | null;
+	note_source: 'owner' | 'model' | null;
 };
 export type AdminBook = {
 	number: number;
@@ -90,6 +92,11 @@ export type HistoryRow = {
 export type Detail = Summary & {
 	id: number;
 	preamble: string;
+	gloss: string;
+	record: [string, string][];
+	vendor_text: string | null;
+	// Conservator notes waiting or being written for this collection.
+	notes_queued: number;
 	tuning: Tuning;
 	tuning_default: Tuning;
 	last_resort_at: string | null;
@@ -111,7 +118,12 @@ export const list = () => call<{ collections: Summary[] }>('GET', '');
 export const detail = (slug: string) => call<Detail>('GET', at(slug));
 export const edit = (
 	slug: string,
-	body: Partial<Pick<Detail, 'title' | 'abbrev' | 'abbrev_latin' | 'preamble' | 'published'>> & {
+	body: Partial<
+		Pick<
+			Detail,
+			'title' | 'abbrev' | 'abbrev_latin' | 'preamble' | 'gloss' | 'record' | 'vendor_text' | 'published'
+		>
+	> & {
 		tuning?: Partial<Tuning>;
 	}
 ) => call<Detail>('PATCH', at(slug), body);
@@ -127,6 +139,13 @@ export const unfile = (slug: string, imageId: number) =>
 	call<Detail>('DELETE', `${at(slug)}/leaves/${imageId}`);
 export const pin = (slug: string, imageId: number, pinned: boolean) =>
 	call<Detail>('POST', `${at(slug)}/leaves/${imageId}/pin`, { pinned });
+// The owner's note; empty clears it and hands the leaf back to the conservator.
+export const setNote = (slug: string, imageId: number, note: string) =>
+	call<Detail>('PUT', `${at(slug)}/leaves/${imageId}/note`, { note });
+// Ask the conservator for one leaf (a model note is written again; an owner note is refused).
+export const writeNote = (slug: string, imageId: number) =>
+	call<Detail>('POST', `${at(slug)}/leaves/${imageId}/note`, {});
+export const writeMissingNotes = (slug: string) => call<Detail>('POST', `${at(slug)}/notes`, {});
 export const retry = (slug: string, imageId: number) =>
 	call<Detail>('POST', `${at(slug)}/requests/${imageId}/retry`, {});
 export const dryRun = (slug: string) =>
