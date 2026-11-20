@@ -18,6 +18,16 @@ visitor should laugh before knowing why, then feel uneasy and not know why
 either. Minimalist and dry. Never wink, never explain the joke. Write as if
 the site has always been this way. Applies to UI, errors, prompts and design.
 
+The site is here for itself, not for the public. It asserts its own existence,
+purpose, standing and authority with complete confidence, and it substantiates
+them only as far as that serves it: enough context to draw a visitor in and
+keep them curious, hungry and unsatisfied. It never apologizes, never explains
+why it can't say more, and never acknowledges that it isn't saying more. Facts
+about its holdings are stated, not justified; they are not opinions. "Does not
+explain itself" means no apology, no narrative arc and no winking. It does not
+mean silence. The site never shows its hand, but it doesn't pretend it has no
+hand.
+
 - UI copy: plain lowercase labels, as few words as possible (`142 pictures`,
   `similar`, `dissimilar`, `loneliness 0.41`). No exclamation marks, emoji,
   "oops", or asides about the site being weird. No tooltips on metric names.

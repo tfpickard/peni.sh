@@ -213,7 +213,8 @@ Don't build either now. Just leave room for a nullable `note` field on `collecti
 
 ## Out of scope
 
-- Any public explanation of what the Pansophicon is, where it came from, or how filing works
+- A narrative history of the collection, or any text that explains, justifies or apologizes for it. Stated facts about the collection (provenance, extent, condition, per-leaf conservation notes) are in scope.
+- Any public explanation of how filing works
 - Model-decided membership
 - Collections as a category or a mycelium layer (they stay independent)
 - Drag-and-drop ordering (pin and move by number is enough)
