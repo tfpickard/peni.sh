@@ -1,4 +1,5 @@
-export type AdminState = { state: string; slug?: string; error?: string };
+// stem comes with `received`: the server holds the bytes under that name, no picture yet.
+export type AdminState = { state: string; slug?: string; error?: string; stem?: string };
 export type Recent = { slug: string | null; status: string; created_at: string; thumb: string | null };
 export type Fields = { caption: string; description: string; tags: string; prompt: string };
 // Written as a `_collection.txt` sidecar by the server. book and leaf blank: the filer picks.
@@ -26,7 +27,8 @@ export async function login(password: string): Promise<'ok' | 'no' | 'wait'> {
 export const logout = () => fetch('/api/admin/logout', { method: 'POST', headers: H });
 
 // status 0 means no answer at all: offline, aborted, or the connection dropped. sent says
-// whether the whole body left before that, since only then can the server have kept it.
+// the whole body left and no usable answer came back, since only then can the server hold
+// the file without having said so. A refusal with a status code stored nothing.
 export class HttpError extends Error {
 	status: number;
 	sent: boolean;
@@ -55,7 +57,24 @@ function reason(status: number, text: string): string {
 	return `server ${status}`;
 }
 
-// XHR rather than fetch: fetch has no upload progress.
+// A gateway that gave up waiting on the api: the api may still have kept the file.
+const unanswered = (status: number) =>
+	status === 502 || status === 504 || (status >= 520 && status <= 524);
+
+// A 200 from something other than the api, such as a captive portal, is not a receipt.
+function receipt(text: string): { stem: string; sha256: string } | null {
+	try {
+		const r = JSON.parse(text);
+		return typeof r?.stem === 'string' && typeof r?.sha256 === 'string'
+			? { stem: r.stem, sha256: r.sha256 }
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+// XHR rather than fetch: fetch has no upload progress. Unbounded here; the caller's signal
+// is its bound.
 export function upload(
 	file: File,
 	fields: Fields | null,
@@ -75,31 +94,73 @@ export function upload(
 		xhr.setRequestHeader('X-Requested-With', 'penish');
 		xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
 		xhr.upload.onload = () => (sent = true);
+		// Settles on every path: a throw in here would leave the promise open, and aborting
+		// a request that is already done fires nothing.
 		xhr.onload = () => {
-			if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
-			else reject(new HttpError(reason(xhr.status, xhr.responseText), xhr.status, true));
+			if (xhr.status === 200) {
+				const r = receipt(xhr.responseText);
+				if (r) resolve(r);
+				else reject(new HttpError('bad answer', 200, sent));
+			} else {
+				const s = xhr.status;
+				reject(new HttpError(reason(s, xhr.responseText), s, sent && (s === 0 || unanswered(s))));
+			}
 		};
 		xhr.onerror = lost;
 		xhr.onabort = lost;
+		if (signal?.aborted) return lost();
 		signal?.addEventListener('abort', () => xhr.abort(), { once: true });
 		xhr.send(body);
 	});
 }
 
-export async function status(sha256: string, stem: string): Promise<AdminState> {
+// Polled, so a hung request must not hold its caller.
+const STATUS_LIMIT = 15_000;
+
+function asState(v: unknown): AdminState | null {
+	if (typeof v !== 'object' || v === null) return null;
+	const o = v as Record<string, unknown>;
+	if (typeof o.state !== 'string') return null;
+	const s: AdminState = { state: o.state };
+	if (typeof o.slug === 'string') s.slug = o.slug;
+	if (typeof o.error === 'string') s.error = o.error;
+	if (typeof o.stem === 'string') s.stem = o.stem;
+	return s;
+}
+
+export async function status(sha256: string, stem: string, signal?: AbortSignal): Promise<AdminState> {
 	const q = new URLSearchParams({ sha256, stem });
-	let r: Response;
+	const ctl = new AbortController();
+	const stop = () => ctl.abort();
+	const t = setTimeout(stop, STATUS_LIMIT);
+	if (signal?.aborted) stop();
+	signal?.addEventListener('abort', stop, { once: true });
 	try {
-		r = await fetch(`/api/admin/status?${q}`);
-	} catch {
-		throw new HttpError('no answer', 0);
+		let r: Response;
+		try {
+			r = await fetch(`/api/admin/status?${q}`, { signal: ctl.signal });
+		} catch {
+			throw new HttpError('no answer', 0);
+		}
+		if (!r.ok) throw new HttpError('status', r.status);
+		let s: AdminState | null = null;
+		try {
+			s = asState(await r.json());
+		} catch {
+			if (ctl.signal.aborted) throw new HttpError('no answer', 0);
+		}
+		if (!s) throw new HttpError('bad answer', r.status);
+		return s;
+	} finally {
+		clearTimeout(t);
+		signal?.removeEventListener('abort', stop);
 	}
-	if (!r.ok) throw new HttpError('status', r.status);
-	return r.json();
 }
 
 export async function recent(): Promise<Recent[]> {
 	const r = await fetch('/api/admin/recent');
 	if (!r.ok) throw new Error('recent');
-	return r.json();
+	const v: unknown = await r.json();
+	if (!Array.isArray(v)) throw new Error('recent');
+	return v;
 }

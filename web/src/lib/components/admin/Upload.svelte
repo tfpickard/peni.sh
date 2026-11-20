@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { beforeNavigate } from '$app/navigation';
 	import * as admin from '../../admin';
 	import * as cols from '../../admin-collections';
 	import * as uq from '../../upload-queue';
@@ -26,7 +27,7 @@
 	// chosen yet the fields are open: Tom often writes the caption first.
 	const many = $derived(fresh.length > 1);
 	const sending = $derived(rows.some(uq.isSending));
-	const failed = $derived(rows.some((r) => r.phase === 'failed'));
+	const retryable = $derived(rows.some(uq.isRetryable));
 	const line = $derived(uq.summary(rows));
 
 	const queue = new uq.UploadQueue({
@@ -50,6 +51,8 @@
 			}
 		})();
 		return () => {
+			torn = true;
+			queue.stop();
 			letGo();
 			for (const r of rows) URL.revokeObjectURL(r.preview);
 		};
@@ -59,6 +62,8 @@
 	// on every return while anything is still going out.
 	let lock: WakeLockSentinel | null = null;
 	let asking = false;
+	// A request still pending at teardown resolves into a lock nothing would release.
+	let torn = false;
 	async function hold() {
 		if (lock || asking || !('wakeLock' in navigator)) return;
 		if (document.visibilityState !== 'visible') return;
@@ -68,7 +73,7 @@
 			l.addEventListener('release', () => {
 				if (lock === l) lock = null;
 			});
-			if (sending) lock = l;
+			if (sending && !torn) lock = l;
 			else void l.release();
 		} catch {
 			// Refused, by a low battery or a browser that will not; the sends go on regardless.
@@ -99,6 +104,16 @@
 		// Older Safari and Chrome only ask when this is set.
 		e.returnValue = '';
 	}
+
+	// beforeunload covers reloads and closing the tab; this covers the admin's own links and
+	// back and forward, which would tear the form down and abort what it is sending. Code
+	// that navigates on its own, such as logout, is let through.
+	beforeNavigate((nav) => {
+		if (!sending || nav.willUnload) return;
+		if (nav.type !== 'link' && nav.type !== 'popstate') return;
+		if (nav.to?.url.pathname === location.pathname) return;
+		if (!confirm('still sending. leave?')) nav.cancel();
+	});
 
 	function tick(slug: string) {
 		filing = filing.collection === slug ? { ...noFiling } : { ...noFiling, collection: slug };
@@ -187,14 +202,19 @@
 					<img src={row.preview} alt="" />
 					<span class="name">{row.name}</span>
 					{#if row.phase === 'uploading'}
+						<span class="dim">sending</span>
 						<progress value={row.progress} max="1"></progress>
-					{:else if row.phase === 'hashing' || row.phase === 'checking'}
+					{:else if row.phase === 'hashing'}
+						<span class="dim">reading</span>
+						<progress></progress>
+					{:else if row.phase === 'checking'}
+						<span class="dim">checking</span>
 						<progress></progress>
 					{:else if row.phase === 'queued'}
 						<span class="dim">queued</span>
 					{:else if row.phase === 'failed'}
-						<span class="bad">failed</span>
-						{#if row.error}<span class="err">{row.error}</span>{/if}
+						<!-- The reason is the state: `too large`, `no answer`, `server 503`. -->
+						<span class="bad">{row.error || 'failed'}</span>
 					{:else if row.state === 'live' && row.slug}
 						<a href="/i/{row.slug}">live</a>
 					{:else if row.state}
@@ -267,7 +287,7 @@
 
 	<div class="actions">
 		<button class="go" disabled={!fresh.length}>post</button>
-		{#if failed}
+		{#if retryable}
 			<button type="button" class="link" onclick={() => queue.retryFailed()}>retry failed</button>
 		{/if}
 	</div>

@@ -352,7 +352,7 @@
 					<button class="link" onclick={() => unfile(r.image_id)}>drop</button>
 				</li>
 			{/each}
-			{#each d.uploads as u (u.stem)}
+			{#each d.uploads as u (u.sha256)}
 				<li class="row">
 					{#if u.image_id !== null}
 						<a href="/admin/pictures/{u.image_id}">{u.filename ?? u.stem}</a>
