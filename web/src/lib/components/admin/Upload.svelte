@@ -2,59 +2,127 @@
 	import { onMount } from 'svelte';
 	import * as admin from '../../admin';
 	import * as cols from '../../admin-collections';
+	import * as uq from '../../upload-queue';
 	import { roman } from '../../roman';
 
-	type Row = {
-		name: string;
-		file: File;
-		preview: string;
-		progress: number;
-		state: string;
-		slug?: string;
-		error?: string;
-	};
+	type Row = uq.Item & { preview: string };
 
 	let { ondone }: { ondone?: () => void } = $props();
 
 	let rows = $state<Row[]>([]);
 	let fields = $state<admin.Fields>({ caption: '', description: '', tags: '', prompt: '' });
-	let busy = $state(false);
 	let over = $state(false);
+	let halted = $state(false);
 	// One sidecar names one collection, so ticking one unticks any other.
 	let collections = $state<cols.Summary[]>([]);
 	const noFiling: admin.Filing = { collection: '', book: '', leaf: '', note: '' };
 	let filing = $state<admin.Filing>({ ...noFiling });
 	const chosen = $derived(collections.find((c) => c.slug === filing.collection) ?? null);
 
-	const single = $derived(rows.length === 1);
+	// Rows already posted keep their own text and filing; the form speaks only for the rest.
+	const fresh = $derived(rows.filter((r) => r.phase === 'new'));
+	const single = $derived(fresh.length === 1);
 	// Text is per picture, so it only stands down when several are chosen. With none
 	// chosen yet the fields are open: Tom often writes the caption first.
-	const many = $derived(rows.length > 1);
+	const many = $derived(fresh.length > 1);
+	const sending = $derived(rows.some(uq.isSending));
+	const failed = $derived(rows.some((r) => r.phase === 'failed'));
+	const line = $derived(uq.summary(rows));
 
-	onMount(async () => {
-		try {
-			collections = (await cols.list()).collections;
-		} catch {
-			collections = [];
-		}
+	const queue = new uq.UploadQueue({
+		// The filing holds until the batch it was set for is out, unless more pictures are
+		// already waiting under it.
+		ondrain: () => {
+			if (!fresh.length) filing = { ...noFiling };
+		},
+		ondone: () => ondone?.(),
+		onhalt: (h) => (halted = h)
 	});
+
+	onMount(() => {
+		queue.setVisible(document.visibilityState === 'visible');
+		queue.setOnline(navigator.onLine);
+		(async () => {
+			try {
+				collections = (await cols.list()).collections;
+			} catch {
+				collections = [];
+			}
+		})();
+		return () => {
+			letGo();
+			for (const r of rows) URL.revokeObjectURL(r.preview);
+		};
+	});
+
+	// The browser drops a wake lock whenever the page is hidden, so it is asked for again
+	// on every return while anything is still going out.
+	let lock: WakeLockSentinel | null = null;
+	let asking = false;
+	async function hold() {
+		if (lock || asking || !('wakeLock' in navigator)) return;
+		if (document.visibilityState !== 'visible') return;
+		asking = true;
+		try {
+			const l = await navigator.wakeLock.request('screen');
+			l.addEventListener('release', () => {
+				if (lock === l) lock = null;
+			});
+			if (sending) lock = l;
+			else void l.release();
+		} catch {
+			// Refused, by a low battery or a browser that will not; the sends go on regardless.
+		} finally {
+			asking = false;
+		}
+	}
+	function letGo() {
+		const l = lock;
+		lock = null;
+		void l?.release();
+	}
+
+	$effect(() => {
+		if (sending) hold();
+		else letGo();
+	});
+
+	function seen() {
+		const v = document.visibilityState === 'visible';
+		queue.setVisible(v);
+		if (v && sending) hold();
+	}
+
+	function warn(e: BeforeUnloadEvent) {
+		if (!sending) return;
+		e.preventDefault();
+		// Older Safari and Chrome only ask when this is set.
+		e.returnValue = '';
+	}
 
 	function tick(slug: string) {
 		filing = filing.collection === slug ? { ...noFiling } : { ...noFiling, collection: slug };
 	}
 
+	// iPads hand over HEIC, and some browsers give it no type at all.
+	const HEIC = /\.(heic|heif)$/i;
+	const isImage = (f: File) => f.type.startsWith('image/') || (!f.type && HEIC.test(f.name));
+	const same = (a: File, b: File) =>
+		a.name === b.name && a.size === b.size && a.lastModified === b.lastModified;
+
+	// A finished batch is replaced by the next pick. While one is still moving, new pictures
+	// join it and only the unposted ones are swapped.
 	function pick(files: FileList | File[] | null) {
 		if (!files) return;
-		for (const r of rows) URL.revokeObjectURL(r.preview);
-		rows = [...files]
-			.filter((f) => f.type.startsWith('image/'))
-			.map((file) => ({
-				name: file.name,
-				file,
-				preview: URL.createObjectURL(file),
-				progress: 0,
-				state: ''
-			}));
+		const keep = queue.clear() ? [] : rows.filter((r) => r.phase !== 'new');
+		for (const r of rows) if (!keep.includes(r)) URL.revokeObjectURL(r.preview);
+		const added: Row[] = [];
+		for (const file of files) {
+			if (!isImage(file)) continue;
+			if ([...keep, ...added].some((r) => same(r.file, file))) continue;
+			added.push({ ...uq.item(file), preview: URL.createObjectURL(file) });
+		}
+		rows = [...keep, ...added];
 	}
 
 	function drop(e: DragEvent) {
@@ -63,54 +131,31 @@
 		pick(e.dataTransfer?.files ?? null);
 	}
 
-	const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-	const settled = (s: string) => s === 'live' || s === 'failed';
-
-	async function track(row: Row, sha256: string, stem: string) {
-		while (true) {
-			await sleep(2000);
-			try {
-				const s = await admin.status(sha256, stem);
-				row.state = s.state;
-				row.slug = s.slug;
-				row.error = s.error;
-				if (settled(s.state)) return;
-			} catch {
-				// A dropped poll is retried; the next one tells the truth.
-			}
-		}
-	}
-
-	async function post(e: SubmitEvent) {
+	function post(e: SubmitEvent) {
 		e.preventDefault();
-		if (busy || !rows.length) return;
-		busy = true;
+		const batch = fresh;
+		if (!batch.length) return;
 		const text = single ? { ...fields } : null;
-		const pending: Promise<void>[] = [];
-		for (const row of rows) {
-			try {
-				row.state = 'uploading';
-				// A leaf is one slot, and a note is about one leaf; several pictures can share
-				// a book but neither of those.
-				const f = filing.collection
-					? { ...filing, leaf: single ? filing.leaf : '', note: single ? filing.note : '' }
-					: null;
-				const { sha256, stem } = await admin.upload(row.file, text, (p) => (row.progress = p), f);
-				row.progress = 1;
-				row.state = 'waiting';
-				pending.push(track(row, sha256, stem));
-			} catch (err) {
-				row.state = 'failed';
-				row.error = (err as Error).message;
-			}
+		// A leaf is one slot, and a note is about one leaf; several pictures can share a book
+		// but neither of those.
+		const f = filing.collection
+			? { ...filing, leaf: single ? filing.leaf : '', note: single ? filing.note : '' }
+			: null;
+		for (const r of batch) {
+			r.fields = text;
+			r.filing = f ? { ...f } : null;
 		}
-		busy = false;
 		fields = { caption: '', description: '', tags: '', prompt: '' };
-		filing = { ...noFiling };
-		await Promise.all(pending);
-		ondone?.();
+		queue.add(batch);
 	}
 </script>
+
+<svelte:window
+	onbeforeunload={warn}
+	ononline={() => queue.setOnline(true)}
+	onoffline={() => queue.setOnline(false)}
+/>
+<svelte:document onvisibilitychange={seen} />
 
 <form
 	class="up"
@@ -126,11 +171,14 @@
 	<p class="hint">drop pictures here</p>
 	<input
 		type="file"
-		accept="image/png,image/jpeg,image/webp"
+		accept="image/png,image/jpeg,image/webp,image/heic,image/heif,.heic,.heif"
 		multiple
 		aria-label="image"
 		onchange={(e) => pick(e.currentTarget.files)}
 	/>
+
+	{#if halted}<p class="hot">{uq.SESSION_ENDED}</p>{/if}
+	{#if line}<p class="dim">{line}</p>{/if}
 
 	{#if rows.length}
 		<ul class="rows">
@@ -138,13 +186,21 @@
 				<li>
 					<img src={row.preview} alt="" />
 					<span class="name">{row.name}</span>
-					{#if row.state === 'uploading'}
+					{#if row.phase === 'uploading'}
 						<progress value={row.progress} max="1"></progress>
+					{:else if row.phase === 'hashing' || row.phase === 'checking'}
+						<progress></progress>
+					{:else if row.phase === 'queued'}
+						<span class="dim">queued</span>
+					{:else if row.phase === 'failed'}
+						<span class="bad">failed</span>
+						{#if row.error}<span class="err">{row.error}</span>{/if}
 					{:else if row.state === 'live' && row.slug}
 						<a href="/i/{row.slug}">live</a>
 					{:else if row.state}
 						<span class:bad={row.state === 'failed'}>{row.state}</span>
 						{#if row.error}<span class="err">{row.error}</span>{/if}
+						{#if row.quiet}<a href="/admin/queue">queue</a>{/if}
 					{/if}
 				</li>
 			{/each}
@@ -210,7 +266,10 @@
 	{/if}
 
 	<div class="actions">
-		<button class="go" disabled={busy || !rows.length}>post</button>
+		<button class="go" disabled={!fresh.length}>post</button>
+		{#if failed}
+			<button type="button" class="link" onclick={() => queue.retryFailed()}>retry failed</button>
+		{/if}
 	</div>
 </form>
 

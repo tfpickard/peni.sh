@@ -25,12 +25,43 @@ export async function login(password: string): Promise<'ok' | 'no' | 'wait'> {
 
 export const logout = () => fetch('/api/admin/logout', { method: 'POST', headers: H });
 
+// status 0 means no answer at all: offline, aborted, or the connection dropped. sent says
+// whether the whole body left before that, since only then can the server have kept it.
+export class HttpError extends Error {
+	status: number;
+	sent: boolean;
+	constructor(message: string, status: number, sent = false) {
+		super(message);
+		this.status = status;
+		this.sent = sent;
+	}
+}
+
+// The server's own word for a refusal, when it gave one: 422 names the bad field.
+function detail(text: string): string | null {
+	try {
+		const d = JSON.parse(text)?.detail;
+		return typeof d === 'string' && d ? d : null;
+	} catch {
+		return null;
+	}
+}
+
+function reason(status: number, text: string): string {
+	if (status === 413) return 'too large';
+	if (status === 415) return 'not an image';
+	if (status === 422) return detail(text) ?? 'refused';
+	if (status === 0) return 'no answer';
+	return `server ${status}`;
+}
+
 // XHR rather than fetch: fetch has no upload progress.
 export function upload(
 	file: File,
 	fields: Fields | null,
 	onProgress: (fraction: number) => void,
-	filing: Filing | null = null
+	filing: Filing | null = null,
+	signal?: AbortSignal
 ): Promise<{ stem: string; sha256: string }> {
 	return new Promise((resolve, reject) => {
 		const body = new FormData();
@@ -38,22 +69,32 @@ export function upload(
 		if (fields) for (const [k, v] of Object.entries(fields)) if (v) body.append(k, v);
 		if (filing?.collection) for (const [k, v] of Object.entries(filing)) if (v) body.append(k, v);
 		const xhr = new XMLHttpRequest();
+		let sent = false;
+		const lost = () => reject(new HttpError('no answer', 0, sent));
 		xhr.open('POST', '/api/admin/upload');
 		xhr.setRequestHeader('X-Requested-With', 'penish');
 		xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
+		xhr.upload.onload = () => (sent = true);
 		xhr.onload = () => {
 			if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
-			else reject(new Error(xhr.status === 413 ? 'too large' : xhr.status === 415 ? 'not an image' : 'failed'));
+			else reject(new HttpError(reason(xhr.status, xhr.responseText), xhr.status, true));
 		};
-		xhr.onerror = () => reject(new Error('failed'));
+		xhr.onerror = lost;
+		xhr.onabort = lost;
+		signal?.addEventListener('abort', () => xhr.abort(), { once: true });
 		xhr.send(body);
 	});
 }
 
 export async function status(sha256: string, stem: string): Promise<AdminState> {
 	const q = new URLSearchParams({ sha256, stem });
-	const r = await fetch(`/api/admin/status?${q}`);
-	if (!r.ok) throw new Error('status');
+	let r: Response;
+	try {
+		r = await fetch(`/api/admin/status?${q}`);
+	} catch {
+		throw new HttpError('no answer', 0);
+	}
+	if (!r.ok) throw new HttpError('status', r.status);
 	return r.json();
 }
 
