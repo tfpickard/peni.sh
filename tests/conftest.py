@@ -20,7 +20,11 @@ from penish.db import make_pool
 
 MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
 _UP = re.compile(r"--\s*migrate:up(.*?)(?:--\s*migrate:down|\Z)", re.S)
-COLLECTION_SEED = MIGRATIONS / "018_seed_pansophicon.sql"
+# Re-applied after every test, in order: the collection, then its owner text.
+COLLECTION_SEEDS = (
+    MIGRATIONS / "018_seed_pansophicon.sql",
+    MIGRATIONS / "020_seed_pansophicon_text.sql",
+)
 
 
 def _apply_migrations(dsn: str) -> None:
@@ -106,9 +110,10 @@ def clean_db(database_url: str) -> str:
         # The seeded collection back exactly as the migration leaves it: a test may
         # publish it, retitle a book or embed its anchors.
         conn.execute("delete from collections")
-        m = _UP.search(COLLECTION_SEED.read_text())
-        assert m
-        conn.execute(m.group(1).encode())
+        for seed in COLLECTION_SEEDS:
+            m = _UP.search(seed.read_text())
+            assert m
+            conn.execute(m.group(1).encode())
     return database_url
 
 

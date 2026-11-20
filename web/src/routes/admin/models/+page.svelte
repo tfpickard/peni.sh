@@ -3,7 +3,7 @@
 	import * as ops from '../../../lib/admin-ops';
 
 	const OTHER = '__other';
-	const purposes = ['describe', 'haiku', 'grow', 'extract', 'name'] as const;
+	const purposes = ['describe', 'haiku', 'grow', 'extract', 'name', 'conservator'] as const;
 	type Purpose = (typeof purposes)[number];
 	// The purposes with an effort key; the others always run at the model's own default.
 	const withEffort: readonly Purpose[] = ['describe', 'extract'];
@@ -50,7 +50,8 @@
 			haiku: block(data, 'haiku'),
 			grow: block(data, 'grow'),
 			extract: block(data, 'extract'),
-			name: block(data, 'name')
+			name: block(data, 'name'),
+			conservator: block(data, 'conservator')
 		};
 		cap = Number(data.current[CAP]);
 	}

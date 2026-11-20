@@ -7,6 +7,7 @@
 	import Votes from '../../../lib/components/Votes.svelte';
 	import Comments from '../../../lib/components/Comments.svelte';
 	import Overlap from '../../../lib/components/Overlap.svelte';
+	import PtpLogo from '../../../lib/components/PtpLogo.svelte';
 	import { postView } from '../../../lib/api';
 	import { markViewed } from '../../../lib/viewed';
 	import { roman } from '../../../lib/roman';
@@ -23,6 +24,9 @@
 		const abbrev = l.collection.abbrev_latin.toLowerCase();
 		const p = l.previous;
 		return {
+			note: l.note,
+			home: `/collections/${l.collection.slug}`,
+			title: l.collection.title,
 			href: `/collections/${l.collection.slug}/${l.book}`,
 			text: `${abbrev} ${roman(l.book)}, leaf ${l.position}`,
 			was: !p
@@ -282,6 +286,15 @@
 			{#if inNow.length > 1}<Overlap others={inNow} label="in" />{/if}
 		</div>
 	{/if}
+	<!-- A leaf is a holding before it is a picture: its place and the conservator's note
+	     come straight after the caption, ahead of the clerk. -->
+	{#if leaf}
+		<div class="ptp"><PtpLogo size="small" title={leaf.title} href={leaf.home} /></div>
+		<p class="leaf">
+			<a href={leaf.href}>{leaf.text}</a>{#if leaf.was}<span class="was">({leaf.was})</span>{/if}
+		</p>
+		{#if leaf.note}<p class="note">{leaf.note}</p>{/if}
+	{/if}
 	{#key image.slug}<Votes slug={image.slug} votes={image.votes} />{/key}
 	{#each paragraphs as p}
 		<p class="desc">
@@ -289,16 +302,12 @@
 			{p.text}
 		</p>
 	{/each}
-	{#if image.categories?.length}
+	<!-- On a leaf the gallery category would turn it back into a picture; the data stays. -->
+	{#if image.categories?.length && !leaf}
 		<p class="cats">
 			{#each image.categories as c (c.slug)}
 				<a href="/c/{c.slug}">{c.label}</a>{' '}
 			{/each}
-		</p>
-	{/if}
-	{#if leaf}
-		<p class="leaf">
-			<a href={leaf.href}>{leaf.text}</a>{#if leaf.was}<span class="was">({leaf.was})</span>{/if}
 		</p>
 	{/if}
 	{#if image.tags.length}
@@ -399,11 +408,23 @@
 	.cats a {
 		margin-right: 1rem;
 	}
+	.ptp {
+		margin-top: 0.5rem;
+	}
 	.leaf {
-		margin: 1rem 0 0;
+		margin: 0 0 1rem;
 		font-size: 0.9rem;
 	}
+	.leaf:has(+ .note) {
+		margin-bottom: 0.4rem;
+	}
 	.leaf a {
+		color: var(--muted-foreground);
+	}
+	.note {
+		margin: 0 0 1rem;
+		max-width: 40rem;
+		font-size: 0.9rem;
 		color: var(--muted-foreground);
 	}
 	.was {

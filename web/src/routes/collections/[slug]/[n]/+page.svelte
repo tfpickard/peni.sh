@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Picture from '../../../../lib/components/Picture.svelte';
+	import PtpLogo from '../../../../lib/components/PtpLogo.svelte';
 	import { roman } from '../../../../lib/roman';
 
 	let { data } = $props();
@@ -16,6 +17,7 @@
 {#if !b}
 	<p class="flat">not here</p>
 {:else}
+	<PtpLogo size="medium" title={b.collection.title} href="/collections/{data.slug}" />
 	<p class="up"><a href="/collections/{data.slug}">{b.collection.title}</a></p>
 	<h1>book {roman(b.number)}{#if b.title}<span class="title">{b.title}</span>{/if}</h1>
 	{#if leaves.length}

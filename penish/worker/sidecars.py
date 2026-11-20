@@ -1,7 +1,7 @@
 """Sidecar files that ride along with an inbox image, and grouping them by stem.
 
 A drop is `x.png` plus any of `x_caption.txt`, `x_tags.txt`, ... `x_embedding.json`,
-`x_collection.txt`.
+`x_collection.txt`, `x_note.txt`.
 """
 
 from __future__ import annotations
@@ -51,6 +51,16 @@ def _raw(p: Path) -> str:
     return p.read_bytes().decode("utf-8", errors="replace").strip()
 
 
+def _note(p: Path) -> str | None:
+    # A conservator note rides with a collection line and, like it, must never fail the
+    # picture: undecodable or empty is no note, and ingest says so in the log.
+    try:
+        text = p.read_bytes().decode("utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text or None
+
+
 def _embedding(p: Path) -> Embedding:
     # JSON only. A .npy variant would need a second file for model and dim, and
     # nothing produces .npy sidecars yet; add it here if that changes.
@@ -88,6 +98,7 @@ SIDECARS: dict[str, SidecarSpec] = {
     "_prompt": SidecarSpec("prompt", _text),
     "_embedding": SidecarSpec("embedding", _embedding, ".json"),
     "_collection": SidecarSpec("collection", _raw),
+    "_note": SidecarSpec("note", _note),
 }
 
 
@@ -117,7 +128,7 @@ class Group:
     stem: str
     image: Path
     # Keyed by SidecarSpec.field: caption, description, analysis, tags, prompt, embedding,
-    # collection.
+    # collection, note.
     values: dict[str, Any] = field(default_factory=dict)
     sidecars: dict[str, Path] = field(default_factory=dict)
     unknown: list[str] = field(default_factory=list)

@@ -510,6 +510,7 @@ async def test_make_handlers(p: Any, settings: Settings) -> None:
             "collection_file",
             "collection_anchor",
             "collection_resort",
+            "collection_note",
         }
     )
     await handlers["reembed_all"](job("reembed_all", {}))

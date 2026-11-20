@@ -63,10 +63,12 @@ export type ImageDetail = Omit<ImageItem, 'overgrowth'> & {
 	leaf: Leaf | null;
 };
 export type Leaf = {
-	collection: { slug: string; abbrev: string; abbrev_latin: string };
+	collection: { slug: string; title: string; abbrev: string; abbrev_latin: string };
 	book: number;
 	position: number;
 	previous: { book: number; position: number } | null;
+	// The conservator's note on the leaf.
+	note: string | null;
 };
 export type ImageRedirect = { redirect: string };
 
@@ -464,6 +466,11 @@ export type StripLeaf = {
 };
 export type Collection = CollectionHead & {
 	preamble: string;
+	// Owner text: a gloss of the title, the catalogue record as [label, value] pairs (a
+	// value may hold several lines), and the dealer's own description, if any.
+	gloss: string;
+	record: [string, string][];
+	vendor_text: string | null;
 	books: { number: number; title: string | null; leaves: StripLeaf[] }[];
 };
 export type BookSlot = (ImageItem & { position: number }) | null;

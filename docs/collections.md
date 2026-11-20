@@ -202,18 +202,16 @@ The site embeds the **analysis** paragraphs, so write anchors in that register: 
 
 `tag_hints` for each book can come from the obvious words in its anchor. Keep them short.
 
-## Clerk voice (phase 2, not in this build)
+## Voices
 
-Noted so it doesn't get designed out:
-
-- A per-leaf **conservator note** that is owner-written, or model-written when blank. It states layers as flat fact with no conclusions ("Greek hand, probably fifteenth century. Marginalia in Polish, later."). It would get its own prompt in `penish/prompts/`.
-- When any generated text refers to the collection, the clerk writes the full title or PTP. About 1 in 20 times he slips and writes "the Pansophicon". Never correct it, never flag it.
-
-Don't build either now. Just leave room for a nullable `note` field on `collection_leaves`.
+- The **conservator note** is built (see "As built"). It is owner-written, or model-written when blank, and describes the object, never the picture's meaning, as flat fact with no conclusions ("Greek hand, probably fifteenth century. Marginalia in Polish, later."). Its prompt is `penish/prompts/conservator.md`.
+- The academic etiquette: everyone calls it "the Pansophicon", and academics believe only they have earned the one-word name. So the conservator says "the Pansophicon" freely. The public pages and the clerk use the full title or PTP.
+- When the clerk's generated text refers to the collection, he writes the full title or PTP. About 1 in 20 times he slips and writes "the Pansophicon". Never correct it, never flag it. (Not built: the clerk does not refer to the collection yet.)
 
 ## Out of scope
 
-- Any public explanation of what the Pansophicon is, where it came from, or how filing works
+- A narrative history of the collection, or any text that explains, justifies or apologizes for it. Stated facts about the collection (provenance, extent, condition, per-leaf conservation notes) are in scope.
+- Any public explanation of how filing works
 - Model-decided membership
 - Collections as a category or a mycelium layer (they stay independent)
 - Drag-and-drop ordering (pin and move by number is enough)
@@ -252,7 +250,16 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
 - History also records a filing (`from` null) and an unfiling (`to` null), so the admin list
   shows a leaf's whole life. The public `previous` is the latest row with a `from`, and is
   null when that equals where the leaf is now.
-- `note` is on `collection_leaves`, nullable, and nothing writes it.
+- `migrations/019_collection_text.sql` adds the owner text and the note's provenance;
+  `020_seed_pansophicon_text.sql` seeds the Pansophicon's text, filling only what is still
+  empty. Tests re-apply 018 and 020 between runs.
+- `collections` carries owner text nothing generates: `gloss` (under the title), `record`
+  (jsonb, an ordered list of `[label, value]` pairs; a value may hold several lines) and
+  `vendor_text` (nullable). All three, like the preamble, are edited on `/admin/collections`.
+- `collection_leaves.note` is the conservator's note, with `note_source` (`owner` or
+  `model`) and `note_model`, as text rows carry theirs. A note always has a source.
+- `collection_requests.note` holds an owner note that arrived with the request (the upload
+  form or `_note.txt`) until the picture is filed; filing writes it to the leaf.
 - The filer's constants are `collections.tuning` (jsonb): `anchor_k` 3, `tag_alpha` 0.05,
   `fill_beta` 0.05, `book_margin` 0.03, `weekly_resort` false. Absent keys mean the defaults
   in `penish/collection/plan.py`. They are edited on `/admin/collections`, so tuning needs no
@@ -268,6 +275,30 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
 - `penish/worker/collection_jobs.py`: `collection_file`, `collection_anchor`,
   `collection_resort`, the worker start sweeps and the weekly check.
 - `penish/api/routes_collections.py` (public) and `penish/api/admin_collections.py` (admin).
+- `penish/worker/conservator.py`: the `collection_note` job, its prompt input and its
+  output check. `scripts/conservator_sample.py` runs the same call against live leaves
+  without storing anything, for checking the prompt.
+
+### Conservator notes
+
+- Filing queues `collection_note` in the filing's own transaction when the leaf has no
+  note. The admin queues it for one leaf (`write note`, which rewrites a model note) or for
+  every leaf with none (`write missing notes`). A plain job and an asked-for rewrite have
+  separate dedupe keys, so the rewrite never folds into a job that would keep the old note.
+- Owner wins twice: the job skips a leaf with an owner note, and the model's write is an
+  update conditional on `note_source` not being `owner`, so an owner note saved while the
+  model ran stands. Clearing an owner note (saving it empty) hands the leaf back.
+- The model is `conservator.model` (describe's model unless changed on `/admin/models`)
+  and the prompt `conservator.prompt`. It sees the displayed pixels, the collection's
+  record, the leaf's book and position, its latest earlier place, and the notes already
+  written for other leaves in the same book, in leaf order.
+- Its output is refused and asked again (three tries) when it is empty, over 600
+  characters, more than four sentences, asks or exclaims, reacts (`unusual`, `curious`,
+  `remarkable`, `interestingly`, `appears to depict` and kin), or names what stays unsaid
+  (the community and town the record leaves out, Byzantium as a state). Em dashes become
+  `--`. The prompt itself never names the unsaid things, so it cannot prime them.
+- `_note.txt` is read leniently: undecodable or empty is no note, logged, and never fails
+  the picture. A note with no collection line is dropped with a log line.
 
 ### Filing
 
@@ -321,3 +352,20 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   `(formerly leaf 22)` within a book or `(formerly ptp v, leaf 3)` across books.
 - Server-rendered titles: the Greek title for `/collections/<slug>`, `ΠΤΠ iii` for a book.
   Unknown or unpublished addresses answer 404.
+- The collection page, top to bottom: logo, Greek title, gloss (muted), preamble, the
+  record as a definition list (muted lowercase labels, one line per value line; stacked on
+  a phone), the vendor's description quoted under `vendor's description`, smaller and
+  dimmer, then the books. The vendor's "COMPLETE IN SEVEN BOOKS" against the preamble's
+  "No book has been found complete" is left standing.
+- `/api/collections/<slug>` carries `gloss`, `record` and `vendor_text`; `/api/images/<slug>`
+  `leaf` carries `note` and the collection's `title`. The note's source and model stay
+  private. An unpublished collection exposes none of it.
+- Leaf picture pages: caption, then the small logo, the leaf line and the conservator note
+  (muted, unlabelled), then votes and the clerk's description. The category line is hidden
+  on a leaf (one conditional in `i/[slug]/+page.svelte`); the categories stay in the data.
+- Logos: 25 decorated objects in `web/src/lib/assets/ptp/`, loaded with a relative
+  `import.meta.glob` (a `$lib` pattern matched nothing here). `PtpLogo.svelte` picks one
+  in `onMount`, skipping the last one shown (sessionStorage), inside a box sized by height
+  before the pick so nothing shifts: 10rem (7rem on a phone) on the collection page, 6rem on
+  a book page, 4rem above the leaf line on a leaf page, linking to the collection. Wide
+  logos are capped by width as well. No logo anywhere else.

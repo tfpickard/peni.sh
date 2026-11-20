@@ -276,6 +276,11 @@ async def upload(request: Request) -> dict[str, str]:
             line = _collection_line(form.get("collection"), form.get("book"), form.get("leaf"))
             if line:
                 sidecars.append((f"{stem}_collection.txt", line + "\n"))
+                # The conservator note is the owner's, for the leaf this picture becomes;
+                # with no collection there is no leaf, so it is not written.
+                note = form.get("note")
+                if isinstance(note, str) and note.strip():
+                    sidecars.append((f"{stem}_note.txt", note.strip() + "\n"))
 
         # Sidecars land before the image: the settle timer is keyed by stem, and an image
         # arriving first could be claimed without them.

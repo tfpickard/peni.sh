@@ -35,6 +35,7 @@ _PROMPT_FILES = {
     "extract.prompt": "mycelium_extract.md",
     "name.prompt": "mycelium_name.md",
     "nudity.prompt": "nudity.md",
+    "conservator.prompt": "conservator.md",
 }
 KEYS = (
     "describe.model",
@@ -51,12 +52,14 @@ KEYS = (
     "name.prompt",
     "nudity.model",
     "nudity.prompt",
+    "conservator.model",
+    "conservator.prompt",
     "mycelium.daily_calls",
     "log.level",
     "log.keep_days",
 )
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
-PURPOSES = ("describe", "haiku", "grow", "extract", "name", "nudity")
+PURPOSES = ("describe", "haiku", "grow", "extract", "name", "nudity", "conservator")
 # The purposes that count against mycelium.daily_calls. Describe, haiku, grow and nudity run once
 # per upload or per click; these two run from sweeps and the organism, so they are the
 # ones that could run away.
@@ -101,7 +104,15 @@ def default(key: str, settings: Settings | None = None) -> Any:
     s = settings or get_settings()
     # Grow, extract, naming and nudity are describe-grade work (extract and nudity also need
     # vision), so they follow describe until someone splits them.
-    if key in ("describe.model", "grow.model", "extract.model", "name.model", "nudity.model"):
+    # The conservator looks at the leaf, so it is vision work of the same grade.
+    if key in (
+        "describe.model",
+        "grow.model",
+        "extract.model",
+        "name.model",
+        "nudity.model",
+        "conservator.model",
+    ):
         return s.describe_model
     if key == "haiku.model":
         return s.haiku_model

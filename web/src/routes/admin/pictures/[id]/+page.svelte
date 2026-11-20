@@ -19,6 +19,10 @@
 	// Book and leaf for each collection's file or move, blank meaning the filer picks.
 	// Seeded by load, one per collection, so the fields can bind to them.
 	let filing = $state<Record<string, { book: string; leaf: string }>>({});
+	// The conservator note per collection, kept like a draft: a poll only replaces it
+	// while it still matches what the server last said.
+	let notes = $state<Record<string, string>>({});
+	let seenNotes: Record<string, string> = {};
 
 	type Draft = {
 		caption: string;
@@ -56,7 +60,12 @@
 			const kinds = x.nudity?.kinds ?? [];
 			if (picks.join(',') === seenPicks) picks = [...kinds];
 			seenPicks = kinds.join(',');
-			for (const c of x.collections) filing[c.slug] ??= { book: '', leaf: '' };
+			for (const c of x.collections) {
+				filing[c.slug] ??= { book: '', leaf: '' };
+				const n = c.leaf?.note ?? '';
+				if ((notes[c.slug] ?? '') === (seenNotes[c.slug] ?? '')) notes[c.slug] = n;
+				seenNotes[c.slug] = n;
+			}
 			d = x;
 		} catch (e) {
 			if (!d) missing = true;
@@ -159,6 +168,21 @@
 		if (!f.book) return;
 		return collect(() => cols.place(c.slug, id, Number(f.book), f.leaf ? Number(f.leaf) : null));
 	}
+	const noteDirty = (c: pics.PictureCollection) => (notes[c.slug] ?? '') !== (c.leaf?.note ?? '');
+	const saveNote = (c: pics.PictureCollection) =>
+		collect(() => cols.setNote(c.slug, id, notes[c.slug] ?? ''));
+	// Only offered on an empty field. An owner note emptied here is cleared first, since
+	// the conservator never writes over the owner's.
+	const askNote = (c: pics.PictureCollection) =>
+		collect(async () => {
+			if (c.leaf?.note_source === 'owner') await cols.setNote(c.slug, id, '');
+			await cols.writeNote(c.slug, id);
+			// The field is the conservator's now: an untouched empty draft takes the new
+			// note when it arrives, while anything typed after this still holds.
+			seenNotes[c.slug] = notes[c.slug] = '';
+		});
+	const noteBy = (c: pics.PictureCollection) =>
+		!c.leaf?.note ? '' : c.leaf.note_source === 'owner' ? 'owner' : (c.leaf.note_model ?? '');
 	const where = (c: pics.PictureCollection) => {
 		if (c.leaf) {
 			const pin = c.leaf.pinned ? 'pinned' : c.leaf.book_pinned ? 'book pinned' : 'auto';
@@ -323,6 +347,18 @@
 						{/if}
 						<a class="dim" href="/admin/collections">{c.abbrev_latin.toLowerCase()}</a>
 					</div>
+					{#if c.leaf}
+						<label>
+							<span class="l">conservator note <span class="dim">{noteBy(c)}</span></span>
+							<textarea rows="4" bind:value={notes[c.slug]}></textarea>
+						</label>
+						<div class="row">
+							<button disabled={!noteDirty(c)} onclick={() => saveNote(c)}>save</button>
+							{#if !(notes[c.slug] ?? '').trim()}
+								<button onclick={() => askNote(c)}>write note</button>
+							{/if}
+						</div>
+					{/if}
 				</div>
 			{/each}
 
@@ -417,6 +453,7 @@
 	label {
 		display: flex;
 		flex-direction: column;
+		gap: 0.35rem;
 		margin-top: 0.75rem;
 	}
 	.l {
@@ -428,17 +465,6 @@
 	}
 	p.dim {
 		margin: 0.75rem 0 0;
-	}
-	input,
-	textarea {
-		background: transparent;
-		color: var(--foreground);
-		border: 0;
-		border-bottom: 1px solid var(--ink-700);
-		border-radius: 0;
-		font: inherit;
-		padding: 0.4rem 0;
-		resize: vertical;
 	}
 	.nude {
 		margin-top: 0.75rem;
@@ -456,6 +482,7 @@
 		flex-direction: row;
 		align-items: center;
 		gap: 0.4rem;
+		min-height: 44px;
 		margin-top: 0;
 		font-size: 0.875rem;
 		color: var(--muted-foreground);
@@ -468,24 +495,14 @@
 		border: 0;
 		accent-color: var(--primary);
 	}
-	select {
-		background: transparent;
-		color: var(--foreground);
-		border: 0;
-		border-bottom: 1px solid var(--ink-700);
-		font: inherit;
-		padding: 0.4rem 0;
-	}
-	select option {
-		background: var(--background);
-	}
 	.num {
 		width: 5rem;
 	}
 	.row {
 		display: flex;
-		gap: 1.5rem;
-		align-items: baseline;
+		flex-wrap: wrap;
+		gap: 0.5rem 1.5rem;
+		align-items: center;
 		margin-top: 0.5rem;
 	}
 	.all {

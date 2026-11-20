@@ -111,27 +111,98 @@
 		color: var(--muted-foreground);
 	}
 
-	/* Shared by every admin page so each one only carries its own layout. */
-	.admin :global(input),
+	/* Shared by every admin page so each one only carries its own layout. The admin is
+	   for one person on an iPad: a field has to look like a field before it is touched,
+	   and 16px keeps Safari from zooming on focus. */
+	.admin :global(input:not([type='checkbox']):not([type='radio']):not([type='file'])),
 	.admin :global(textarea),
 	.admin :global(select),
 	.login input {
-		background: transparent;
+		box-sizing: border-box;
+		background: var(--ink-900);
 		color: var(--foreground);
-		border: 0;
-		border-bottom: 1px solid var(--ink-700);
+		border: 1px solid var(--ink-500);
 		border-radius: 0;
 		font: inherit;
-		padding: 0.4rem 0;
+		font-size: max(1rem, 16px);
+		line-height: 1.4;
+		padding: 0.55rem 0.75rem;
+		min-height: 44px;
+	}
+	.admin :global(textarea) {
+		resize: vertical;
+	}
+	.admin :global(input:focus-visible),
+	.admin :global(textarea:focus-visible),
+	.admin :global(select:focus-visible),
+	.login input:focus-visible {
+		outline: 2px solid var(--secondary);
+		outline-offset: 1px;
+		border-color: var(--secondary);
+	}
+	.admin :global(input:disabled),
+	.admin :global(textarea:disabled),
+	.admin :global(select:disabled) {
+		border-style: dashed;
+		color: var(--muted-foreground);
+		cursor: default;
 	}
 	.admin :global(select option) {
 		background: var(--background);
 	}
-	.admin :global(input::placeholder) {
+	.admin :global(input::placeholder),
+	.admin :global(textarea::placeholder),
+	.login input::placeholder {
+		color: var(--ink-400);
+	}
+	/* A visible label above a field: placeholders vanish while typing. */
+	.admin :global(.field) {
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+	}
+	.admin :global(.field > .l) {
+		font-size: 0.875rem;
+		color: var(--muted-foreground);
+	}
+	/* Checkboxes keep their small box; the label around them is the 44px target. */
+	.admin :global(label.hit) {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 44px;
+		min-height: 44px;
+		cursor: pointer;
+	}
+	.admin :global(input[type='checkbox']) {
+		width: 1.1rem;
+		height: 1.1rem;
+		margin: 0;
+		accent-color: var(--primary);
+		cursor: pointer;
+	}
+	/* Primary actions are real buttons; secondary and text actions stay bare. */
+	.admin :global(button.go),
+	.login button {
+		box-sizing: border-box;
+		background: transparent;
+		font-family: inherit;
+		cursor: pointer;
+		min-height: 44px;
+		padding: 0.55rem 1.4rem;
+		border: 1px solid var(--primary);
+		color: var(--primary);
+		font-size: max(1rem, 16px);
+	}
+	.admin :global(button.go:hover:not(:disabled)) {
+		background: var(--primary);
+		color: var(--background);
+	}
+	.admin :global(button.go:disabled) {
+		border-color: var(--ink-700);
 		color: var(--ink-500);
 	}
-	.admin :global(button),
-	.login button {
+	.admin :global(button) {
 		background: transparent;
 		color: var(--primary);
 		border: 0;

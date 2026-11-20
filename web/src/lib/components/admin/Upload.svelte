@@ -22,11 +22,14 @@
 	let over = $state(false);
 	// One sidecar names one collection, so ticking one unticks any other.
 	let collections = $state<cols.Summary[]>([]);
-	const noFiling: admin.Filing = { collection: '', book: '', leaf: '' };
+	const noFiling: admin.Filing = { collection: '', book: '', leaf: '', note: '' };
 	let filing = $state<admin.Filing>({ ...noFiling });
 	const chosen = $derived(collections.find((c) => c.slug === filing.collection) ?? null);
 
 	const single = $derived(rows.length === 1);
+	// Text is per picture, so it only stands down when several are chosen. With none
+	// chosen yet the fields are open: Tom often writes the caption first.
+	const many = $derived(rows.length > 1);
 
 	onMount(async () => {
 		try {
@@ -87,8 +90,11 @@
 		for (const row of rows) {
 			try {
 				row.state = 'uploading';
-				// A leaf is one slot; several pictures can share a book but not a leaf.
-				const f = filing.collection ? { ...filing, leaf: single ? filing.leaf : '' } : null;
+				// A leaf is one slot, and a note is about one leaf; several pictures can share
+				// a book but neither of those.
+				const f = filing.collection
+					? { ...filing, leaf: single ? filing.leaf : '', note: single ? filing.note : '' }
+					: null;
 				const { sha256, stem } = await admin.upload(row.file, text, (p) => (row.progress = p), f);
 				row.progress = 1;
 				row.state = 'waiting';
@@ -117,6 +123,7 @@
 	ondragleave={() => (over = false)}
 	ondrop={drop}
 >
+	<p class="hint">drop pictures here</p>
 	<input
 		type="file"
 		accept="image/png,image/jpeg,image/webp"
@@ -144,12 +151,24 @@
 		</ul>
 	{/if}
 
-	<input placeholder="caption" bind:value={fields.caption} disabled={!single} />
-	<textarea placeholder="description" rows="3" bind:value={fields.description} disabled={!single}
-	></textarea>
-	<textarea placeholder="tags, one per line" rows="3" bind:value={fields.tags} disabled={!single}
-	></textarea>
-	<textarea placeholder="prompt" rows="3" bind:value={fields.prompt} disabled={!single}></textarea>
+	{#if many}<p class="dim">text applies to one picture</p>{/if}
+
+	<label class="field">
+		<span class="l">caption</span>
+		<input bind:value={fields.caption} disabled={many} />
+	</label>
+	<label class="field">
+		<span class="l">description</span>
+		<textarea rows="5" bind:value={fields.description} disabled={many}></textarea>
+	</label>
+	<label class="field">
+		<span class="l">tags</span>
+		<textarea rows="4" placeholder="one per line" bind:value={fields.tags} disabled={many}></textarea>
+	</label>
+	<label class="field">
+		<span class="l">prompt</span>
+		<textarea rows="6" bind:value={fields.prompt} disabled={many}></textarea>
+	</label>
 
 	{#each collections as c (c.slug)}
 		<label class="tick">
@@ -159,27 +178,39 @@
 	{/each}
 	{#if chosen}
 		<div class="place">
-			<select aria-label="book" bind:value={filing.book}>
-				<option value="">book</option>
-				{#each Array.from({ length: chosen.book_count }, (_, i) => i + 1) as n (n)}
-					<option value={String(n)}>{roman(n)}</option>
-				{/each}
-			</select>
-			<input
-				class="leaf"
-				type="number"
-				min="1"
-				max={chosen.leaves_per_book}
-				placeholder="leaf"
-				aria-label="leaf"
-				bind:value={filing.leaf}
-				disabled={!single || !filing.book}
-			/>
+			<label class="field">
+				<span class="l">book</span>
+				<select bind:value={filing.book}>
+					<option value="">any</option>
+					{#each Array.from({ length: chosen.book_count }, (_, i) => i + 1) as n (n)}
+						<option value={String(n)}>{roman(n)}</option>
+					{/each}
+				</select>
+			</label>
+			<label class="field">
+				<span class="l">leaf</span>
+				<input
+					class="leaf"
+					type="number"
+					min="1"
+					max={chosen.leaves_per_book}
+					placeholder="any"
+					bind:value={filing.leaf}
+					disabled={many || !filing.book}
+				/>
+			</label>
 		</div>
 	{/if}
 
+	{#if chosen && single}
+		<label class="field">
+			<span class="l">conservator note</span>
+			<textarea rows="4" bind:value={filing.note}></textarea>
+		</label>
+	{/if}
+
 	<div class="actions">
-		<button disabled={busy || !rows.length}>post</button>
+		<button class="go" disabled={busy || !rows.length}>post</button>
 	</div>
 </form>
 
@@ -187,80 +218,44 @@
 	form {
 		display: flex;
 		flex-direction: column;
-		gap: 0.75rem;
-		max-width: 32rem;
+		gap: 1rem;
+		max-width: 48rem;
 	}
-	input,
-	textarea {
-		background: transparent;
-		color: var(--foreground);
-		border: 0;
-		border-bottom: 1px solid var(--ink-700);
-		font: inherit;
-		padding: 0.4rem 0;
-		resize: vertical;
+	/* Visible at rest, so it reads as a place to drop before anything is dragged. */
+	.up {
+		padding: 1rem;
+		border: 1px dashed var(--ink-500);
 	}
-	input:disabled,
-	textarea:disabled {
-		opacity: 0.3;
+	.up.over {
+		border-color: var(--secondary);
 	}
-	input::placeholder,
-	textarea::placeholder {
-		color: var(--ink-500);
-	}
-	input[type='file'] {
-		border: 0;
+	.hint {
+		margin: 0;
 		color: var(--muted-foreground);
 	}
-	button {
-		background: transparent;
-		color: var(--primary);
-		border: 0;
+	input[type='file'] {
+		color: var(--muted-foreground);
 		font: inherit;
-		padding: 0;
-		cursor: pointer;
+		min-height: 44px;
 	}
-	button:disabled {
-		color: var(--ink-500);
-		cursor: default;
-	}
-	select {
-		background: transparent;
-		color: var(--foreground);
-		border: 0;
-		border-bottom: 1px solid var(--ink-700);
-		font: inherit;
-		padding: 0.4rem 0;
-	}
-	select option {
-		background: var(--background);
+	.dim {
+		margin: 0;
+		color: var(--muted-foreground);
 	}
 	.tick {
 		display: flex;
 		align-items: center;
-		gap: 0.5rem;
-		color: var(--muted-foreground);
-	}
-	.tick input {
-		width: 1rem;
-		height: 1rem;
-		margin: 0;
-		accent-color: var(--primary);
+		gap: 0.6rem;
+		min-height: 44px;
+		cursor: pointer;
 	}
 	.place {
 		display: flex;
-		gap: 1.5rem;
+		flex-wrap: wrap;
+		gap: 1rem 1.5rem;
 	}
 	.leaf {
-		width: 5rem;
-	}
-	.up {
-		padding: 0.75rem;
-		margin: -0.75rem;
-		border: 1px dashed transparent;
-	}
-	.up.over {
-		border-color: var(--secondary);
+		width: 7rem;
 	}
 	.rows {
 		list-style: none;
@@ -268,7 +263,7 @@
 		padding: 0;
 		display: flex;
 		flex-direction: column;
-		gap: 0.5rem;
+		gap: 0.75rem;
 	}
 	li {
 		display: flex;
@@ -276,10 +271,11 @@
 		gap: 0.75rem;
 	}
 	li img {
-		width: 3rem;
-		height: 3rem;
+		width: 6rem;
+		height: 6rem;
 		object-fit: cover;
 		flex: none;
+		background: var(--muted);
 	}
 	.name {
 		overflow: hidden;
