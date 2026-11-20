@@ -4,9 +4,10 @@ import re
 import secrets
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 from penish.api.haiku_render import Gen, render_haiku_html
 from penish.api.media import variants_for
@@ -14,6 +15,7 @@ from penish.api.routes_collections import published
 from penish.api.routes_galleries import gallery_card, parse_serial
 from penish.api.routes_images import resolve_live
 from penish.api.routes_meta import random_haiku
+from penish.categories import SLUGS as CATEGORY_SLUGS
 from penish.collection.numerals import roman
 from penish.config import get_settings
 
@@ -25,6 +27,31 @@ _FALLBACK = (
 )
 _BODY_OPEN = re.compile(r"<body[^>]*>", re.I)
 _IMMUTABLE = "public, max-age=31536000, immutable"
+
+# Paths (no leading slash) that are real pages. Everything else gets the shell with a 404 so
+# crawlers do not see infinite pages; tests/test_api_meta.py walks web/src/routes to keep it honest.
+_FIXED_PAGES = frozenset(
+    {
+        "",
+        "categories",
+        "tags",
+        "galleries",
+        "mycelium",
+        "collections",
+        "search",
+        "admin",
+        "admin/comments",
+        "admin/mycelium",
+        "admin/pictures",
+        "admin/haikus",
+        "admin/models",
+        "admin/system",
+        "admin/logs",
+        "admin/queue",
+        "admin/collections",
+        "admin/stats",
+    }
+)
 
 
 def _template(build: Path) -> str:
@@ -75,12 +102,19 @@ def _summary(description: str, limit: int = 200) -> str:
     return text[:limit].rsplit(" ", 1)[0]
 
 
-async def _image_page(request: Request, slug: str) -> HTMLResponse:
+async def _image_page(request: Request, slug: str) -> Response:
     async with request.app.state.pool.connection() as conn:
         img = await resolve_live(conn, slug)
         if img is None:
             # The SPA draws "not here"; the status is for crawlers.
             return await render_index(request, status_code=404)
+        if img["slug"] != slug:
+            # A renamed picture: one address per picture, so crawlers consolidate on the new one.
+            # no-store because the target moves again if the picture is renamed again.
+            where = "/i/" + quote(img["slug"], safe="")
+            if request.url.query:
+                where += "?" + request.url.query
+            return RedirectResponse(where, status_code=301, headers={"Cache-Control": "no-store"})
         cur = await conn.execute(
             "select field, body from image_texts where image_id = %s "
             "and field in ('caption', 'description')",
@@ -162,6 +196,27 @@ async def _collection_page(request: Request, slug: str, book: str | None) -> HTM
     return await render_index(request, _meta("og:type", "website"), title=title)
 
 
+async def _is_known_page(request: Request, path: str) -> bool:
+    if path in _FIXED_PAGES:
+        return True
+    if path.startswith("c/"):
+        return path[2:] in CATEGORY_SLUGS
+    if path.startswith("t/") and len(path) > 2:
+        # Tags are free text, so the rest of the path is the tag, slashes included.
+        async with request.app.state.pool.connection() as conn:
+            cur = await conn.execute(
+                "select 1 from tags t join images i on i.id = t.image_id "
+                "where t.tag = %s and i.status = 'live' and i.published_at is not null limit 1",
+                (path[2:],),
+            )
+            return await cur.fetchone() is not None
+    # Digits only, same rule as /g/.
+    if path.startswith("admin/pictures/"):
+        rest = path[len("admin/pictures/") :]
+        return rest.isascii() and rest.isdigit()
+    return False
+
+
 # HEAD too: link unfurlers and uptime checks probe with HEAD before GET.
 @router.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
 async def catch_all(path: str, request: Request) -> Response:
@@ -187,4 +242,6 @@ async def catch_all(path: str, request: Request) -> Response:
         if target.is_file() and target.is_relative_to(build) and target.name != "index.html":
             headers = {"Cache-Control": _IMMUTABLE} if path.startswith("_app/immutable/") else {}
             return FileResponse(target, headers=headers)
-    return await render_index(request)
+    if await _is_known_page(request, path):
+        return await render_index(request)
+    return await render_index(request, status_code=404)
