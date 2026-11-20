@@ -7,7 +7,7 @@ import httpx
 
 from penish.config import get_settings
 from tests import test_admin_pictures
-from tests.test_admin_pictures import XHR, add, sql
+from tests.test_admin_pictures import XHR, add, sha, sql
 
 # The admin pictures client: logged in, with a 4-wide test embedding space.
 client = test_admin_pictures.client
@@ -213,6 +213,57 @@ async def test_admin_detail(client: httpx.AsyncClient, clean_db: str) -> None:
             "note_source": None,
         }
     ]
+
+
+def arrived(dsn: str, stem: str, n: int, error: str | None = None) -> None:
+    sql(
+        dsn,
+        "insert into uploads (stem, sha256, filename, collection_line, source, error)"
+        " values (%s, %s, %s, %s, 'form', %s)",
+        stem,
+        sha(n),
+        f"{stem}.HEIC",
+        SLUG,
+        error,
+    )
+
+
+async def test_admin_detail_lists_uploads_not_yet_leaves(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    arrived(clean_db, "broken", 1, error="broken.heic: not a readable image")
+    filed = add(clean_db, 2, vec=[1, 0, 0, 0])
+    leaf(clean_db, filed, 1, 1)
+    arrived(clean_db, "filed", 2)
+    waiting = add(clean_db, 3, vec=[0, 1, 0, 0])
+    sql(
+        clean_db,
+        "insert into collection_requests (image_id, collection_id, book) values (%s, %s, 1)",
+        waiting,
+        cid(clean_db),
+    )
+    arrived(clean_db, "waiting", 3)
+    sql(
+        clean_db,
+        "insert into uploads (stem, sha256, source) values ('elsewhere', %s, 'rsync')",
+        sha(4),
+    )
+
+    d = (await client.get(f"{ADM}/{SLUG}")).json()
+    assert [r["image_id"] for r in d["requests"]] == [waiting]
+    assert d["uploads"] == [
+        {
+            "stem": "broken",
+            "sha256": sha(1),
+            "filename": "broken.HEIC",
+            "stage": "failed",
+            "error": "broken.heic: not a readable image",
+            "slug": None,
+            "image_id": None,
+            "created_at": d["uploads"][0]["created_at"],
+        }
+    ]
+    assert d["uploads"][0]["created_at"]
 
 
 async def test_admin_edit_collection(client: httpx.AsyncClient, clean_db: str) -> None:

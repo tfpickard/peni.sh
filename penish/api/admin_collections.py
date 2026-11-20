@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ConfigDict, Field
 
+from penish import uploads
 from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for_many
 from penish.collection import store
@@ -142,6 +143,13 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
         (store.NOTE_JOB, str(c["id"])),
     )
     noting = (await cur.fetchone() or {"n": 0})["n"]
+    # A live picture waiting to be filed is already listed under requests, with its retry.
+    requested = {r["id"] for r in requests}
+    arriving = [
+        u
+        for u in await uploads.stages(conn, settings, collection=c["slug"], only_unfiled=True)
+        if u["image_id"] is None or u["image_id"] not in requested
+    ]
     return {
         "id": c["id"],
         "slug": c["slug"],
@@ -184,6 +192,19 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
                 "created_at": _iso(r["created_at"]),
             }
             for r in requests
+        ],
+        "uploads": [
+            {
+                "stem": u["stem"],
+                "sha256": u["sha256"],
+                "filename": u["filename"],
+                "stage": u["stage"],
+                "error": u["error"],
+                "slug": u["slug"],
+                "image_id": u["image_id"],
+                "created_at": _iso(u["created_at"]),
+            }
+            for u in arriving
         ],
         "history": [{**h, "at": _iso(h["at"])} for h in history],
     }

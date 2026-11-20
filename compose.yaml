@@ -35,6 +35,7 @@ services:
       DATABASE_URL: *db-url
       DATA_DIR: /data
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_READ_TOKEN: ${ADMIN_READ_TOKEN:-}
       SECRET_KEY: ${SECRET_KEY:-}
       TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
       TURNSTILE_SECRET: ${TURNSTILE_SECRET:-}
@@ -56,6 +57,9 @@ services:
       - ./data/inbox:/data/inbox
       # Read-only: the admin status call quotes the .err file of a failed group.
       - ./data/failed:/data/failed:ro
+      # Read-only: where an upload has got to, and whether a failed ingest job's folder
+      # is still being worked on, are read from here.
+      - ./data/processing:/data/processing:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

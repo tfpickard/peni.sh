@@ -336,6 +336,69 @@ async def test_failed_retry_collision_suffixes_whole_group(
     assert not (data(tmp_path) / "failed" / "cat").exists()
 
 
+def ingest_job(dsn: str, tmp_path: Path, stem: str) -> tuple[int, Path]:
+    directory = data(tmp_path) / "processing" / f"{stem}-claimed"
+    job_id = sql(
+        dsn,
+        "insert into jobs (type, payload, status, attempts, last_error) values"
+        " ('ingest', jsonb_build_object('dir', %s::text, 'stem', %s::text), 'failed', 1,"
+        " 'cat.png: not a readable image') returning id",
+        str(directory),
+        stem,
+    )[0][0]
+    return int(job_id), directory
+
+
+async def test_retry_ingest_moves_its_failed_folder_back(
+    client: httpx.AsyncClient, clean_db: str, tmp_path: Path
+) -> None:
+    job_id, _ = ingest_job(clean_db, tmp_path, "cat")
+    # An older picture of the same name failed first; this one landed in `cat-2`.
+    older = make_failed(tmp_path, "cat", {"cat.png": "old", "cat.err": "old"})
+    os.utime(older, (1, 1))
+    mine = make_failed(
+        tmp_path, "cat-2", {"cat.png": "img", "cat_caption.txt": "c", "cat.err": "boom"}
+    )
+    r = await client.post(f"/api/admin/queue/{job_id}/retry", headers=XHR)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "files": ["cat.png", "cat_caption.txt"]}
+    inbox = data(tmp_path) / "inbox"
+    assert (inbox / "cat.png").read_text() == "img"
+    assert not mine.exists() and older.exists()
+    # The watcher queues a new ingest for the files; this row is finished and leaves the
+    # queue, keeping its error.
+    row = sql(clean_db, "select status::text, last_error from jobs where id = %s", job_id)[0]
+    assert row == ("done", "cat.png: not a readable image")
+    assert job_id not in [j["id"] for j in (await client.get("/api/admin/queue")).json()["jobs"]]
+
+
+async def test_retry_ingest_with_nothing_left_refuses(
+    client: httpx.AsyncClient, clean_db: str, tmp_path: Path
+) -> None:
+    job_id, _ = ingest_job(clean_db, tmp_path, "cat")
+    # Another stem's folder, even one whose name starts the same, is not this job's.
+    make_failed(tmp_path, "cats", {"cats.png": "x"})
+    r = await client.post(f"/api/admin/queue/{job_id}/retry", headers=XHR)
+    assert r.status_code == 409
+    assert r.json() == {"detail": "gone"}
+    assert sql(clean_db, "select status::text from jobs where id = %s", job_id) == [("failed",)]
+    assert (data(tmp_path) / "failed" / "cats").exists()
+
+
+async def test_retry_ingest_still_in_processing_requeues(
+    client: httpx.AsyncClient, clean_db: str, tmp_path: Path
+) -> None:
+    job_id, directory = ingest_job(clean_db, tmp_path, "cat")
+    directory.mkdir(parents=True)
+    (directory / "cat.png").write_text("img")
+    failed = make_failed(tmp_path, "cat", {"cat.png": "old"})
+    r = await client.post(f"/api/admin/queue/{job_id}/retry", headers=XHR)
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    assert sql(clean_db, "select status::text from jobs where id = %s", job_id) == [("queued",)]
+    assert failed.exists() and (directory / "cat.png").exists()
+
+
 async def test_failed_delete(client: httpx.AsyncClient, tmp_path: Path) -> None:
     d = make_failed(tmp_path, "cat", {"cat.png": "x"})
     r = await client.delete("/api/admin/queue/failed/cat")

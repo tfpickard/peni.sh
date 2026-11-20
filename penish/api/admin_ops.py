@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from penish import runtime
+from penish import runtime, uploads
 from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for_many
 from penish.config import get_settings
@@ -431,8 +431,28 @@ async def get_queue(request: Request) -> dict[str, Any]:
     return {"jobs": jobs, "failed": await run_in_threadpool(_list_failed)}
 
 
+def _ingest_gone(payload: Any) -> str | None:
+    """The stem of an ingest whose processing folder no longer exists, else None. Named
+    under this container's processing dir, which need not be the worker's path."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("dir"), str):
+        return None
+    directory = Path(payload["dir"])
+    if (get_settings().processing / directory.name).is_dir():
+        return None
+    return str(payload.get("stem") or directory.name)
+
+
 @router.post("/queue/{job_id}/retry")
-async def retry_job(job_id: int, request: Request) -> dict[str, bool]:
+async def retry_job(job_id: int, request: Request) -> dict[str, Any]:
+    async with _pool(request).connection() as conn:
+        cur = await conn.execute("select type, payload from jobs where id = %s", (job_id,))
+        job = await cur.fetchone()
+    if job is None:
+        raise HTTPException(status_code=404, detail="not here")
+    if job["type"] == "ingest":
+        stem = await run_in_threadpool(_ingest_gone, job["payload"])
+        if stem is not None:
+            return await _retry_ingest(request, job_id, stem)
     try:
         async with _pool(request).connection() as conn:
             cur = await conn.execute(
@@ -455,6 +475,23 @@ async def delete_job(job_id: int, request: Request) -> dict[str, bool]:
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="not here")
     return {"ok": True}
+
+
+async def _retry_ingest(request: Request, job_id: int, stem: str) -> dict[str, Any]:
+    """Re-running an ingest whose files were moved to failed/ would find nothing and call
+    itself done; the files go back to the inbox instead, as the folder retry does."""
+    folder = await run_in_threadpool(uploads.failed_folder, get_settings(), stem)
+    if folder is None:
+        raise HTTPException(status_code=409, detail="gone")
+    moved = await run_in_threadpool(_move_back, _failed_dir(folder.name), get_settings().inbox)
+    # The watcher queues a fresh ingest for the files; this row has nothing left to do, and
+    # left failed it would offer a retry that leads nowhere. Its error stays for the logs.
+    async with _pool(request).connection() as conn:
+        await conn.execute(
+            "update jobs set status = 'done', locked_at = null, updated_at = now() where id = %s",
+            (job_id,),
+        )
+    return {"ok": True, "files": moved}
 
 
 def _suffixed(name: str, suffix: str) -> str:
