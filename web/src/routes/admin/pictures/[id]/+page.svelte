@@ -177,6 +177,9 @@
 		collect(async () => {
 			if (c.leaf?.note_source === 'owner') await cols.setNote(c.slug, id, '');
 			await cols.writeNote(c.slug, id);
+			// The field is the conservator's now: an untouched empty draft takes the new
+			// note when it arrives, while anything typed after this still holds.
+			seenNotes[c.slug] = notes[c.slug] = '';
 		});
 	const noteBy = (c: pics.PictureCollection) =>
 		!c.leaf?.note ? '' : c.leaf.note_source === 'owner' ? 'owner' : (c.leaf.note_model ?? '');

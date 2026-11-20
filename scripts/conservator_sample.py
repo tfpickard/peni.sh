@@ -6,7 +6,9 @@ Reads each leaf's place and earlier place from the public api, its 960px picture
 collection's record (from the public api once it carries one, else from the local
 database), then runs the same call the collection_note job makes. Leaves of one book are
 written in leaf order, each told the notes before it, as the job would be. Needs
-ANTHROPIC_API_KEY; model and prompt come from the runtime settings like the worker's.
+ANTHROPIC_API_KEY. Model and prompt are the worker's: the runtime settings in the database,
+overrides from /admin/models included; with no database reachable, the defaults, and it
+says so.
 """
 
 import argparse
@@ -20,6 +22,7 @@ import psycopg
 
 from penish.collection.store import NoteContext, record_pairs
 from penish.config import get_settings
+from penish.db import make_pool
 from penish.worker.conservator import write
 
 DEFAULT = (
@@ -44,15 +47,41 @@ def record(base: str, slug: str) -> list[tuple[str, str]]:
     except OSError:
         pass
     # Not deployed yet: the seed as the local database holds it.
-    with psycopg.connect(get_settings().database_url) as conn:
-        row = conn.execute("select record from collections where slug = %s", (slug,)).fetchone()
+    try:
+        with psycopg.connect(get_settings().database_url, connect_timeout=5) as conn:
+            row = conn.execute("select record from collections where slug = %s", (slug,)).fetchone()
+    except psycopg.OperationalError:
+        sys.exit(f"no record for {slug}: the live api has none yet and no database is reachable")
     if row is None:
         sys.exit(f"no record for {slug}")
     return record_pairs(row[0])
 
 
+async def open_pool() -> Any:
+    """The database the worker reads its settings from, or None when there is none here."""
+    pool = make_pool(get_settings().database_url)
+    try:
+        await pool.open(wait=True, timeout=5)
+    except Exception as e:
+        await pool.close()
+        print(
+            f"no database ({e.__class__.__name__}); using default model and prompt", file=sys.stderr
+        )
+        return None
+    return pool
+
+
 async def run(args: argparse.Namespace) -> int:
     settings = get_settings()
+    pool = await open_pool()
+    try:
+        return await notes(args, settings, pool)
+    finally:
+        if pool is not None:
+            await pool.close()
+
+
+async def notes(args: argparse.Namespace, settings: Any, pool: Any) -> int:
     leaves: list[tuple[dict[str, Any], bytes]] = []
     for slug in args.slugs:
         d = json.loads(get(args.base, f"/api/images/{slug}"))
@@ -81,7 +110,7 @@ async def run(args: argparse.Namespace) -> int:
             previous=(prev["book"], prev["position"]) if prev else None,
             book_notes=list(written.get(leaf["book"], [])),
         )
-        note = await write(pixels, "image/webp", ctx, settings=settings)
+        note = await write(pixels, "image/webp", ctx, settings=settings, pool=pool)
         written.setdefault(leaf["book"], []).append((leaf["position"], note.text))
         print(f"{d['slug']} (book {leaf['book']}, leaf {leaf['position']}, {note.model})")
         print(f"  {note.text}\n")
