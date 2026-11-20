@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import re
@@ -22,6 +23,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
+from penish import uploads
 from penish.collection import store as collection
 from penish.config import Settings
 from penish.mycelium import store as mycelium
@@ -476,6 +478,30 @@ async def _reslug(conn: Conn, image_id: int, old: str | None, base: str) -> None
     raise SoftError(f"could not find a free slug for {base!r}")
 
 
+# -- uploads --------------------------------------------------------------
+
+
+async def _upload_on(conn: Conn, what: str, stem: str, write: Awaitable[None]) -> None:
+    # The uploads row is a record of the ingest, not part of it: losing one is logged,
+    # never the reason a picture fails.
+    try:
+        await write
+    except Exception:
+        log.exception("ingest %s: could not %s the upload row", stem, what)
+
+
+async def _upload(
+    pool: Pool, what: str, stem: str, write: Callable[[Conn], Awaitable[None]]
+) -> None:
+    # Its own pool connection, committed on its own: written before the picture is
+    # decoded, it has to outlive whatever happens to the ingest after it.
+    try:
+        async with pool.connection() as conn:
+            await write(conn)
+    except Exception:
+        log.exception("ingest %s: could not %s the upload row", stem, what)
+
+
 # -- handlers -------------------------------------------------------------
 
 
@@ -536,10 +562,34 @@ async def handle_ingest(
         log.warning("ingest %s: ignoring unknown files %s", stem, group.unknown)
 
     data = await asyncio.to_thread(group.image.read_bytes)
+    # Before the decode, so a file that never becomes a picture still leaves its hash and
+    # the collection it was meant for. The decoder hashes the same bytes again later.
+    upload_sha = hashlib.sha256(data).hexdigest()
+    await _upload(
+        pool,
+        "record",
+        group.stem,
+        lambda c: uploads.record(
+            c,
+            stem=group.stem,
+            sha256=upload_sha,
+            filename=group.image.name,
+            size=len(data),
+            collection_line=group.values.get("collection"),
+            source="rsync",
+        ),
+    )
     try:
         decoded = await asyncio.to_thread(load_and_validate, data)
     except UndecodableImage as e:
-        _move_to_failed(directory, group.stem, settings, f"{group.image.name}: {e}", group.unknown)
+        reason = f"{group.image.name}: {e}"
+        _move_to_failed(directory, group.stem, settings, reason, group.unknown)
+        await _upload(
+            pool,
+            "fail",
+            group.stem,
+            lambda c: uploads.fail(c, stem=group.stem, sha256=upload_sha, error=reason),
+        )
         raise HardError(str(e)) from e
     sha = decoded.sha256
 
@@ -663,9 +713,16 @@ async def _ingest_locked(
                 await _set_status(conn, image_id, "pending_enrichment")
                 raise SoftError(f"describe: {e}") from e
             await _set_status(conn, image_id, "failed")
+            reason = f"describe: {e}"
             # Left in processing/ it would be re-enqueued and re-described on every restart.
-            _move_to_failed(directory, group.stem, settings, f"describe: {e}", group.unknown)
-            raise HardError(f"describe: {e}") from e
+            _move_to_failed(directory, group.stem, settings, reason, group.unknown)
+            await _upload_on(
+                conn,
+                "fail",
+                group.stem,
+                uploads.fail(conn, stem=group.stem, sha256=sha, error=reason),
+            )
+            raise HardError(reason) from e
         await _apply_model(conn, image_id, described)
 
     await _ensure_embedding(conn, image_id, group, settings, embedder)
@@ -702,6 +759,8 @@ async def _ingest_locked(
         # the caption write and the rename. Model captions never rename a live image.
         await _reslug(conn, image_id, row["slug"], base)
 
+    # Through the publish gate: whatever stopped this upload before no longer stands.
+    await _upload_on(conn, "clear", group.stem, uploads.clear(conn, stem=group.stem, sha256=sha))
     await refresh_corpus_stats(pool, kind=KIND, model=settings.embed_model)
     await asyncio.to_thread(shutil.rmtree, directory)
 

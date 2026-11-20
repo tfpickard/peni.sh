@@ -13,6 +13,7 @@ import pytest
 import pyvips
 from psycopg.types.json import Jsonb
 
+from penish import uploads
 from penish.config import Settings
 from penish.worker.derive import rebuild_public
 from penish.worker.describe import Described, DescribeError, expand
@@ -348,6 +349,95 @@ async def test_corrupt_file_goes_to_failed(p: Any, settings: Settings) -> None:
     with pytest.raises(HardError):
         await run(drop(settings, "bad", b"junk"), p, settings)
     assert (settings.failed / "bad-2" / "bad.err").is_file()
+
+
+async def stages(p: Any, settings: Settings, **kw: Any) -> list[dict[str, Any]]:
+    async with p.connection() as conn:
+        return await uploads.stages(conn, settings, **kw)
+
+
+async def test_corrupt_file_keeps_its_collection(p: Any, settings: Settings) -> None:
+    data = b"\x89PNG\r\n\x1a\nnot really"
+    job = drop(settings, "ultra", data, ext="jpg", collection="pansophicon")
+    with pytest.raises(HardError):
+        await run(job, p, settings)
+    assert await q(p, "select 1 from images") == []
+    err = (settings.failed / "ultra" / "ultra.err").read_text().strip()
+    [row] = await q(p, "select * from uploads")
+    assert row["error"] == err and err.startswith("ultra.jpg: ")
+    assert (row["stem"], row["sha256"], row["source"]) == (
+        "ultra",
+        hashlib.sha256(data).hexdigest(),
+        "rsync",
+    )
+    assert (row["filename"], row["bytes"], row["collection_line"]) == (
+        "ultra.jpg",
+        len(data),
+        "pansophicon",
+    )
+    [got] = await stages(p, settings, collection="pansophicon")
+    assert (got["stage"], got["error"], got["image_id"]) == ("failed", err, None)
+
+
+async def test_good_file_with_a_collection_ends_unfiled(p: Any, settings: Settings) -> None:
+    data = png(18)
+    sha = hashlib.sha256(data).hexdigest()
+    # An earlier attempt at the same bytes and stem gave up; this one gets through.
+    async with p.connection() as conn:
+        await uploads.fail(conn, stem="kept", sha256=sha, error="describe: 400")
+    await run(drop(settings, "kept", data, collection="pansophicon iii"), p, settings)
+    img = await image(p)
+    [row] = await q(p, "select * from uploads")
+    assert (row["error"], row["collection_line"], row["sha256"]) == (None, "pansophicon iii", sha)
+    [got] = await stages(p, settings, collection="pansophicon")
+    # Filing is its own job, and nothing here runs it.
+    assert (got["stage"], got["error"], got["image_id"], got["slug"]) == (
+        "unfiled",
+        None,
+        img["id"],
+        img["slug"],
+    )
+
+
+async def test_plain_drop_is_an_rsync_upload(p: Any, settings: Settings) -> None:
+    data = png(19)
+    await run(drop(settings, "plain", data), p, settings)
+    [row] = await q(p, "select * from uploads")
+    assert (row["stem"], row["source"], row["filename"], row["bytes"]) == (
+        "plain",
+        "rsync",
+        "plain.png",
+        len(data),
+    )
+    assert (row["collection_line"], row["error"]) == (None, None)
+    [got] = await stages(p, settings)
+    assert got["stage"] == "live"
+
+
+async def test_permanent_describe_error_is_kept_on_the_upload(p: Any, settings: Settings) -> None:
+    job = drop(settings, "nope", png(20), collection="pansophicon")
+    with pytest.raises(HardError):
+        await run(job, p, settings, FakeDescriber(fail=DescribeError("400", retryable=False)))
+    [row] = await q(p, "select error from uploads")
+    assert row["error"] == "describe: 400"
+    [got] = await stages(p, settings, collection="pansophicon")
+    assert got["stage"] == "failed"
+
+
+async def test_a_lost_upload_row_never_fails_the_picture(
+    p: Any, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def broken(*_: Any, **__: Any) -> None:
+        raise psycopg.errors.UndefinedTable("relation uploads does not exist")
+
+    for name in ("record", "fail", "clear"):
+        monkeypatch.setattr(uploads, name, broken)
+    await run(drop(settings, "fine", png(21), collection="pansophicon"), p, settings)
+    assert (await image(p))["status"] == "live"
+
+    with pytest.raises(HardError, match="not a readable image"):
+        await run(drop(settings, "bad", b"junk"), p, settings)
+    assert (settings.failed / "bad" / "bad.err").is_file()
 
 
 async def test_bad_group_goes_to_failed(p: Any, settings: Settings) -> None:
