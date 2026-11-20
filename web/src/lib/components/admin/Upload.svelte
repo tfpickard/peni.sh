@@ -111,7 +111,9 @@
 	beforeNavigate((nav) => {
 		if (!sending || nav.willUnload) return;
 		if (nav.type !== 'link' && nav.type !== 'popstate') return;
-		if (nav.to?.url.pathname === location.pathname) return;
+		// Against where the navigation started, not location: on back and forward the browser
+		// has already moved location to the target, so the two always matched and nothing asked.
+		if (nav.to?.url.pathname === nav.from?.url.pathname) return;
 		if (!confirm('still sending. leave?')) nav.cancel();
 	});
 
