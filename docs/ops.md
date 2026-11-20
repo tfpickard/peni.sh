@@ -33,11 +33,40 @@ Files with the same stem form one post. A group is picked up after 10 s without 
 | `x.png` | image |
 | `x_caption.txt` | caption |
 | `x_description.txt` | description |
+| `x_analysis.txt` | analysis |
 | `x_tags.txt` | tags, one per line |
 | `x_prompt.txt` | prompt |
-| `x_embedding.json` / `.npy` | embedding, only if it names our model and dim |
+| `x_embedding.json` | embedding, JSON only, and only if it names our model and dim |
+| `x_collection.txt` | collection, one line: `pansophicon`, `pansophicon iii` or `pansophicon iii 14` |
+| `x_note.txt` | conservator's note, kept with the collection line |
+
+Accepted pictures are `.png`, `.jpg`, `.jpeg`, `.webp`, `.heic` and `.heif`, in any case. Ultra HDR JPEGs are read as plain JPEG and the gain map is dropped. HEIC is decoded and its stored original is a PNG.
 
 Missing fields are generated. Failures land in `data/failed/<stem>/` with `x.err`. The admin queue page retries one: the api moves the files back to `data/inbox` and removes the folder (not the `.err`). `inbox` and `failed` are separate mounts in the api container, so the move is a copy into a dotfile in the inbox, an fsync, a rename, sidecars first and the picture last, and only then the delete of the source; the `failed` mount is therefore writable for the api. The api runs as uid/gid 1002, the same as `upload`, which owns both folders, so owner write on `failed/<stem>/` is all it needs (group write is not).
+
+Every arrival is recorded in the `uploads` table before it is decoded, so an upload that fails to decode still shows on `/admin/collections` under `unfiled`, with its stage and reason. The stages, in the order they are checked, are `filed`, `unfiled`, `live`, `down`, `ingesting`, `inbox`, `failed` and `received`. The stage is worked out from the images row, the collection leaves and the data folders on each request, and is not stored.
+
+### bulk push
+
+`scripts/ptp_push.py` sends a folder of pictures for one collection over the same rsync path as above. It skips any file whose sha256 the site already holds. It takes its sha list from `GET /api/admin/shas` with a read token (see admin), or from `--shas-file`.
+
+It is a dry run unless `--send` is given. The dry run prints each file and whether the site holds it. `--send` needs `--files-from`, a file of names, one per line, that must be files in the folder (`#` starts a comment). The script never chooses the files. Each picture goes with a `<stem>_collection.txt` sidecar, sent first.
+
+- `folder`: default `~/src/claude-share`
+- `--glob`: file pattern, repeatable (default `ptp-*.png` and `zm*.png`)
+- `--base`: site to ask for the sha list (default `https://peni.sh`)
+- `--shas-file`: json or one sha256 per line, instead of the api
+- `--json`: print json instead of text
+- `--files-from`: the files to send
+- `--send`: rsync the files named by `--files-from`
+- `--dest`: rsync destination (default `upload@100.80.26.40:`)
+- `--collection`: collection written into the sidecars (default `pansophicon`)
+- `--limit N`: send at most N files; files already on the site do not count
+
+```
+uv run python scripts/ptp_push.py
+uv run python scripts/ptp_push.py --send --files-from finals.txt --limit 5
+```
 
 ## cloudflare
 
@@ -154,3 +183,18 @@ ssh root@100.80.26.40 grep ADMIN_PASSWORD /srv/peni.sh/.env
 ```
 
 Changing it ends every session. Uploads go to `data/inbox` and take the same path as an rsync drop, including the 10 s settle.
+
+### read token
+
+`ADMIN_READ_TOKEN` in `.env` lets scripts read `/api/admin` with `Authorization: Bearer <token>`. It works for `GET` and `HEAD` only and can never write. It must be at least 32 characters or it is ignored, and it does nothing unless `ADMIN_PASSWORD` is set.
+
+On the owner's Mac the token lives in `~/.config/penish/read-token`, or in the `PENISH_READ_TOKEN` env var.
+
+```
+curl -H "Authorization: Bearer $(cat ~/.config/penish/read-token)" https://peni.sh/api/admin/queue
+```
+
+Two endpoints exist for scripts:
+
+- `GET /api/admin/shas`: `{"images": [...], "uploads": [...]}`. Each image has `sha256`, `status` and `slug`. Each upload has `sha256`, `stem`, `stage` and `error`.
+- `GET /api/admin/uploads`: `{"uploads": [...]}`, every upload with its `stage`, `error`, `filename`, `collection_line` and `created_at`. `?collection=<slug>` limits it to one collection.
