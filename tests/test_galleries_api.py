@@ -608,8 +608,9 @@ async def test_non_digit_gallery_paths_fall_through(
     clean_db: str,
     path: str,
 ) -> None:
+    # Not a gallery and not a page: the plain shell, and a 404 so crawlers drop it.
     r = await client.get(path)
-    assert r.status_code == 200
+    assert r.status_code == 404
     assert re.search(r'og:title" content="peni.sh"', r.text)
 
 
