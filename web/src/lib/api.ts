@@ -63,7 +63,7 @@ export type ImageDetail = Omit<ImageItem, 'overgrowth'> & {
 	leaf: Leaf | null;
 };
 export type Leaf = {
-	collection: { slug: string; abbrev: string; abbrev_latin: string };
+	collection: { slug: string; title: string; abbrev: string; abbrev_latin: string };
 	book: number;
 	position: number;
 	previous: { book: number; position: number } | null;

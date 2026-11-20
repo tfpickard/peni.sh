@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PtpLogo from '../../../lib/components/PtpLogo.svelte';
 	import { roman } from '../../../lib/roman';
 
 	let { data } = $props();
@@ -19,6 +20,7 @@
 {#if !c}
 	<p class="flat">not here</p>
 {:else}
+	<PtpLogo size="large" title={c.title} />
 	<h1>{c.title}</h1>
 	{#each paragraphs as p}
 		<p class="preamble">{p}</p>

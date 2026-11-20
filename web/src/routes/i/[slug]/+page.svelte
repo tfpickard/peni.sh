@@ -7,6 +7,7 @@
 	import Votes from '../../../lib/components/Votes.svelte';
 	import Comments from '../../../lib/components/Comments.svelte';
 	import Overlap from '../../../lib/components/Overlap.svelte';
+	import PtpLogo from '../../../lib/components/PtpLogo.svelte';
 	import { postView } from '../../../lib/api';
 	import { markViewed } from '../../../lib/viewed';
 	import { roman } from '../../../lib/roman';
@@ -23,6 +24,8 @@
 		const abbrev = l.collection.abbrev_latin.toLowerCase();
 		const p = l.previous;
 		return {
+			home: `/collections/${l.collection.slug}`,
+			title: l.collection.title,
 			href: `/collections/${l.collection.slug}/${l.book}`,
 			text: `${abbrev} ${roman(l.book)}, leaf ${l.position}`,
 			was: !p
@@ -297,6 +300,7 @@
 		</p>
 	{/if}
 	{#if leaf}
+		<div class="ptp"><PtpLogo size="small" title={leaf.title} href={leaf.home} /></div>
 		<p class="leaf">
 			<a href={leaf.href}>{leaf.text}</a>{#if leaf.was}<span class="was">({leaf.was})</span>{/if}
 		</p>
@@ -399,8 +403,11 @@
 	.cats a {
 		margin-right: 1rem;
 	}
+	.ptp {
+		margin-top: 1.5rem;
+	}
 	.leaf {
-		margin: 1rem 0 0;
+		margin: 0;
 		font-size: 0.9rem;
 	}
 	.leaf a {

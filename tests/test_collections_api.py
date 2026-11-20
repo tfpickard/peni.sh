@@ -124,7 +124,12 @@ async def test_picture_leaf_and_previous(client: httpx.AsyncClient, clean_db: st
     publish(clean_db)
     got = (await client.get("/api/images/img-1")).json()["leaf"]
     assert got == {
-        "collection": {"slug": SLUG, "abbrev": "ΠΤΠ", "abbrev_latin": "PTP"},
+        "collection": {
+            "slug": SLUG,
+            "title": "Πανσοφικὸν τῶν πάντων",
+            "abbrev": "ΠΤΠ",
+            "abbrev_latin": "PTP",
+        },
         "book": 3,
         "position": 14,
         "previous": None,

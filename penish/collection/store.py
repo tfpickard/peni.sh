@@ -580,7 +580,7 @@ async def leaf_for_image(conn: Conn, image_id: int) -> dict[str, Any] | None:
     was filed before (null when it has never been anywhere else)."""
     cur = await conn.execute(
         """
-        select c.slug, c.abbrev, c.abbrev_latin, l.book, l.position,
+        select c.slug, c.title, c.abbrev, c.abbrev_latin, l.book, l.position,
                (select row_to_json(h) from (
                   select from_book as book, from_position as position
                     from collection_leaf_history
@@ -605,6 +605,7 @@ async def leaf_for_image(conn: Conn, image_id: int) -> dict[str, Any] | None:
     return {
         "collection": {
             "slug": row["slug"],
+            "title": row["title"],
             "abbrev": row["abbrev"],
             "abbrev_latin": row["abbrev_latin"],
         },
