@@ -43,14 +43,21 @@ _BODY_SLACK = 1024 * 1024
 
 # A token shorter than this would make the rate limit the only defense, as with passwords.
 MIN_READ_TOKEN_LEN = 32
-_READ_METHODS = frozenset({"GET", "HEAD"})
-# Major brands of HEIF holding HEVC; AVIF shares the container but the worker cannot read it.
+# GET only: these routes are registered for GET, and the catch-all answers HEAD before the
+# token is ever looked at.
+_READ_METHODS = frozenset({"GET"})
+# Major brands of HEIF holding HEVC. AVIF shares the container and is refused here on
+# purpose: no door claims `.avif` (the inbox does not group it), so an upload of one could
+# never be grouped with its sidecars.
 _HEIC_BRANDS = frozenset({b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis"})
 _HEIF_GENERIC = frozenset({b"mif1", b"msf1"})
 
 log = logging.getLogger(__name__)
 
 _failures: dict[str, deque[float]] = defaultdict(deque)
+# Bearer misses are kept apart: a script on the owner's own machine with a stale token
+# must not use up the attempts the owner's password login needs from the same address.
+_token_failures: dict[str, deque[float]] = defaultdict(deque)
 
 
 def _settings_or_404() -> Settings:
@@ -123,8 +130,9 @@ def require_admin(request: Request) -> None:
         or request.method not in _READ_METHODS
     ):
         raise HTTPException(status_code=401, detail="no")
-    # The login's limiter, so the token cannot be guessed faster than the password.
-    q = _recent_failures(_client_ip(request))
+    # Its own per-address bucket with the login's limits, and the same global budget, so
+    # the token cannot be guessed faster than the password.
+    q = _recent_failures(_client_ip(request), _token_failures)
     if len(q) >= LOGIN_FAILURES:
         raise HTTPException(status_code=429, detail="wait")
     if hmac.compare_digest(given.encode(), token.encode()):
@@ -141,20 +149,27 @@ def _client_ip(request: Request) -> str:
     )
 
 
-def _recent_failures(ip: str) -> deque[float]:
+def _prune(bucket: dict[str, deque[float]], keep: str) -> None:
     cutoff = time.time() - LOGIN_WINDOW
     # Prune every key so the map cannot grow without bound across many IPs.
-    for key in list(_failures):
-        q = _failures[key]
+    for key in list(bucket):
+        q = bucket[key]
         while q and q[0] < cutoff:
             q.popleft()
-        if not q and key != ip:
-            del _failures[key]
-    return _failures[ip]
+        if not q and key != keep:
+            del bucket[key]
+
+
+def _recent_failures(ip: str, bucket: dict[str, deque[float]] | None = None) -> deque[float]:
+    bucket = _failures if bucket is None else bucket
+    # Both buckets, because the global budget sums them and must not count expired misses.
+    _prune(_failures, ip if bucket is _failures else "")
+    _prune(_token_failures, ip if bucket is _token_failures else "")
+    return bucket[ip]
 
 
 def _global_failures() -> int:
-    return sum(len(q) for q in _failures.values())
+    return sum(len(q) for q in _failures.values()) + sum(len(q) for q in _token_failures.values())
 
 
 class Login(BaseModel):
@@ -337,18 +352,21 @@ async def upload(request: Request) -> dict[str, str]:
                 if isinstance(note, str) and note.strip():
                     sidecars.append((f"{stem}_note.txt", note.strip() + "\n"))
 
-        # Sidecars land before the image: the settle timer is keyed by stem, and an image
-        # arriving first could be claimed without them.
         finals: list[tuple[Path, Path]] = []
         for name, text in sidecars:
             tmp = _write_tmp(inbox, name, text.encode())
             temps.append(tmp)
             finals.append((tmp, inbox / name))
+        # The one await before the files land, so a cancelled request leaves only temps for
+        # the finally to remove. Still before the image, so the row is there by the time
+        # the watcher can claim it.
+        await _record(request, stem, sha, filename, size, line)
+        # Nothing below awaits: sidecars land before the image (the settle timer is keyed
+        # by stem, and an image arriving first could be claimed without them) and a
+        # cancellation cannot fall between them.
         for tmp, final in finals:
             os.rename(tmp, final)
             temps.remove(tmp)
-        # Before the image lands, so the row is there by the time the watcher can claim it.
-        await _record(request, stem, sha, filename, size, line)
         os.rename(img_tmp, inbox / f"{stem}.{ext}")
         temps.remove(img_tmp)
     finally:
@@ -392,6 +410,19 @@ async def status(request: Request, sha256: str, stem: str = "") -> dict[str, str
             err = next(iter(sorted(d.glob("*.err"))), None)
             text = err.read_text(errors="replace")[:500] if err else ""
             return {"state": "failed", "error": text}
+    # The row is written before any file lands, so it is what tells a file the server holds
+    # from bytes it has never seen; the directories are not scanned, as this is polled.
+    async with request.app.state.pool.connection() as conn:
+        cur = await conn.execute(
+            "select stem, error from uploads where sha256 = %s order by created_at desc, id desc"
+            " limit 1",
+            (sha256,),
+        )
+        up = await cur.fetchone()
+    if up is not None:
+        if up["error"]:
+            return {"state": "failed", "error": up["error"], "stem": up["stem"]}
+        return {"state": "received", "stem": up["stem"]}
     return {"state": "waiting"}
 
 

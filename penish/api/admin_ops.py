@@ -454,14 +454,19 @@ def _ingest_gone(payload: Any) -> str | None:
 @router.post("/queue/{job_id}/retry")
 async def retry_job(job_id: int, request: Request) -> dict[str, Any]:
     async with _pool(request).connection() as conn:
-        cur = await conn.execute("select type, payload from jobs where id = %s", (job_id,))
+        cur = await conn.execute(
+            "select type, payload, status::text as status,"
+            " extract(epoch from updated_at) as failed_at from jobs where id = %s",
+            (job_id,),
+        )
         job = await cur.fetchone()
     if job is None:
         raise HTTPException(status_code=404, detail="not here")
     if job["type"] == "ingest":
         stem = await run_in_threadpool(_ingest_gone, job["payload"])
         if stem is not None:
-            return await _retry_ingest(request, job_id, stem)
+            job = {**job, "id": job_id, "failed_at": float(job["failed_at"])}
+            return await _retry_ingest(request, job, stem)
     try:
         async with _pool(request).connection() as conn:
             cur = await conn.execute(
@@ -486,21 +491,63 @@ async def delete_job(job_id: int, request: Request) -> dict[str, bool]:
     return {"ok": True}
 
 
-async def _retry_ingest(request: Request, job_id: int, stem: str) -> dict[str, Any]:
+async def _retry_ingest(request: Request, job: dict[str, Any], stem: str) -> dict[str, Any]:
     """Re-running an ingest whose files were moved to failed/ would find nothing and call
     itself done; the files go back to the inbox instead, as the folder retry does."""
-    folder = await run_in_threadpool(uploads.failed_folder, get_settings(), stem)
-    if folder is None:
+    if job["status"] != "failed":
+        # Already closed by an earlier click or by a folder retry; its folder, if one is
+        # left for the stem, belongs to another failure.
         raise HTTPException(status_code=409, detail="gone")
-    moved = await run_in_threadpool(_move_back, _failed_dir(folder.name), get_settings().inbox)
+    settings = get_settings()
+    folders = await run_in_threadpool(uploads.failed_folders, settings, stem)
+    if not folders:
+        raise HTTPException(status_code=409, detail="gone")
+    # The same stem can fail more than once (`x`, `x-2`), and the newest folder is not
+    # necessarily this row's: the one that failed when this row did is.
+    folder = await run_in_threadpool(_nearest_failure, folders, job["failed_at"])
+    moved = await run_in_threadpool(_move_back, _failed_dir(folder.name), settings.inbox)
     # The watcher queues a fresh ingest for the files; this row has nothing left to do, and
     # left failed it would offer a retry that leads nowhere. Its error stays for the logs.
+    await _close_ingests(request, [job["id"]])
+    return {"ok": True, "files": moved}
+
+
+def _nearest_failure(folders: list[Path], at: float) -> Path:
+    return min(folders, key=lambda f: abs(uploads.failed_at(f) - at))
+
+
+async def _close_ingests(request: Request, ids: list[int]) -> None:
+    if not ids:
+        return
     async with _pool(request).connection() as conn:
         await conn.execute(
-            "update jobs set status = 'done', locked_at = null, updated_at = now() where id = %s",
-            (job_id,),
+            "update jobs set status = 'done', locked_at = null, updated_at = now()"
+            " where id = any(%s) and type = 'ingest' and status = 'failed'",
+            (ids,),
         )
-    return {"ok": True, "files": moved}
+
+
+async def _close_after_folder_retry(request: Request, stems: set[str], failed_at: float) -> None:
+    """The failed ingest rows a folder retry has answered. Where another failed folder is
+    still held for the stem, only the row that failed with this one is closed; where none
+    is, no retry can lead anywhere and every failed row for the stem goes."""
+    async with _pool(request).connection() as conn:
+        cur = await conn.execute(
+            "select id, payload->>'stem' as stem, extract(epoch from updated_at) as at"
+            " from jobs where type = 'ingest' and status = 'failed'"
+            " and payload->>'stem' = any(%s)",
+            (sorted(stems),),
+        )
+        rows = await cur.fetchall()
+    settings = get_settings()
+    ids: list[int] = []
+    for stem in stems:
+        mine = [r for r in rows if r["stem"] == stem]
+        if await run_in_threadpool(uploads.failed_folder, settings, stem) is None:
+            ids += [r["id"] for r in mine]
+        elif mine:
+            ids.append(min(mine, key=lambda r: abs(float(r["at"]) - failed_at))["id"])
+    await _close_ingests(request, ids)
 
 
 def _suffixed(name: str, suffix: str) -> str:
@@ -614,9 +661,14 @@ def _move_back(directory: Path, inbox: Path) -> list[str]:
 
 
 @router.post("/queue/failed/{name}/retry")
-async def retry_failed(name: str) -> dict[str, Any]:
+async def retry_failed(name: str, request: Request) -> dict[str, Any]:
     directory = _failed_dir(name)
+    # Read before the move, which takes the files and then the folder away.
+    stems = await run_in_threadpool(uploads.folder_stems, directory)
+    failed_at = await run_in_threadpool(uploads.failed_at, directory)
     moved = await run_in_threadpool(_move_back, directory, get_settings().inbox)
+    # Only now that the files are in the inbox: a failed move leaves the row to retry from.
+    await _close_after_folder_retry(request, stems, failed_at)
     return {"ok": True, "files": moved}
 
 

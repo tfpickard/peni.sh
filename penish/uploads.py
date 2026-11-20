@@ -157,20 +157,50 @@ def _scan(settings: Settings) -> _Dirs:
     return out
 
 
-def failed_folder(settings: Settings, stem: str) -> Path | None:
-    """The newest failed folder holding this stem's files. Unlike `_scan`, a folder's name
-    alone does not count when its files say otherwise: `x-2` may hold an earlier `x`."""
-    best: tuple[float, Path] | None = None
+def failed_folders(settings: Settings, stem: str) -> list[Path]:
+    """Every failed folder holding this stem's files. A folder's name alone does not count
+    when its files say otherwise: `x-2` may hold an earlier `x`."""
+    out: list[Path] = []
     for e in _subdirs(settings.failed):
         stems = _stems(_files(Path(e.path)))
-        if stem not in stems and not (not stems and e.name == stem):
-            continue
+        if stem in stems or (not stems and e.name == stem):
+            out.append(Path(e.path))
+    return out
+
+
+def folder_stems(folder: Path) -> set[str]:
+    """The stems a failed folder's files belong to, its name when they name none."""
+    return _stems(_files(folder)) or {folder.name}
+
+
+def failed_at(folder: Path) -> float:
+    """When a folder failed, as the time its .err was written. The folder's own mtime moves
+    whenever a retry takes files out and puts them back, so it cannot say."""
+    times: list[float] = []
+    for name in _files(folder):
+        if name.endswith(".err"):
+            try:
+                times.append((folder / name).stat().st_mtime)
+            except OSError:
+                continue
+    if times:
+        return max(times)
+    try:
+        return folder.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def failed_folder(settings: Settings, stem: str) -> Path | None:
+    """The newest failed folder holding this stem's files."""
+    best: tuple[float, Path] | None = None
+    for path in failed_folders(settings, stem):
         try:
-            mtime = e.stat(follow_symlinks=False).st_mtime
+            mtime = path.stat().st_mtime
         except OSError:
             continue
         if best is None or mtime > best[0]:
-            best = (mtime, Path(e.path))
+            best = (mtime, path)
     return best[1] if best else None
 
 

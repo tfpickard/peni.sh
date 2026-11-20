@@ -1,6 +1,10 @@
+import asyncio
+import contextlib
+import os
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import psycopg
@@ -19,6 +23,7 @@ XHR = {"X-Requested-With": "penish"}
 @pytest.fixture(autouse=True)
 def _reset_limiter() -> None:
     admin._failures.clear()
+    admin._token_failures.clear()
 
 
 def _build(clean_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, password: str | None):
@@ -226,6 +231,59 @@ async def test_status_waiting_then_live(client: httpx.AsyncClient, clean_db: str
     assert r.json() == {"state": "live", "slug": "a-cat"}
 
 
+async def test_status_received_after_a_form_upload_with_no_stem(
+    client: httpx.AsyncClient,
+) -> None:
+    import hashlib
+
+    await _login(client)
+    data = _png()
+    sha = hashlib.sha256(data).hexdigest()
+    # Never seen: only now does the answer mean the server holds nothing.
+    r = await client.get("/api/admin/status", params={"sha256": sha, "stem": ""})
+    assert r.json() == {"state": "waiting"}
+    up = await client.post(
+        "/api/admin/upload", headers=XHR, files={"image": ("a.png", data, "image/png")}
+    )
+    assert up.status_code == 200, up.text
+    stem = up.json()["stem"]
+    # As after a lost response: the form has the bytes' hash and no stem.
+    for params in ({"sha256": sha, "stem": ""}, {"sha256": sha}):
+        r = await client.get("/api/admin/status", params=params)
+        assert r.json() == {"state": "received", "stem": stem}
+
+
+async def test_status_failed_from_the_upload_row(client: httpx.AsyncClient, clean_db: str) -> None:
+    await _login(client)
+    sha = "ef" * 32
+    with psycopg.connect(clean_db, autocommit=True) as conn:
+        conn.execute(
+            "insert into uploads (stem, sha256, source, error, created_at) values"
+            " ('x-old', %s, 'form', null, now() - interval '1 hour'),"
+            " ('x-new', %s, 'form', 'x.png: not a readable image', now())",
+            (sha, sha),
+        )
+    r = await client.get("/api/admin/status", params={"sha256": sha, "stem": ""})
+    assert r.json() == {"state": "failed", "error": "x.png: not a readable image", "stem": "x-new"}
+
+
+async def test_status_a_picture_outranks_its_upload_row(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    await _login(client)
+    sha = "12" * 32
+    with psycopg.connect(clean_db, autocommit=True) as conn:
+        conn.execute(
+            "insert into uploads (stem, sha256, source, error) values ('x', %s, 'form', 'old')",
+            (sha,),
+        )
+        conn.execute(
+            "insert into images (sha256, slug, status) values (%s, 'a-cat', 'live')", (sha,)
+        )
+    r = await client.get("/api/admin/status", params={"sha256": sha})
+    assert r.json() == {"state": "live", "slug": "a-cat"}
+
+
 async def test_status_failed_from_dir(client: httpx.AsyncClient) -> None:
     await _login(client)
     d = get_settings().failed / "x-abc123"
@@ -330,6 +388,62 @@ async def test_upload_survives_a_lost_record(
     assert _uploads(clean_db) == []
 
 
+async def test_upload_writes_the_row_before_any_file_lands(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The record is the one await in the upload; a cancelled request at that point must
+    # find nothing in the inbox but dotfile temps, never sidecars without their image.
+    await _login(client)
+    events: list[str] = []
+    real_rename, real_record = os.rename, admin.uploads.record
+    seen: list[list[str]] = []
+
+    def rename(src: Any, dst: Any, *a: Any, **k: Any) -> None:
+        events.append(f"rename {Path(dst).name.rpartition('.')[2]}")
+        real_rename(src, dst, *a, **k)
+
+    async def record(*a: Any, **k: Any) -> None:
+        events.append("record")
+        seen.append(sorted(p.name for p in get_settings().inbox.iterdir() if p.name[0] != "."))
+        await real_record(*a, **k)
+
+    monkeypatch.setattr(admin.os, "rename", rename)
+    monkeypatch.setattr(admin.uploads, "record", record)
+    r = await client.post(
+        "/api/admin/upload",
+        headers=XHR,
+        files={"image": ("a.png", _png(), "image/png")},
+        data={"caption": "a cat", "tags": "cat"},
+    )
+    assert r.status_code == 200, r.text
+    assert events == ["record", "rename txt", "rename txt", "rename png"]
+    assert seen == [[]]
+
+
+async def test_a_cancelled_record_leaves_the_inbox_empty(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _login(client)
+
+    async def cancelled(*_: object, **__: object) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(admin, "_record", cancelled)
+    # The cancellation is the server's to swallow; the client only needs to see no files.
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(
+            client.post(
+                "/api/admin/upload",
+                headers=XHR,
+                files={"image": ("a.png", _png(), "image/png")},
+                data={"caption": "a cat"},
+            ),
+            timeout=5,
+        )
+    inbox = get_settings().inbox
+    assert not inbox.exists() or list(inbox.iterdir()) == []
+
+
 def _ftyp(major: bytes, *compatible: bytes) -> bytes:
     body = b"ftyp" + major + b"\0\0\0\0" + b"".join(compatible)
     return (len(body) + 4).to_bytes(4, "big") + body + b"\0" * 64
@@ -379,6 +493,10 @@ async def test_upload_refuses_avif_and_noise(client: httpx.AsyncClient, head: by
 # -- the read token --------------------------------------------------------------------
 
 TOKEN = "r3ad-only-" + "k" * 30
+
+
+def _spent() -> bool:
+    return any(admin._failures.values()) or any(admin._token_failures.values())
 
 
 def _bearer(token: str = TOKEN) -> dict[str, str]:
@@ -445,7 +563,7 @@ async def test_token_cannot_write(reader: httpx.AsyncClient, clean_db: str) -> N
         assert title is not None and title[0] != "x"
         assert conn.execute("select count(*) from settings").fetchone() == settings_before
     # Refused writes are not guesses: they do not spend the limiter.
-    assert not any(admin._failures.values())
+    assert not _spent()
 
 
 async def test_wrong_token_is_refused_and_limited(reader: httpx.AsyncClient) -> None:
@@ -454,13 +572,49 @@ async def test_wrong_token_is_refused_and_limited(reader: httpx.AsyncClient) -> 
         r = await reader.get("/api/admin/me", headers={**ip, **_bearer(bad)})
         assert r.status_code == 401
     await reader.get("/api/admin/me", headers={**ip, **_bearer("y" * 40)})
-    # Spent: even the right token waits, and so does the password from the same address.
+    # Spent: even the right token waits from this address, and another address is untouched.
     r = await reader.get("/api/admin/me", headers={**ip, **_bearer()})
-    assert r.status_code == 429
-    r = await reader.post("/api/admin/login", json={"password": PW}, headers={**XHR, **ip})
     assert r.status_code == 429
     r = await reader.get("/api/admin/me", headers={"cf-connecting-ip": "4.4.4.4", **_bearer()})
     assert r.status_code == 200
+    # The token's bucket is not the login's: the password still works from the address a
+    # stale token locked, and it did not borrow from the login bucket to get there.
+    assert not any(admin._failures.values())
+    r = await reader.post("/api/admin/login", json={"password": PW}, headers={**XHR, **ip})
+    assert r.status_code == 200
+
+
+async def test_locked_login_does_not_stop_a_correct_token(reader: httpx.AsyncClient) -> None:
+    ip = {"cf-connecting-ip": "5.5.5.5"}
+    for _ in range(admin.LOGIN_FAILURES):
+        r = await reader.post("/api/admin/login", json={"password": "wrong"}, headers={**XHR, **ip})
+        assert r.status_code == 401
+    r = await reader.post("/api/admin/login", json={"password": PW}, headers={**XHR, **ip})
+    assert r.status_code == 429
+    assert (await reader.get("/api/admin/me", headers={**ip, **_bearer()})).status_code == 200
+
+
+async def test_token_misses_count_toward_the_global_budget(reader: httpx.AsyncClient) -> None:
+    for i in range(admin.GLOBAL_LOGIN_FAILURES):
+        admin._token_failures[f"10.0.0.{i}"].append(time.time())
+    ip = {"cf-connecting-ip": "10.9.9.9"}
+    # Spent for everyone: a wrong guess, from a fresh address, is turned away as a 429.
+    r = await reader.get("/api/admin/me", headers={**ip, **_bearer("w" * 40)})
+    assert r.status_code == 429
+    # The right credentials still pass.
+    assert (await reader.get("/api/admin/me", headers={**ip, **_bearer()})).status_code == 200
+    r = await reader.post("/api/admin/login", json={"password": "wrong"}, headers={**XHR, **ip})
+    assert r.status_code == 429
+
+
+async def test_head_with_a_valid_token_is_not_served_by_the_admin_route(
+    reader: httpx.AsyncClient,
+) -> None:
+    # The admin routes are GET only, so the catch-all answers HEAD; the token never opens
+    # anything it was not honoured for.
+    r = await reader.head("/api/admin/me", headers=_bearer())
+    assert r.status_code == 404
+    assert "no-store" in r.headers["cache-control"]
 
 
 async def test_short_token_is_off(
@@ -470,7 +624,7 @@ async def test_short_token_is_off(
     async for c in _token_client(clean_db, tmp_path, monkeypatch, short):
         assert (await c.get("/api/admin/me", headers=_bearer(short))).status_code == 401
         assert (await c.get("/api/admin/me", headers=_bearer(short + "s"))).status_code == 401
-        assert not any(admin._failures.values())
+        assert not _spent()
 
 
 async def test_unset_token_ignores_bearer(
@@ -480,7 +634,7 @@ async def test_unset_token_ignores_bearer(
         assert get_settings().admin_read_token is None
         assert (await c.get("/api/admin/me", headers=_bearer())).status_code == 401
         assert (await c.get("/api/admin/me", headers=_bearer(""))).status_code == 401
-        assert not any(admin._failures.values())
+        assert not _spent()
 
 
 async def test_token_does_not_wake_a_switched_off_admin(
@@ -502,7 +656,7 @@ async def test_cookie_still_works_with_a_token_set(reader: httpx.AsyncClient) ->
     assert r.status_code == 200
     # A wrong bearer beside a good cookie is not a guess; the cookie is enough.
     assert (await reader.get("/api/admin/me", headers=_bearer("z" * 40))).status_code == 200
-    assert not any(admin._failures.values())
+    assert not _spent()
 
 
 async def test_token_never_shows(

@@ -16,7 +16,7 @@ from penish.worker import providers
 from penish.worker.admin_jobs import handle_regen
 from penish.worker.describe import DescribeError
 from penish.worker.haiku import Written, haiku_from
-from penish.worker.ingest import enqueue_unwritten, handle_haiku
+from penish.worker.ingest import enqueue_unwritten, handle_haiku, insert_haiku
 from penish.worker.jobs import HardError, Job, SoftError
 from tests.test_admin import XHR
 from tests.test_admin_jobs import Redescriber, live
@@ -422,15 +422,77 @@ async def test_sweep_queues_live_pictures_with_no_haiku_and_no_job(
             "insert into haikus (l1, l2, l3, source, image_id) values ('x', 'y', 'z', 'model', %s)",
             (written,),
         )
-    assert await enqueue_unwritten(p) == 2
+    # A done job counts as on record: it finished, whatever it left behind.
+    assert await enqueue_unwritten(p) == 1
     rows = await q(
         p,
         "select payload, dedupe_key from jobs where type = 'haiku' and status = 'queued'"
         " order by id",
     )
-    assert rows[-2:] == [
-        {"payload": {"image_id": plain}, "dedupe_key": f"haiku:{plain}"},
-        {"payload": {"image_id": other}, "dedupe_key": f"haiku:{other}"},
-    ]
+    assert rows[-1:] == [{"payload": {"image_id": plain}, "dedupe_key": f"haiku:{plain}"}]
+    assert {"payload": {"image_id": other}, "dedupe_key": f"haiku:{other}"} not in rows
     # Twice is once.
     assert await enqueue_unwritten(p) == 0
+
+
+async def test_sweep_does_not_requeue_a_done_job_that_left_no_haiku(
+    p: Any, settings: Settings
+) -> None:
+    # The job ran, the text matched a deck haiku, nothing was inserted: the same answer
+    # would be paid for again at every worker start.
+    image = await live(p, settings, seed=1)
+    async with p.connection() as conn:
+        await conn.execute("delete from haikus where image_id is not null")
+        await conn.execute(
+            "update jobs set status = 'done' where type = 'haiku' and dedupe_key = %s",
+            (f"haiku:{image}",),
+        )
+    before = await q(p, "select id from jobs where type = 'haiku' order by id")
+    assert await enqueue_unwritten(p) == 0
+    assert await q(p, "select id from jobs where type = 'haiku' order by id") == before
+
+
+async def test_sweep_finds_a_done_job_by_payload_when_the_key_is_gone(
+    p: Any, settings: Settings
+) -> None:
+    image = await live(p, settings, seed=1)
+    async with p.connection() as conn:
+        await conn.execute("delete from haikus where image_id is not null")
+        await conn.execute(
+            "update jobs set status = 'done', dedupe_key = null"
+            " where type = 'haiku' and payload->>'image_id' = %s",
+            (str(image),),
+        )
+    assert await enqueue_unwritten(p) == 0
+
+
+async def test_sweep_queues_at_most_the_cap_oldest_first(
+    p: Any, settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    ids = [await live(p, settings, seed=s) for s in range(1, 5)]
+    async with p.connection() as conn:
+        await conn.execute("delete from jobs where type = 'haiku'")
+        await conn.execute("delete from haikus where image_id is not null")
+    caplog.set_level("INFO", logger="penish.worker.ingest")
+    assert await enqueue_unwritten(p, cap=3) == 3
+    queued = await q(
+        p, "select (payload->>'image_id')::bigint as i from jobs where type = 'haiku' order by id"
+    )
+    assert [r["i"] for r in queued] == sorted(ids)[:3]
+    assert "queued 3, 1 remain" in caplog.text
+    # The next start takes the rest.
+    assert await enqueue_unwritten(p, cap=3) == 1
+    assert await enqueue_unwritten(p, cap=3) == 0
+
+
+async def test_a_haiku_already_in_the_deck_is_logged_with_the_picture(
+    p: Any, settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    a = await live(p, settings, seed=1)
+    b = await live(p, settings, seed=2)
+    caplog.set_level("INFO", logger="penish.worker.ingest")
+    await insert_haiku(p, a, ("one", "two", "three"))
+    await insert_haiku(p, b, ("One", "two", "three"))
+    stored = await q(p, "select image_id from haikus where l2 = 'two'")
+    assert [r["image_id"] for r in stored] == [a]
+    assert f"haiku for image {b} written by None was already in the deck" in caplog.text

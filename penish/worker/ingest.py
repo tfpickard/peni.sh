@@ -792,13 +792,21 @@ async def handle_haiku(
     await insert_haiku(pool, image_id, h)
 
 
-async def enqueue_unwritten(pool: Pool) -> int:
-    """Every live picture with no haiku gets the job going live would have queued. Run at
-    worker start, so a picture whose haiku job was lost, or never written, is made good.
+# A first deploy on a site with many haiku-less pictures must not launch an unbounded batch
+# of paid calls; the rest wait for the next worker start.
+SWEEP_HAIKU_CAP = 25
 
-    A failed haiku job counts as on record: it is a picture every model refused, and it
-    waits for the owner's retry on the queue page instead of being paid for again at
-    every restart."""
+
+async def enqueue_unwritten(pool: Pool, cap: int = SWEEP_HAIKU_CAP) -> int:
+    """Live pictures that never had their haiku written get the job going live would have
+    queued. Run at worker start, so a picture whose haiku job was lost is made good. At
+    most `cap` per call, oldest first.
+
+    Any haiku job on record in any status keeps a picture out, done included. A job can
+    finish with no row behind it (the text was already in the deck, or the owner deleted
+    the haiku), and queueing it again would pay for the same answer at every restart. A
+    failed job is a picture every model refused, and it waits for the owner's retry on
+    the queue page."""
     async with pool.connection() as conn:
         cur = await conn.execute(
             """
@@ -810,23 +818,51 @@ async def enqueue_unwritten(pool: Pool) -> int:
                             where t.image_id = i.id and t.field = 'description')
                and not exists (select 1 from haikus h where h.image_id = i.id)
                and not exists (select 1 from jobs j
-                                where j.type = 'haiku' and j.dedupe_key = 'haiku:' || i.id
-                                  and j.status in ('queued', 'running', 'failed'))
+                                where j.type = 'haiku' and j.dedupe_key = 'haiku:' || i.id)
+               and not exists (select 1 from jobs j
+                                where j.type = 'haiku' and j.payload->>'image_id' = i.id::text)
              order by i.id
+             limit %s
             on conflict do nothing
+            """,
+            (cap,),
+        )
+        queued = cur.rowcount
+        cur = await conn.execute(
+            """
+            select count(*)::int as n from images i
+             where i.status = 'live'
+               and exists (select 1 from image_texts t
+                            where t.image_id = i.id and t.field = 'description')
+               and not exists (select 1 from haikus h where h.image_id = i.id)
+               and not exists (select 1 from jobs j
+                                where j.type = 'haiku' and j.dedupe_key = 'haiku:' || i.id)
+               and not exists (select 1 from jobs j
+                                where j.type = 'haiku' and j.payload->>'image_id' = i.id::text)
             """
         )
-        return cur.rowcount
+        row = await cur.fetchone()
+    remaining = int(row["n"]) if row else 0
+    if queued or remaining:
+        log.info("haiku sweep: queued %d, %d remain for the next start", queued, remaining)
+    return queued
 
 
 async def insert_haiku(pool: Pool, image_id: int, h: tuple[str, str, str]) -> None:
     """A model haiku for a picture, with the model that wrote it when the writer says."""
     model = getattr(h, "model", None)
-    log.info("haiku for image %s written by %s", image_id, model)
     l1, l2, l3 = h
     async with pool.connection() as conn:
-        await conn.execute(
+        cur = await conn.execute(
             "insert into haikus (l1, l2, l3, source, image_id, model)"
             " values (%s, %s, %s, 'model', %s, %s) on conflict do nothing",
             (l1, l2, l3, image_id, model),
         )
+    if cur.rowcount == 0:
+        # The deck already holds these three lines, so the job ends done with no haiku for
+        # this picture. Said here so a picture without one is explainable from the log.
+        log.warning(
+            "haiku for image %s written by %s was already in the deck; none stored", image_id, model
+        )
+        return
+    log.info("haiku for image %s written by %s", image_id, model)

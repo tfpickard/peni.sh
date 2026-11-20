@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,10 @@ async def client(
             await _login(c)
             yield c
     get_settings.cache_clear()
+
+
+def time_ago(seconds: float) -> float:
+    return time.time() - seconds
 
 
 def sql(dsn: str, query: str, *args: Any) -> list[Any]:
@@ -490,6 +495,8 @@ async def test_retry_ingest_moves_its_failed_folder_back(
     job_id, _ = ingest_job(clean_db, tmp_path, "cat")
     # An older picture of the same name failed first; this one landed in `cat-2`.
     older = make_failed(tmp_path, "cat", {"cat.png": "old", "cat.err": "old"})
+    # The .err is what says when a folder failed, so it ages with the folder.
+    os.utime(older / "cat.err", (1, 1))
     os.utime(older, (1, 1))
     mine = make_failed(
         tmp_path, "cat-2", {"cat.png": "img", "cat_caption.txt": "c", "cat.err": "boom"}
@@ -505,6 +512,102 @@ async def test_retry_ingest_moves_its_failed_folder_back(
     row = sql(clean_db, "select status::text, last_error from jobs where id = %s", job_id)[0]
     assert row == ("done", "cat.png: not a readable image")
     assert job_id not in [j["id"] for j in (await client.get("/api/admin/queue")).json()["jobs"]]
+
+
+def job_state(dsn: str, job_id: int) -> tuple[str, str | None]:
+    return sql(dsn, "select status::text, last_error from jobs where id = %s", job_id)[0]
+
+
+async def test_folder_retry_closes_the_failed_ingest_row(
+    client: httpx.AsyncClient, clean_db: str, tmp_path: Path
+) -> None:
+    job_id, _ = ingest_job(clean_db, tmp_path, "cat")
+    other_id, _ = ingest_job(clean_db, tmp_path, "dog")
+    make_failed(tmp_path, "cat", {"cat.png": "img", "cat.err": "boom"})
+    r = await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)
+    assert r.status_code == 200, r.text
+    # Done, with its error kept, as the row retry leaves it; another stem's row is not touched.
+    assert job_state(clean_db, job_id) == ("done", "cat.png: not a readable image")
+    assert job_state(clean_db, other_id)[0] == "failed"
+    jobs = (await client.get("/api/admin/queue")).json()["jobs"]
+    assert [j["id"] for j in jobs] == [other_id]
+    inbox = data(tmp_path) / "inbox"
+    assert sorted(p.name for p in inbox.iterdir()) == ["cat.png"]
+    # A second click moves nothing: the folder is gone, and the row, answered by a stale
+    # tab, has no failed state left to retry from.
+    assert (await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)).status_code == 404
+    r = await client.post(f"/api/admin/queue/{job_id}/retry", headers=XHR)
+    assert (r.status_code, r.json()) == (409, {"detail": "gone"})
+    assert sorted(p.name for p in inbox.iterdir()) == ["cat.png"]
+
+
+async def test_failed_folder_retry_that_moves_nothing_leaves_the_row(
+    client: httpx.AsyncClient,
+    clean_db: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id, _ = ingest_job(clean_db, tmp_path, "cat")
+    make_failed(tmp_path, "cat", {"cat.png": "img", "cat.err": "boom"})
+    monkeypatch.setattr(os, "access", lambda *a, **k: False)
+    r = await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)
+    assert r.status_code == 409
+    assert job_state(clean_db, job_id)[0] == "failed"
+
+
+async def test_folder_retry_of_a_later_failure_closes_the_row_that_failed_with_it(
+    client: httpx.AsyncClient, clean_db: str, tmp_path: Path
+) -> None:
+    first, _ = ingest_job(clean_db, tmp_path, "cat")
+    second, _ = ingest_job(clean_db, tmp_path, "cat")
+    old = make_failed(tmp_path, "cat", {"cat.png": "old", "cat.err": "old"})
+    new = make_failed(tmp_path, "cat-2", {"cat.png": "new", "cat.err": "new"})
+    # The first picture failed long ago; the second just now.
+    sql(clean_db, "update jobs set updated_at = now() - interval '2 hours' where id = %s", first)
+    for p in (old / "cat.err", old):
+        os.utime(p, (time_ago(2 * 3600), time_ago(2 * 3600)))
+    r = await client.post("/api/admin/queue/failed/cat-2/retry", headers=XHR)
+    assert r.status_code == 200, r.text
+    assert not new.exists() and old.exists()
+    assert job_state(clean_db, second)[0] == "done"
+    # The row for the folder still standing keeps its retry.
+    assert job_state(clean_db, first)[0] == "failed"
+
+
+async def test_folder_retry_of_the_last_folder_closes_every_failed_row_for_the_stem(
+    client: httpx.AsyncClient, clean_db: str, tmp_path: Path
+) -> None:
+    # An earlier failure whose folder the owner deleted left a row with nowhere to go.
+    stale, _ = ingest_job(clean_db, tmp_path, "cat")
+    live, _ = ingest_job(clean_db, tmp_path, "cat")
+    make_failed(tmp_path, "cat", {"cat.png": "img", "cat.err": "boom"})
+    r = await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)
+    assert r.status_code == 200
+    assert job_state(clean_db, stale)[0] == "done"
+    assert job_state(clean_db, live)[0] == "done"
+
+
+async def test_row_retry_takes_the_folder_that_failed_with_it(
+    client: httpx.AsyncClient, clean_db: str, tmp_path: Path
+) -> None:
+    # Retrying the older row must not move the newer failure's picture.
+    first, _ = ingest_job(clean_db, tmp_path, "cat")
+    second, _ = ingest_job(clean_db, tmp_path, "cat")
+    old = make_failed(tmp_path, "cat", {"cat.png": "old", "cat.err": "old"})
+    new = make_failed(tmp_path, "cat-2", {"cat.png": "new", "cat.err": "new"})
+    sql(clean_db, "update jobs set updated_at = now() - interval '2 hours' where id = %s", first)
+    for p in (old / "cat.err", old):
+        os.utime(p, (time_ago(2 * 3600), time_ago(2 * 3600)))
+    r = await client.post(f"/api/admin/queue/{first}/retry", headers=XHR)
+    assert r.status_code == 200, r.text
+    assert (data(tmp_path) / "inbox" / "cat.png").read_text() == "old"
+    assert new.exists() and not old.exists()
+    assert job_state(clean_db, first)[0] == "done"
+    assert job_state(clean_db, second)[0] == "failed"
+    # The row already answered cannot be pressed again to move the other folder.
+    r = await client.post(f"/api/admin/queue/{first}/retry", headers=XHR)
+    assert r.status_code == 409
+    assert new.exists()
 
 
 async def test_retry_ingest_with_nothing_left_refuses(

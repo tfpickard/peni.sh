@@ -14,6 +14,13 @@ from blurhash import encode as _blurhash_encode
 log = logging.getLogger(__name__)
 
 WIDTHS = (480, 960, 1600)
+# The largest real upload seen is 6048x6048 (36.6 megapixels) and an iPhone's biggest file
+# is 48. A decode holds several full-size copies (the HEIC path alone makes a Pillow image,
+# its bytes, the vips image and the colour transform), so a gigapixel header would pass
+# libheif's own limit and still push the worker past its 6 GB, killing it before the
+# failure is ever recorded, after which the job is claimed again and loops. 100 leaves
+# room above everything real. Read from the header, before any decode.
+MAX_PIXELS = 100_000_000
 # Smaller than this and the 480 rung, the blurhash and the palette are all mush.
 MIN_CROP = 32
 
@@ -30,9 +37,10 @@ _SAVE_SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"
 # loader on the same bytes: the site shows SDR and everything downstream assumes
 # 8-bit sRGB, so the gain map is dropped and the SDR base is the picture.
 _UHDR_LOADER = "uhdrload_buffer"
-# HEIC, HEIF and AVIF all arrive here. The wheel's libvips has no HEVC decoder, so
-# HEIC falls through to pillow-heif; AVIF decodes in libvips. Stored as lossless PNG
-# so the kept original is not compressed a second time.
+# HEIC and HEIF arrive here, and so would an AVIF if one got past the doors (neither the
+# upload form nor the inbox accepts one). The wheel's libvips has no HEVC decoder, so HEIC
+# falls through to pillow-heif; AVIF decodes in libvips. Stored as lossless PNG so the
+# kept original is not compressed a second time.
 _HEIF_LOADER = "heifload_buffer"
 _HEIF_MIME = "image/png"
 # ftyp brands of HEVC-coded HEIF, the ones pillow-heif's bundled libheif can decode.
@@ -48,6 +56,13 @@ _NCLX_SRGB_CURVE = 13
 
 class UndecodableImage(Exception):
     pass
+
+
+def _check_size(width: int, height: int) -> None:
+    if width * height > MAX_PIXELS:
+        raise UndecodableImage(
+            f"picture is {width * height / 1e6:.1f} megapixels; the limit is {MAX_PIXELS / 1e6:.0f}"
+        )
 
 
 @dataclass
@@ -106,6 +121,8 @@ def _decode(data: bytes) -> tuple[pyvips.Image, str]:
             return _heif_via_pillow(data), _HEIF_MIME
         raise UndecodableImage("not a readable image") from e
 
+    # The header is all libvips has read so far; refuse before the decode below.
+    _check_size(img.width, img.height)
     loader = str(img.get("vips-loader")) if img.get_typeof("vips-loader") else ""
     if loader == _UHDR_LOADER:
         try:
@@ -121,7 +138,7 @@ def _decode(data: bytes) -> tuple[pyvips.Image, str]:
             return _heif_via_pillow(data), _HEIF_MIME
     if loader not in _LOADERS:
         raise UndecodableImage(
-            f"unsupported format ({loader or 'unknown'}); need png, jpeg, webp, heic or avif"
+            f"unsupported format ({loader or 'unknown'}); need png, jpeg, webp or heic"
         )
     try:
         # Forces a full decode now, so a truncated file fails here and not mid-pipeline.
@@ -173,6 +190,8 @@ def _heif_via_pillow(data: bytes) -> pyvips.Image:
         raise UndecodableImage("heic decoder not installed")
     try:
         heif = open_heif(io.BytesIO(data), convert_hdr_to_8bit=True)
+        # Known from the header; to_pillow is where the pixels are allocated.
+        _check_size(*heif.size)
         # libheif applies the irot/imir transforms here and pillow-heif resets the
         # EXIF orientation to 1; no EXIF is carried over, so autorot() leaves it be.
         im = heif.to_pillow()

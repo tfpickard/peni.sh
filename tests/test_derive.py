@@ -1,6 +1,8 @@
 import hashlib
 import io
+import struct
 import sys
+import zlib
 
 import numpy as np
 import pillow_heif
@@ -90,8 +92,72 @@ def test_unsupported_format_raises() -> None:
 def test_unsupported_format_names_what_is_accepted() -> None:
     tif = _gradient(32, 32).write_to_buffer(".tif")
     assert isinstance(tif, bytes)
-    with pytest.raises(UndecodableImage, match=r"need png, jpeg, webp, heic or avif$"):
+    with pytest.raises(UndecodableImage, match=r"need png, jpeg, webp or heic$"):
         load_and_validate(tif)
+
+
+# -- the pixel cap ------------------------------------------------------------------
+
+
+def _png_claiming(width: int, height: int) -> bytes:
+    """A 1-bit grey PNG of the stated size. Blank rows deflate to almost nothing, so the
+    file is a few kilobytes while the header claims any number of pixels."""
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        crc = zlib.crc32(kind + body)
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", crc)
+
+    packer = zlib.compressobj(9)
+    row = bytes((width + 7) // 8 + 1)
+    idat = b"".join(packer.compress(row) for _ in range(height)) + packer.flush()
+    ihdr = struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0)
+    sig = b"\x89PNG\r\n\x1a\n"
+    return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def test_cap_is_above_every_real_upload() -> None:
+    # The largest seen is 6048x6048; iPhones make 48 megapixel files.
+    derive._check_size(6048, 6048)
+    derive._check_size(8064, 6048)
+    derive._check_size(derive.MAX_PIXELS, 1)
+    with pytest.raises(UndecodableImage):
+        derive._check_size(derive.MAX_PIXELS, 2)
+
+
+def test_oversized_header_is_refused_before_decode_in_libvips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def decoded(*_: object) -> None:
+        raise AssertionError("decode reached")
+
+    monkeypatch.setattr(pyvips.Image, "copy_memory", decoded)
+    data = _png_claiming(20000, 6000)
+    assert len(data) < 100_000
+    with pytest.raises(UndecodableImage, match=r"picture is 120\.0 megapixels; the limit is 100$"):
+        load_and_validate(data)
+
+
+def test_a_48_megapixel_picture_is_decoded() -> None:
+    d = load_and_validate(_png_claiming(8064, 6048))
+    assert (d.width, d.height) == (8064, 6048)
+
+
+def test_oversized_heic_is_refused_before_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = _heic(Image.new("RGB", (64, 48), (200, 30, 90)))
+
+    def decoded(*_: object, **__: object) -> None:
+        raise AssertionError("decode reached")
+
+    # A real 100 megapixel HEIC is too much to build in a test, so the cap comes down to
+    # 3071 pixels instead of the picture going up; the check is the same comparison.
+    monkeypatch.setattr(derive, "MAX_PIXELS", 64 * 48 - 1)
+    monkeypatch.setattr(pillow_heif.HeifFile, "to_pillow", decoded)
+    with pytest.raises(UndecodableImage, match=r"picture is 0\.0 megapixels"):
+        derive._heif_via_pillow(data)
+    # And the whole way in, whichever loader reads the header first.
+    monkeypatch.setattr(pyvips.Image, "copy_memory", decoded)
+    with pytest.raises(UndecodableImage, match="megapixels"):
+        load_and_validate(data)
 
 
 # -- iPhone and iPad formats --------------------------------------------------

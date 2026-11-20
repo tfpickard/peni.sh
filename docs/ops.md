@@ -186,7 +186,7 @@ Changing it ends every session. Uploads go to `data/inbox` and take the same pat
 
 ### read token
 
-`ADMIN_READ_TOKEN` in `.env` lets scripts read `/api/admin` with `Authorization: Bearer <token>`. It works for `GET` and `HEAD` only and can never write. It must be at least 32 characters or it is ignored, and it does nothing unless `ADMIN_PASSWORD` is set.
+`ADMIN_READ_TOKEN` in `.env` lets scripts read `/api/admin` with `Authorization: Bearer <token>`. It works for `GET` only and can never write. It must be at least 32 characters or it is ignored, and it does nothing unless `ADMIN_PASSWORD` is set. Wrong tokens are limited per address like wrong passwords, in a bucket of their own, so a stale token in a script does not lock the password login; both buckets count toward the same global budget.
 
 On the owner's Mac the token lives in `~/.config/penish/read-token`, or in the `PENISH_READ_TOKEN` env var.
 
