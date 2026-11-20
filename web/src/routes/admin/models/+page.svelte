@@ -8,6 +8,7 @@
 	// The purposes with an effort key; the others always run at the model's own default.
 	const withEffort: readonly Purpose[] = ['describe', 'extract'];
 	const CAP = 'mycelium.daily_calls';
+	const FALLBACK = 'haiku.fallback';
 
 	type Block = {
 		loaded: { model: string; effort: string; prompt: string };
@@ -22,6 +23,9 @@
 	let note = $state('');
 	let armed = $state('');
 	let cap = $state(0);
+	// haiku.fallback as typed: `provider:model` ids, comma separated.
+	let fallback = $state('');
+	let fallbackLoaded = $state('');
 
 	// Effort null means none; the select needs a string for it.
 	const eff = (v: string | number | null) => (v === null ? 'none' : String(v));
@@ -29,7 +33,7 @@
 	function block(m: ops.Models, p: Purpose): Block {
 		const model = m.current[`${p}.model`] as string;
 		const known = m.known_models.includes(model);
-		const effort = withEffort.includes(p) ? eff(m.current[`${p}.effort`]) : 'none';
+		const effort = withEffort.includes(p) ? eff(m.current[`${p}.effort`] as string | null) : 'none';
 		const prompt = m.current[`${p}.prompt`] as string;
 		return {
 			loaded: { model, effort, prompt },
@@ -41,7 +45,9 @@
 	}
 
 	// Reset is live whenever the stored value differs from the default, for every key.
-	const custom = (key: string) => data!.current[key] !== data!.default[key];
+	// Compared as JSON because haiku.fallback is a list.
+	const custom = (key: string) =>
+		JSON.stringify(data!.current[key]) !== JSON.stringify(data!.default[key]);
 
 	async function load() {
 		data = await ops.models();
@@ -54,6 +60,8 @@
 			conservator: block(data, 'conservator')
 		};
 		cap = Number(data.current[CAP]);
+		const f = data.current[FALLBACK];
+		fallback = fallbackLoaded = Array.isArray(f) ? f.join(', ') : '';
 	}
 
 	onMount(() => {
@@ -68,8 +76,9 @@
 			await fn();
 			await load();
 			note = 'saved';
-		} catch {
-			note = 'failed';
+		} catch (e) {
+			// A refused value says why, flatly; anything else is just failed.
+			note = e instanceof ops.HttpError && e.detail ? e.detail : 'failed';
 		}
 	}
 
@@ -83,6 +92,17 @@
 	const capValid = $derived(Number.isInteger(cap) && cap >= 0 && cap <= 100000);
 	const saveCap = () => run(() => ops.putSetting(CAP, cap));
 	const resetCap = () => run(() => ops.resetSetting(CAP));
+	const saveFallback = () =>
+		run(() =>
+			ops.putSetting(
+				FALLBACK,
+				fallback
+					.split(/[,\n]/)
+					.map((x) => x.trim())
+					.filter(Boolean)
+			)
+		);
+	const resetFallback = () => run(() => ops.resetSetting(FALLBACK));
 	const keyed = $derived(
 		data?.keyed == null ? 'unknown' : data.keyed.length ? data.keyed.join(' ') : 'none'
 	);
@@ -122,6 +142,21 @@
 				</button>
 				<button class="link" disabled={!custom(`${p}.model`)} onclick={() => resetModel(p)}>reset</button>
 			</div>
+
+			{#if p === 'haiku'}
+				<div class="row gap">
+					<span class="dim">fallback</span>
+					<input
+						class="wide"
+						bind:value={fallback}
+						aria-label="haiku fallback"
+						placeholder="provider:model, provider:model"
+						spellcheck="false"
+					/>
+					<button disabled={fallback.trim() === fallbackLoaded} onclick={saveFallback}>save</button>
+					<button class="link" disabled={!custom(FALLBACK)} onclick={resetFallback}>reset</button>
+				</div>
+			{/if}
 
 			{#if withEffort.includes(p)}
 				<div class="row gap">
@@ -181,6 +216,10 @@
 	}
 	input[type='number'] {
 		width: 8rem;
+	}
+	input.wide {
+		flex: 1;
+		min-width: 16rem;
 	}
 	section {
 		display: flex;

@@ -784,14 +784,49 @@ async def handle_haiku(
         log.info("haiku: image %s has no description (deleted?); skipping", image_id)
         return
     try:
-        l1, l2, l3 = await writer(row["body"], settings=settings, pool=pool, nudity=kinds or ())
+        h = await writer(row["body"], settings=settings, pool=pool, nudity=kinds or ())
     except DescribeError as e:
         if e.retryable:
             raise SoftError(f"haiku: {e}") from e
         raise HardError(f"haiku: {e}") from e
+    await insert_haiku(pool, image_id, h)
+
+
+async def enqueue_unwritten(pool: Pool) -> int:
+    """Every live picture with no haiku gets the job going live would have queued. Run at
+    worker start, so a picture whose haiku job was lost, or never written, is made good.
+
+    A failed haiku job counts as on record: it is a picture every model refused, and it
+    waits for the owner's retry on the queue page instead of being paid for again at
+    every restart."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            insert into jobs (type, payload, dedupe_key)
+            select 'haiku', jsonb_build_object('image_id', i.id), 'haiku:' || i.id
+              from images i
+             where i.status = 'live'
+               and exists (select 1 from image_texts t
+                            where t.image_id = i.id and t.field = 'description')
+               and not exists (select 1 from haikus h where h.image_id = i.id)
+               and not exists (select 1 from jobs j
+                                where j.type = 'haiku' and j.dedupe_key = 'haiku:' || i.id
+                                  and j.status in ('queued', 'running', 'failed'))
+             order by i.id
+            on conflict do nothing
+            """
+        )
+        return cur.rowcount
+
+
+async def insert_haiku(pool: Pool, image_id: int, h: tuple[str, str, str]) -> None:
+    """A model haiku for a picture, with the model that wrote it when the writer says."""
+    model = getattr(h, "model", None)
+    log.info("haiku for image %s written by %s", image_id, model)
+    l1, l2, l3 = h
     async with pool.connection() as conn:
         await conn.execute(
-            "insert into haikus (l1, l2, l3, source, image_id) values (%s, %s, %s, 'model', %s)"
-            " on conflict do nothing",
-            (l1, l2, l3, image_id),
+            "insert into haikus (l1, l2, l3, source, image_id, model)"
+            " values (%s, %s, %s, 'model', %s, %s) on conflict do nothing",
+            (l1, l2, l3, image_id, model),
         )

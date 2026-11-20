@@ -171,7 +171,7 @@ def _clean_lines(lines: list[str]) -> list[str]:
 # A gallery's haiku sits in the same table as the deck but is shown only on its gallery,
 # so the list labels it with the gallery's serial (null for the deck).
 _HAIKU_COLS = (
-    "id, l1, l2, l3, source::text as source, active, image_id, created_at,"
+    "id, l1, l2, l3, source::text as source, model, active, image_id, created_at,"
     " (select c.serial from colonies c where c.id = haikus.colony_id) as gallery"
 )
 
@@ -181,6 +181,8 @@ def _haiku(r: dict[str, Any]) -> dict[str, Any]:
         "id": r["id"],
         "lines": [r["l1"], r["l2"], r["l3"]],
         "source": r["source"],
+        # The model that wrote it; null for owner and seed haikus and older model ones.
+        "model": r["model"],
         "active": r["active"],
         "image_id": r["image_id"],
         "gallery": r["gallery"],

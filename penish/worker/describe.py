@@ -45,12 +45,21 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 class DescribeError(Exception):
     """`retryable` tells the job loop whether to back off (soft) or fail the job (hard).
     `category` is the refusal category when the model refused, so a caller can tell a
-    request it can rephrase from one it cannot."""
+    request it can rephrase from one it cannot. `refused` marks a refusal even when the
+    provider gives no category, so a caller can hand the request to another model."""
 
-    def __init__(self, message: str, *, retryable: bool, category: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        category: str | None = None,
+        refused: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.category = category
+        self.refused = refused
 
 
 @dataclass
@@ -195,10 +204,13 @@ class LazyAnthropic:
 class Reply(str):
     """call_text's text, carrying what a caller needs to say why it would not validate.
 
-    A str so every caller and test that treats the reply as text keeps working."""
+    A str so every caller and test that treats the reply as text keeps working. `served`
+    is the model that answered, which Anthropic's server-side fallback can make another
+    than the one asked."""
 
     stop_reason: str
     model: str
+    served: str
     purpose: str | None
     max_tokens: int | None
 
@@ -208,12 +220,14 @@ class Reply(str):
         *,
         stop_reason: str = "end_turn",
         model: str = "",
+        served: str | None = None,
         purpose: str | None = None,
         max_tokens: int | None = None,
     ) -> "Reply":
         out = super().__new__(cls, text)
         out.stop_reason = stop_reason
         out.model = model
+        out.served = served or model
         out.purpose = purpose
         out.max_tokens = max_tokens
         return out
@@ -356,8 +370,17 @@ async def call_text(
             )
             # The category in the message too, so the queue page says which kind it was.
             why = f"{model}, {category}" if category else model
-            raise DescribeError(f"model refused ({why})", retryable=False, category=category)
-    return Reply(text, stop_reason=stop, model=model, purpose=purpose, max_tokens=max_tokens)
+            raise DescribeError(
+                f"model refused ({why})", retryable=False, category=category, refused=True
+            )
+    return Reply(
+        text,
+        stop_reason=stop,
+        model=model,
+        served=served,
+        purpose=purpose,
+        max_tokens=max_tokens,
+    )
 
 
 def rejected(reply: str, exc: BaseException, *, attempt: int, purpose: str, model: str) -> None:

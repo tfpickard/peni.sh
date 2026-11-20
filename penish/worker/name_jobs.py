@@ -210,7 +210,7 @@ async def name_gallery(
             last = exc
             rejected(text, exc, attempt=attempt, purpose="name", model=model)
             continue
-        return Named(title=title, haiku=lines, model=model)
+        return Named(title=title, haiku=lines, model=getattr(text, "served", None) or model)
     raise invalid("invalid name output", text, last)
 
 
@@ -437,12 +437,13 @@ async def write(pool: Pool, colony_id: int, named: Named, *, regenerate: bool) -
         l1, l2, l3 = named.haiku
         await conn.execute(
             """
-            insert into haikus (l1, l2, l3, source, colony_id) values (%s, %s, %s, 'model', %s)
+            insert into haikus (l1, l2, l3, source, colony_id, model)
+            values (%s, %s, %s, 'model', %s, %s)
             on conflict (colony_id, lower(l1 || E'\\n' || l2 || E'\\n' || l3))
               where colony_id is not null
-            do update set active = true, created_at = now()
+            do update set active = true, created_at = now(), model = excluded.model
             """,
-            (l1, l2, l3, colony_id),
+            (l1, l2, l3, colony_id, named.model),
         )
         await conn.execute(
             """

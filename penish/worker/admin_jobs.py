@@ -54,6 +54,7 @@ from penish.worker.ingest import (
     _describe_bytes,
     _held,
     _texts,
+    insert_haiku,
     record_served,
 )
 from penish.worker.jobs import HardError, Job, Pool, SoftError
@@ -296,17 +297,12 @@ async def _haiku(pool: Pool, image_id: int, settings: Settings, writer: HaikuWri
         log.info("regen: image %s has no description; no haiku", image_id)
         return
     try:
-        l1, l2, l3 = await writer(
+        h = await writer(
             texts["description"]["body"], settings=settings, pool=pool, nudity=kinds or ()
         )
     except DescribeError as e:
         raise _soft_or_hard("haiku", e) from e
-    async with pool.connection() as conn:
-        await conn.execute(
-            "insert into haikus (l1, l2, l3, source, image_id) values (%s, %s, %s, 'model', %s)"
-            " on conflict do nothing",
-            (l1, l2, l3, image_id),
-        )
+    await insert_haiku(pool, image_id, h)
 
 
 # -- regen ------------------------------------------------------------------

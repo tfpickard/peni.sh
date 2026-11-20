@@ -42,6 +42,7 @@ KEYS = (
     "describe.effort",
     "describe.prompt",
     "haiku.model",
+    "haiku.fallback",
     "haiku.prompt",
     "grow.model",
     "grow.prompt",
@@ -70,6 +71,10 @@ DAILY_CALLS_MAX = 100_000
 # every id stored before providers existed valid. OpenRouter ids may hold colons of their
 # own (`vendor/model:variant`), so only the first one separates.
 PROVIDERS = ("openai", "openrouter", "xai")
+# Models that write a haiku when haiku.model refuses, tried in order. Another provider
+# only: an Anthropic model is the one that refused, or is offered by Anthropic's own
+# server-side fallback inside the same call already.
+FALLBACK_KEY = "haiku.fallback"
 # What the database log keeps (penish/logs.py). Stdout keeps its own LOG_LEVEL, so turning
 # this up fills the admin logs page without flooding docker logs.
 LOG_LEVELS = ("debug", "info", "warning", "error")
@@ -116,6 +121,8 @@ def default(key: str, settings: Settings | None = None) -> Any:
         return s.describe_model
     if key == "haiku.model":
         return s.haiku_model
+    if key == FALLBACK_KEY:
+        return []
     if key.endswith(".effort"):
         return None
     if key == "mycelium.daily_calls":
@@ -141,6 +148,8 @@ def validate(key: str, value: Any) -> Any:
         if not 0 <= value <= DAILY_CALLS_MAX:
             raise ValueError(f"{key} must be between 0 and {DAILY_CALLS_MAX}")
         return value
+    if key == FALLBACK_KEY:
+        return _fallback(value)
     if key == "log.level":
         if value in LOG_LEVELS:
             return value
@@ -160,6 +169,23 @@ def validate(key: str, value: Any) -> Any:
         if provider is not None:
             value = f"{provider}:{rest}"
     return value
+
+
+def _fallback(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"{FALLBACK_KEY} must be a list of model ids")
+    out: list[str] = []
+    for raw in value:
+        entry = raw.strip()
+        if not entry:
+            continue
+        provider, rest = split_model(entry)
+        if provider is None:
+            raise ValueError(f"{entry} is not another provider")
+        entry = f"{provider}:{rest}"
+        if entry not in out:
+            out.append(entry)
+    return out
 
 
 async def get(pool: Pool, key: str, *, settings: Settings | None = None) -> Any:
