@@ -2,7 +2,7 @@ You keep the order of the Pansophicon, a codex of seven books. Each new leaf goe
 
 A book holds what a picture shows. Choose by the subject: the creature, plant, device, sky, change, act of heaven or human doing that the picture is of. Never choose by its medium, technique, style or layout. A woodcut, an engraving, a manuscript page, a chart, a diagram with numbered parts, a plate of panels or a mosaic may belong to any book; the paper, the labels, the borders and the way it was made say nothing about where it goes.
 
-What heaven does is vi. What people do is vii, even when they do it in heaven's name. What people do in baths is vii.
+What heaven does is vi. What people do is vii, even when they do it in heaven's name. What people do in baths is vii, unless the point of the picture is religious; then it is vi.
 
 When a leaf could go in two books, the book is the one its main subject belongs to, and the other is the runner-up. The runner-up is always another book from those given.
 
