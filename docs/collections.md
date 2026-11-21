@@ -83,7 +83,7 @@ Work in the same vector space the site already uses for similarity: the analysis
 For each book that is not full, compute a **centroid** that blends the written anchor with the real leaves:
 
 ```
-w_anchor = k / (k + n)          # n = leaves in the book, k = 3 (config)
+w_anchor = k / (k + n)          # n = leaves in the book, k = `anchor_k`: 3 by default, 10 here
 centroid = normalize(w_anchor * anchor + (1 - w_anchor) * mean(leaf vectors))
 ```
 
@@ -192,13 +192,15 @@ Don't expose `anchor_text`, `anchor_embedding`, `tag_hints` or scores publicly.
 
 The site embeds the **analysis** paragraphs, so write anchors in that register: plain visual description, not titles. Tom can rewrite them. Starting text:
 
-1. **Creatures.** Engraved or painted plates of single animals and composite creatures shown in profile against a plain ground, sometimes with small figures beside them for scale. Bestiary and natural-history illustration, hand-coloured woodcut, marginal drolleries, beasts drawn with careful anatomy and impossible parts.
-2. **Plants and stones.** Botanical plates showing a whole plant from root to flower, seeds and cross-sections, gems and minerals drawn in rows, pseudo-script labels, herbal and lapidary pages with faded washes.
-3. **Instruments and the body.** Engraved diagrams of surgical, mechanical or ritual apparatus in exploded view with lettered parts, anatomical figures with flaps and cutaways, patients and practitioners, bathhouses and infirmaries, procedures in progress.
-4. **The sky.** Celestial spheres, nested rings and orbits, volvelles, astrolabe plates, star charts, maps of seas and coasts, cosmological diagrams with figures at the margins, gold and lapis on parchment.
-5. **Transmutation.** Alchemical emblems, flasks and furnaces with scenes inside them, crowned figures, serpents, suns and moons, sequences of small panels, laboratory interiors.
-6. **Devotion.** Icons with gold grounds, saints and figures in registers, relic caskets, liturgical objects, processions, heterodox or unfamiliar sacred scenes, mosaic and fresco fragments.
-7. **Dreams and signs.** Dream images paired in grids, emblems and their meanings, divination tables, figures in symbolic scenes, a sleeping person with a vision above, alphabets of signs.
+1. **Creatures.** Animals and composite creatures presented one at a time for study: their parts, habits, uses and dangers. Beasts with impossible anatomy, hybrids of fish, bird and mammal, monsters from the edges of the known world, creatures in the margins acting like people. Small human figures sometimes stand beside them for scale.
+2. **Plants and stones.** Plants shown whole from root to flower, with seeds and cross-sections. Trees that bear creatures, people or objects as fruit, roots shaped like people, gardens and harvests of impossible crops. Gems, minerals and stones laid out in rows with their virtues.
+3. **Instruments and the body.** Devices built to be applied to the body: chairs, frames, balances, tubes, gears and basins with lettered parts. Surgery, bloodletting and cures in progress, remedies and their ingredients, a body opened, flapped or diagrammed for teaching. A patient approaches the apparatus warily while practitioners wait.
+4. **The sky.** The heavens and what they foretell. Spheres, rings and orbits, planets with the people they govern, constellations drawn as figures, zodiac men whose body parts are ruled by the signs, winds, maps of seas and coasts. Dreams and their meanings, omens, divination and alphabets of signs.
+5. **Transmutation.** The changing of one thing into another. Flasks and furnaces with whole scenes sealed inside them, a crowned king and queen, lions, serpents, suns and moons, sequences of small stages, laboratory work. Baths and fountains that alter whoever enters them, or fail to.
+6. **Devotion.** What heaven does. Gods, saints and the many-armed one-eyed sky god acting directly: creating, judging and weighing souls, sorting the saved from the damned, working miracles and martyrdoms. Heaven and hell, relics, processions and sacred scenes that belong to no known church.
+7. **Man.** What people are and what they do. The human figure shown whole and unashamed as the measure of things, set between beasts below and heaven above. Virtues and vices as persons, the soul and its housing, knowledge carried in the body, conception, pregnancy, birth and the ages of life. The household, the bath, the table, trades and guilds, custom and festival. Law, trial and ordeal, and the prescribed punishment fitted exactly to the offence, carried out calmly by magistrates and executioners while daily life goes on around it.
+
+The line between books vi and vii: what heaven does is vi, and what people do is vii, even in heaven's name. A book is defined by what a picture shows, never by how it was made, so the anchors and tag hints name no medium.
 
 `tag_hints` for each book can come from the obvious words in its anchor. Keep them short.
 
@@ -260,7 +262,7 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   `model`) and `note_model`, as text rows carry theirs. A note always has a source.
 - `collection_requests.note` holds an owner note that arrived with the request (the upload
   form or `_note.txt`) until the picture is filed; filing writes it to the leaf.
-- The filer's constants are `collections.tuning` (jsonb): `anchor_k` 3, `tag_alpha` 0.05,
+- The filer's constants are `collections.tuning` (jsonb): `anchor_k` 3 (10 on the Pansophicon since `023`), `tag_alpha` 0.05,
   `fill_beta` 0.05, `book_margin` 0.03, `weekly_resort` false. Absent keys mean the defaults
   in `penish/collection/plan.py`. They are edited on `/admin/collections`, so tuning needs no
   deploy.

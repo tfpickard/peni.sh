@@ -197,8 +197,8 @@ async def test_admin_detail(client: httpx.AsyncClient, clean_db: str) -> None:
     leaf(clean_db, a, 2, 7, pinned=True)
     assert (await client.get(ADM)).json()["collections"][0]["slug"] == SLUG
     d = (await client.get(f"{ADM}/{SLUG}")).json()
-    assert d["published"] is False and d["tuning"]["anchor_k"] == 3.0
-    assert d["books"][0]["anchor_text"].startswith("Engraved or painted plates")
+    assert d["published"] is False and d["tuning"]["anchor_k"] == 10.0
+    assert d["books"][0]["anchor_text"].startswith("Animals and composite creatures")
     assert d["books"][0]["anchored"] is False and "creature" in d["books"][0]["tag_hints"]
     assert d["books"][1]["leaves"] == [
         {
