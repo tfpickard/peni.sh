@@ -37,6 +37,48 @@ async def haiku(request: Request) -> dict[str, Any]:
     return h
 
 
+# The latest change to a published collection this week whose leaf is still where the
+# change put it: a later move or an unfiling would make the line false, so the join to
+# collection_leaves on the destination drops it. At one moment a filing outranks the
+# shifts it caused in its book.
+_CHANGED = """
+    select c.slug as collection, c.abbrev, c.abbrev_latin, i.slug, h.to_book, h.to_position,
+           h.from_book, h.from_position
+      from collection_leaf_history h
+      join collections c on c.id = h.collection_id and c.published
+      join collection_leaves l on l.image_id = h.image_id and l.collection_id = h.collection_id
+                              and l.book = h.to_book and l.position = h.to_position
+      join images i on i.id = h.image_id
+     where h.at > now() - interval '7 days'
+       and i.status = 'live' and i.published_at is not null
+       and (h.from_book, h.from_position) is distinct from (h.to_book, h.to_position)
+     order by h.at desc, (h.from_book is null) desc, h.id desc
+     limit 1
+"""
+
+
+async def collection_change(conn: Any) -> dict[str, Any] | None:
+    """`{collection: {slug, abbrev, abbrev_latin}, book, position, slug, from}`, `from`
+    being the leaf's place before (null for a filing), or None for a quiet week."""
+    cur = await conn.execute(_CHANGED)
+    r = await cur.fetchone()
+    if r is None:
+        return None
+    return {
+        "collection": {
+            "slug": r["collection"],
+            "abbrev": r["abbrev"],
+            "abbrev_latin": r["abbrev_latin"],
+        },
+        "book": r["to_book"],
+        "position": r["to_position"],
+        "slug": r["slug"],
+        "from": None
+        if r["from_book"] is None
+        else {"book": r["from_book"], "position": r["from_position"]},
+    }
+
+
 @router.get("/api/stats")
 async def stats(request: Request) -> dict[str, Any]:
     async with request.app.state.pool.connection() as conn:
@@ -47,4 +89,9 @@ async def stats(request: Request) -> dict[str, Any]:
             (get_settings().embed_model,),
         )
         row = await cur.fetchone()
-    return {"pictures": pictures, "temperature": row["temperature"] if row else None}
+        changed = await collection_change(conn)
+    out = {"pictures": pictures, "temperature": row["temperature"] if row else None}
+    # Present only in a week something changed, so a quiet week reads as it always has.
+    if changed is not None:
+        out["changed"] = changed
+    return out

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Hyphae from '../../lib/components/Hyphae.svelte';
+	import LeafLine, { leafOf } from '../../lib/components/LeafLine.svelte';
 	import {
 		getGalleries,
 		getMyceliumLog,
@@ -94,6 +95,10 @@
 									{/if}
 									<span>{c.layer}</span>
 								</span>
+								{#if c.cover && leafOf(c.cover)}
+									<!-- Inside the card's link, so the line is text, not a second link. -->
+									<LeafLine leaf={leafOf(c.cover)!} href={null} />
+								{/if}
 							</span>
 						</a>
 					</li>

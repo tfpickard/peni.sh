@@ -1,9 +1,13 @@
 <script lang="ts">
 	import PtpLogo from '../../../lib/components/PtpLogo.svelte';
+	import FungalHaiku from '../../../lib/haiku/FungalHaiku.svelte';
 	import { roman } from '../../../lib/roman';
+	import type { Haiku } from '../../../lib/api';
 
 	let { data } = $props();
 	const c = $derived(data.collection);
+	// A haiku from one of the collection's own leaves, when any has one.
+	const verse = $derived((c as { haiku?: Haiku | null } | null)?.haiku ?? null);
 
 	const paragraphs = $derived(
 		(c?.preamble ?? '')
@@ -52,6 +56,13 @@
 			<figcaption>vendor's description</figcaption>
 			<blockquote>{c.vendor_text}</blockquote>
 		</figure>
+	{/if}
+
+	{#if verse}
+		<!-- Keyed so the next visit's haiku grows its own shape rather than reusing this one's. -->
+		{#key verse.id}
+			<div class="verse"><FungalHaiku lines={verse.lines} tag="p" /></div>
+		{/key}
 	{/if}
 
 	<ol>
@@ -145,6 +156,9 @@
 	blockquote {
 		margin: 0;
 		color: var(--ink-400);
+	}
+	.verse {
+		margin-top: 2.5rem;
 	}
 	ol {
 		list-style: none;

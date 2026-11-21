@@ -3,6 +3,7 @@
 	import { goto, snapshot } from '$app/navigation';
 	import { page } from '$app/state';
 	import Grid from '../../lib/components/Grid.svelte';
+	import CollectionLink, { collectionOf } from '../../lib/components/CollectionLink.svelte';
 	import { ApiError, search, type SearchResult } from '../../lib/api';
 
 	// The query lives in the URL so a result page can be linked and survives back.
@@ -88,6 +89,7 @@
 			{/each}
 		</p>
 	{/if}
+	{#if collectionOf(result)}<CollectionLink collection={collectionOf(result)!} />{/if}
 	{#if result.items.length}
 		<Grid items={result.items} />
 	{:else}

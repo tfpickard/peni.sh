@@ -27,6 +27,21 @@ _FILLED = """
 """
 
 
+# A haiku the deck already holds for one of the collection's live leaves, a different one
+# on each visit as home's is. Only a live leaf's: a haiku of a picture taken down would
+# speak for something nobody can see.
+_LEAF_HAIKU = """
+    select h.id, h.l1, h.l2, h.l3
+      from haikus h
+      join collection_leaves l on l.image_id = h.image_id
+      join images i on i.id = h.image_id
+     where l.collection_id = %s and h.active and h.colony_id is null
+       and i.status = 'live' and i.published_at is not null
+     order by random()
+     limit 1
+"""
+
+
 def _not_here() -> HTTPException:
     return HTTPException(status_code=404, detail="not here")
 
@@ -85,6 +100,8 @@ async def collection(request: Request, slug: str) -> dict[str, Any]:
         books = await cur.fetchall()
         cur = await conn.execute(f"{_FILLED} order by l.book, l.position".encode(), (c["id"],))
         filled = await cur.fetchall()
+        cur = await conn.execute(_LEAF_HAIKU, (c["id"],))
+        verse = await cur.fetchone()
     variants = variants_for_many((r["pub_sha"], r["width"], r["height"]) for r in filled)
     by_book: dict[int, list[dict[str, Any]]] = {}
     for r in filled:
@@ -109,6 +126,10 @@ async def collection(request: Request, slug: str) -> dict[str, Any]:
             {"number": b["number"], "title": b["title"], "leaves": by_book.get(b["number"], [])}
             for b in books
         ],
+        # `{id, lines}` as /api/haiku has it, or null while no leaf has one.
+        "haiku": None
+        if verse is None
+        else {"id": verse["id"], "lines": [verse["l1"], verse["l2"], verse["l3"]]},
     }
 
 
