@@ -500,3 +500,53 @@ async def test_resort_records_the_scores_of_a_book_move(p: Any, settings: Settin
     assert [(m.image_id, m.after[0] if m.after else None) for m in moves] == [(a, 1)]
     last = (await history(p))[-1]
     assert (last["reason"], last["chosen_by"], last["scores"]["best"]) == ("resort", "score", 1)
+
+
+# -- the note sweep ------------------------------------------------------------------
+
+
+async def test_note_sweep(p: Any, settings: Settings) -> None:
+    c = await collection(p)
+    a, b, m = [await picture(p, settings, n, e(n)) for n in (1, 2, 3)]
+    for i, pos in ((a, 1), (b, 2), (m, 3)):
+        await q(
+            p,
+            "insert into collection_leaves (image_id, collection_id, book, position)"
+            " values (%s, %s, 1, %s) returning 1",
+            i,
+            c["id"],
+            pos,
+        )
+    await q(
+        p,
+        "update collection_leaves set note = 'Vellum.', note_source = 'owner'"
+        " where image_id = %s returning 1",
+        b,
+    )
+    await q(
+        p,
+        "update collection_leaves set note = 'Rag paper.', note_source = 'model',"
+        " note_model = 'm' where image_id = %s returning 1",
+        m,
+    )
+    assert await collection_jobs.enqueue_unnoted(p) == 1
+    rows = await q(p, "select payload, dedupe_key from jobs where type = %s", store.NOTE_JOB)
+    assert rows == [
+        {
+            "payload": {"image_id": a, "collection_id": c["id"], "rewrite": False},
+            "dedupe_key": f"{store.NOTE_JOB}:{a}:{c['id']}",
+        }
+    ]
+    # A restart while it waits queues nothing more.
+    assert await collection_jobs.enqueue_unnoted(p) == 0
+    # Nor once it has run and the model came back with nothing to keep: that leaf waits
+    # for the owner, not for the next restart.
+    await q(p, "update jobs set status = 'failed' returning 1")
+    assert await collection_jobs.enqueue_unnoted(p) == 0
+    # The owner's note and the model's are never touched.
+    notes = await q(p, "select image_id, note, note_source from collection_leaves order by 1")
+    assert [(r["note"], r["note_source"]) for r in notes] == [
+        (None, None),
+        ("Vellum.", "owner"),
+        ("Rag paper.", "model"),
+    ]

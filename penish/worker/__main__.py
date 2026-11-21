@@ -121,6 +121,9 @@ async def main() -> None:
         n = await collection_jobs.enqueue_anchors(pool, settings)
         if n:
             log.info("enqueued %d collections to embed book anchors", n)
+        n = await collection_jobs.enqueue_unnoted(pool)
+        if n:
+            log.info("enqueued %d leaves for a conservator's note", n)
 
         watcher = InboxWatcher(settings, enqueue, has_job=has_job)
         await watcher.recover()

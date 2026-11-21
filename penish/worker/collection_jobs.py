@@ -156,6 +156,33 @@ async def enqueue_anchors(pool: Pool, settings: Settings) -> int:
         return cur.rowcount
 
 
+async def enqueue_unnoted(pool: Pool) -> int:
+    """A conservator's note for every leaf with none, the job filing would have queued.
+    Run at worker start, so leaves filed before notes existed, or whose job was lost, are
+    made good. A note of either source keeps a leaf out, and so does any note job on
+    record for it, done or failed: the call is paid, a leaf every try refused would be paid
+    for again at each restart, and the owner can still ask on the collection page."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"""
+            insert into jobs (type, payload, dedupe_key)
+            select '{store.NOTE_JOB}',
+                   jsonb_build_object('image_id', l.image_id, 'collection_id', l.collection_id,
+                                      'rewrite', false),
+                   '{store.NOTE_JOB}:' || l.image_id || ':' || l.collection_id
+              from collection_leaves l
+             where l.note is null
+               and not exists (select 1 from jobs j
+                                where j.type = '{store.NOTE_JOB}'
+                                  and j.payload->>'image_id' = l.image_id::text
+                                  and j.payload->>'collection_id' = l.collection_id::text)
+             order by l.collection_id, l.book, l.position
+            on conflict do nothing
+            """
+        )
+        return cur.rowcount
+
+
 async def enqueue_weekly(pool: Pool, now: datetime | None = None) -> int:
     """A re-sort for each collection whose tuning asks for one weekly and is due."""
     now = now or datetime.now(UTC)

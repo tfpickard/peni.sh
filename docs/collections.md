@@ -290,6 +290,9 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   note. The admin queues it for one leaf (`write note`, which rewrites a model note) or for
   every leaf with none (`write missing notes`). A plain job and an asked-for rewrite have
   separate dedupe keys, so the rewrite never folds into a job that would keep the old note.
+- Worker start queues a note for every leaf with none and no note job on record (done or
+  failed), so the backlog is noted once and a leaf the model keeps refusing is not paid for
+  at every restart.
 - Owner wins twice: the job skips a leaf with an owner note, and the model's write is an
   update conditional on `note_source` not being `owner`, so an owner note saved while the
   model ran stands. Clearing an owner note (saving it empty) hands the leaf back.
