@@ -101,6 +101,26 @@ def og_image(
     return _PUB_URL + name, w, h
 
 
+def preview_image(
+    pub_sha: str | None, width: int | None, height: int | None
+) -> dict[str, Any] | None:
+    """What a link preview or a feed enclosure shows of a picture: `{url, w, h, type}`.
+
+    The og JPEG where it exists, else the largest webp (h is None when the row has no
+    dimensions to scale it by), else None. Urls are site-relative.
+    """
+    og = og_image(pub_sha, width, height)
+    if og is not None:
+        return {"url": og[0], "w": og[1], "h": og[2], "type": "image/jpeg"}
+    if not pub_sha:
+        return None
+    webps = [v for v in variants_for(pub_sha, width, height) if v["webp"]]
+    if not webps:
+        return None
+    big = webps[-1]
+    return {"url": big["webp"], "w": big["w"], "h": big.get("h"), "type": "image/webp"}
+
+
 @router.api_route("/media/pub/{name}", methods=["GET", "HEAD"], include_in_schema=False)
 async def pub(name: str) -> FileResponse:
     m = _NAME.match(name)

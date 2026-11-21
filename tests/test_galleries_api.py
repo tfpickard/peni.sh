@@ -533,6 +533,7 @@ async def test_gallery_page_og_tags(
     r = await client.get("/g/12")
     assert r.status_code == 200
     assert r.text.count('property="og:title"') == 1
+    assert '<title>a "quoted" one -- peni.sh</title>' in r.text
     assert '<meta property="og:title" content="a &quot;quoted&quot; one">' in r.text
     assert '<meta property="og:description" content="3 pictures">' in r.text
     assert f'<meta property="og:image" content="http://t/media/pub/{sha(2)}-1600.webp">' in r.text
