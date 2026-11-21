@@ -83,7 +83,7 @@ Work in the same vector space the site already uses for similarity: the analysis
 For each book that is not full, compute a **centroid** that blends the written anchor with the real leaves:
 
 ```
-w_anchor = k / (k + n)          # n = leaves in the book, k = 3 (config)
+w_anchor = k / (k + n)          # n = leaves in the book, k = `anchor_k`: 3 by default, 10 here
 centroid = normalize(w_anchor * anchor + (1 - w_anchor) * mean(leaf vectors))
 ```
 
@@ -192,13 +192,15 @@ Don't expose `anchor_text`, `anchor_embedding`, `tag_hints` or scores publicly.
 
 The site embeds the **analysis** paragraphs, so write anchors in that register: plain visual description, not titles. Tom can rewrite them. Starting text:
 
-1. **Creatures.** Engraved or painted plates of single animals and composite creatures shown in profile against a plain ground, sometimes with small figures beside them for scale. Bestiary and natural-history illustration, hand-coloured woodcut, marginal drolleries, beasts drawn with careful anatomy and impossible parts.
-2. **Plants and stones.** Botanical plates showing a whole plant from root to flower, seeds and cross-sections, gems and minerals drawn in rows, pseudo-script labels, herbal and lapidary pages with faded washes.
-3. **Instruments and the body.** Engraved diagrams of surgical, mechanical or ritual apparatus in exploded view with lettered parts, anatomical figures with flaps and cutaways, patients and practitioners, bathhouses and infirmaries, procedures in progress.
-4. **The sky.** Celestial spheres, nested rings and orbits, volvelles, astrolabe plates, star charts, maps of seas and coasts, cosmological diagrams with figures at the margins, gold and lapis on parchment.
-5. **Transmutation.** Alchemical emblems, flasks and furnaces with scenes inside them, crowned figures, serpents, suns and moons, sequences of small panels, laboratory interiors.
-6. **Devotion.** Icons with gold grounds, saints and figures in registers, relic caskets, liturgical objects, processions, heterodox or unfamiliar sacred scenes, mosaic and fresco fragments.
-7. **Dreams and signs.** Dream images paired in grids, emblems and their meanings, divination tables, figures in symbolic scenes, a sleeping person with a vision above, alphabets of signs.
+1. **Creatures.** Animals and composite creatures presented one at a time for study: their parts, habits, uses and dangers. Beasts with impossible anatomy, hybrids of fish, bird and mammal, monsters from the edges of the known world, creatures in the margins acting like people. Small human figures sometimes stand beside them for scale.
+2. **Plants and stones.** Plants shown whole from root to flower, with seeds and cross-sections. Trees that bear creatures, people or objects as fruit, roots shaped like people, gardens and harvests of impossible crops. Gems, minerals and stones laid out in rows with their virtues.
+3. **Instruments and the body.** Devices built to be applied to the body: chairs, frames, balances, tubes, gears and basins with lettered parts. Surgery, bloodletting and cures in progress, remedies and their ingredients, a body opened, flapped or diagrammed for teaching. A patient approaches the apparatus warily while practitioners wait.
+4. **The sky.** The heavens and what they foretell. Spheres, rings and orbits, planets with the people they govern, constellations drawn as figures, zodiac men whose body parts are ruled by the signs, winds, maps of seas and coasts. Dreams and their meanings, omens, divination and alphabets of signs.
+5. **Transmutation.** The changing of one thing into another. Flasks and furnaces with whole scenes sealed inside them, a crowned king and queen, lions, serpents, suns and moons, sequences of small stages, laboratory work.
+6. **Devotion.** What heaven does. Gods, saints and the many-armed one-eyed sky god acting directly: creating, judging and weighing souls, sorting the saved from the damned, working miracles and martyrdoms. Heaven and hell, relics, processions and sacred scenes that belong to no known church.
+7. **Man.** What people are and what they do. The human figure shown whole and unashamed as the measure of things, set between beasts below and heaven above. Virtues and vices as persons, the soul and its housing, knowledge carried in the body, conception, pregnancy, birth and the ages of life. The household, the bath, the table, trades and guilds, custom and festival. Law, trial and ordeal, and the prescribed punishment fitted exactly to the offence, carried out calmly by magistrates and executioners while daily life goes on around it.
+
+The line between books vi and vii: what heaven does is vi, and what people do is vii, even in heaven's name. A book is defined by what a picture shows, never by how it was made, so the anchors and tag hints name no medium.
 
 `tag_hints` for each book can come from the obvious words in its anchor. Keep them short.
 
@@ -250,6 +252,10 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
 - History also records a filing (`from` null) and an unfiling (`to` null), so the admin list
   shows a leaf's whole life. The public `previous` is the latest row with a `from`, and is
   null when that equals where the leaf is now.
+- `migrations/024_leaf_history_scores.sql` gives each history row `chosen_by` (`score`,
+  `owner`, `judge`) and `scores` (jsonb), set on the row where a leaf's book was decided:
+  a filing, an owner move, a re-sort or re-judging that changes its book.
+- `migrations/025_collection_judgements.sql` keeps the judge's answers (see "The judge").
 - `migrations/019_collection_text.sql` adds the owner text and the note's provenance;
   `020_seed_pansophicon_text.sql` seeds the Pansophicon's text, filling only what is still
   empty. Tests re-apply 018 and 020 between runs.
@@ -260,7 +266,7 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   `model`) and `note_model`, as text rows carry theirs. A note always has a source.
 - `collection_requests.note` holds an owner note that arrived with the request (the upload
   form or `_note.txt`) until the picture is filed; filing writes it to the leaf.
-- The filer's constants are `collections.tuning` (jsonb): `anchor_k` 3, `tag_alpha` 0.05,
+- The filer's constants are `collections.tuning` (jsonb): `anchor_k` 3 (10 on the Pansophicon since `023`), `tag_alpha` 0.05,
   `fill_beta` 0.05, `book_margin` 0.03, `weekly_resort` false. Absent keys mean the defaults
   in `penish/collection/plan.py`. They are edited on `/admin/collections`, so tuning needs no
   deploy.
@@ -285,6 +291,10 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   note. The admin queues it for one leaf (`write note`, which rewrites a model note) or for
   every leaf with none (`write missing notes`). A plain job and an asked-for rewrite have
   separate dedupe keys, so the rewrite never folds into a job that would keep the old note.
+- Worker start queues a note for every leaf with none and no note job on record (done or
+  failed), the first five minutes out and the rest 30 seconds apart, so uploads, filings and
+  judging queued meanwhile are claimed first. The backlog is noted once, and a leaf the
+  model keeps refusing is not paid for at every restart.
 - Owner wins twice: the job skips a leaf with an owner note, and the model's write is an
   update conditional on `note_source` not being `owner`, so an owner note saved while the
   model ran stands. Clearing an owner note (saving it empty) hands the leaf back.
@@ -336,6 +346,83 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   `collection sidecar: ...`. The picture publishes regardless.
 - A request for a picture that is down waits. Going live, republishing, and the worker
   start sweep each queue its filing.
+- Which book is decided in one place, `store.choose`: the owner's book when given, else
+  the judge's (see "The judge"), else the best score among books with room. `plan.weigh` returns every open book's score in
+  its parts (`cos`, `tag`, `fill`, which add up to the total `choose_book` ranks by), the
+  best, the runner-up and the margin; the filing keeps them, with the tuning, on its
+  history row, also when the owner gave the book.
+- `GET /api/admin/collections/<slug>/explain?image_id=N` (readable with the read token):
+  the leaf's place and pins, every book's parts now with the leaf left out of its own (as a
+  re-sort sees it), the best, the runner-up, the margin and its own book's `lead`, and what
+  was kept when it was filed.
+- The owner's re-sort is a plan, then exactly that plan. The dry run answers `plan_id` and
+  the moves (thumbnail, before, after, and the margin: how far the new book scores above
+  the best other). `plan_id` is a hash of the moves and of the state they were planned
+  from: shape, tuning, each book's anchor text, hints and vector, and every leaf's place
+  and pins. Sent back with the moves, it applies them as they are, or answers 409 `changed`
+  when that state is no longer the collection's. The leaves' own vectors are not in it, so
+  an upload elsewhere on the site (which moves the corpus mean) does not void a plan.
+- A dry run while any anchor has no vector answers 409 `anchors` and queues
+  `collection_anchor`, instead of scoring a book blind. The weekly re-sort is still a job
+  that embeds the anchors, plans and writes in one go.
+
+### The judge
+
+Vectors file by what a picture looks like, and pictures of one medium look alike whatever
+they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and names its book.
+
+- `penish/collection/judge.py`, prompt `penish/prompts/filer.md`. One text-only call: the
+  caption, description and analysis (`image_texts`), and every book of the collection, full
+  or not, with its number, title and anchor text. It answers
+  `{"book", "runner_up", "reason"}`, books as roman numerals. The prompt files by subject,
+  never by medium, technique, style or layout; what heaven does is vi, what people do is
+  vii even in heaven's name, and what people do in baths is vii.
+- An answer is a judgement only when both books are the collection's and differ, and the
+  reason is one line of at most 200 characters (an em dash in it is made `--`). Anything
+  else, a refusal, an error or no answer in 60 seconds is a failure, and the filing goes by
+  score. Whether the named book has room is checked after the answer: a filing into a full
+  book goes by score with `full`, and re-judging holds the leaf with `full`.
+- Settings on `/admin/models`: `filer.model` (default `claude-haiku-5-5`, the
+  `FILER_MODEL` env var; Haiku did best in the trial and costs least), `filer.prompt`, and
+  `filer.judge` (on by default; off, nothing asks: a filing goes by score, the re-judging
+  dry run answers 409 `off` and queues nothing, and a `collection_judge` job already queued
+  returns without asking). Usage is recorded under `filer`.
+- `collection_judgements` keeps every answer by collection, picture and `input_hash`:
+  sha256 over the model, the prompt, the three texts and every book's number, title and
+  anchor text. A book filling or emptying does not change it. The same question is never
+  paid for twice. A failure is kept too, so a dry
+  run can say why; a refusal is never asked again, the other failures are asked again the
+  next time the question comes up. Change a text, a title, an anchor, the model or the
+  prompt and it is a new question.
+- Filing: the worker asks the judge (through the cache) before `file_request` takes the
+  collection's lock, and hands the answer in; `store.choose` takes an answer, never a
+  client, so no model call can run under the lock. A judgement for a book still open is
+  `chosen_by='judge'`, and `scores` keeps the weighing with `judge: {model, book,
+  runner_up, reason}`. Otherwise the scores choose, and `scores.judge` says why not
+  (`{error: "off" | "no text" | "refused" | "invalid" | "timeout" | "error" | "full"}`,
+  `full` being a book with no room when the lock is taken), with a log line. The
+  slot within the book is chosen as before. An owner's book never asks.
+- A leaf whose latest book decision in history is `judge` keeps its book in every vector
+  re-sort, the owner's and the weekly one, as a `book_pinned` leaf does; it may still move
+  within its book. It is not marked `book_pinned`, which stays the owner's alone. A leaf
+  the judge agreed with on re-judging has no new history row, so it stays a scored leaf.
+- Re-judging: `POST /api/admin/collections/<slug>/judge`. The api holds no model keys, so
+  `{"dry_run": true}` plans from kept judgements only: while any leaf not `book_pinned`
+  has none for what it is now, it answers 409 `judging` and queues `collection_judge`, and
+  the worker asks for each (four at a time). Then it answers `{plan_id, moves, held}`:
+  every leaf whose judged book is not its own, moved there with its slot chosen as the
+  filer would (other leaves in that book may shift, as on a filing), each book move with
+  the judge's `reason` and `runner_up`. `held` lists what stays: a leaf whose judged book
+  is full (`book`, `why: "full"`), and one the judge did not judge (`why` is the failure,
+  `no text` or `no vector`). 409 `anchors` as the re-sort's dry run. `{"dry_run": false,
+  plan_id, moves}` applies exactly that plan or answers 409 `changed`; the id covers the
+  collection's state and the question behind each book move. Applied book moves are
+  history rows with `chosen_by='judge'` and the judgement; `last_resort_at` is untouched.
+- `/admin/collections` has `judge` beside the dry run (it asks again every few seconds
+  while the answer is `judging`) and `apply`, which sends the shown plan back. The moves
+  list shows the reason beside a book move; held leaves follow it.
+- `explain` returns `judged` (the judge chose its book), `filed.scores.judge` for a judged
+  filing, and `judgement`: the kept answer for the leaf as it is now, or null.
 
 ### Site
 

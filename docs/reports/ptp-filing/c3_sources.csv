@@ -1,0 +1,26 @@
+source,label,method,right_all,n_all,right_unpinned,n_unpinned
+a,whole analysis,LOO old,1,15,1,10
+a,whole analysis,anchor only old,2,15,2,10
+a,whole analysis,LOO new,3,15,3,10
+a,whole analysis,anchor only new,5,15,2,10
+a,whole analysis,gold centroid,7,15,2,10
+b,subject paragraph,LOO old,1,15,1,10
+b,subject paragraph,anchor only old,1,15,1,10
+b,subject paragraph,LOO new,3,15,3,10
+b,subject paragraph,anchor only new,7,15,4,10
+b,subject paragraph,gold centroid,6,15,2,10
+c,subject + setting,LOO old,1,15,1,10
+c,subject + setting,anchor only old,2,15,2,10
+c,subject + setting,LOO new,3,15,3,10
+c,subject + setting,anchor only new,7,15,4,10
+c,subject + setting,gold centroid,6,15,2,10
+d,"subject, extract recipe",LOO old,2,15,2,10
+d,"subject, extract recipe",anchor only old,3,15,3,10
+d,"subject, extract recipe",LOO new,3,15,3,10
+d,"subject, extract recipe",anchor only new,5,15,3,10
+d,"subject, extract recipe",gold centroid,4,15,0,10
+e,style paragraph,LOO old,2,15,2,10
+e,style paragraph,anchor only old,1,15,1,10
+e,style paragraph,LOO new,1,15,1,10
+e,style paragraph,anchor only new,2,15,2,10
+e,style paragraph,gold centroid,5,15,1,10

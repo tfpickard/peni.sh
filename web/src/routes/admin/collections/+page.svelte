@@ -46,7 +46,9 @@
 	let picked = $state<{ book: number; leaf: cols.AdminLeaf } | null>(null);
 	let moveBook = $state('');
 	let moveLeaf = $state('');
-	let proposed = $state<cols.ProposedMove[] | null>(null);
+	// The re-sort's dry run or the judge's; each applies only through its own button.
+	let proposed = $state<((cols.Plan & { kind: 'resort' }) | (cols.JudgePlan & { kind: 'judge' })) | null>(null);
+	let judging = $state(false);
 
 	const bookDraft = (b: cols.AdminBook): BookDraft => ({
 		title: b.title ?? '',
@@ -162,14 +164,48 @@
 	async function dry() {
 		msg = '';
 		try {
-			proposed = (await cols.dryRun(slug)).moves;
+			proposed = { ...(await cols.dryRun(slug)), kind: 'resort' };
 		} catch (e) {
 			msg = e instanceof cols.HttpError && e.detail ? e.detail : 'failed';
 		}
 	}
+	// Applies the plan the dry run showed, never a fresh one.
 	async function resortNow() {
+		const plan = proposed;
+		if (!plan || plan.kind !== 'resort') return;
 		proposed = null;
-		await act(() => cols.resort(slug));
+		await act(() => cols.resort(slug, plan));
+	}
+	// The worker judges whatever has no judgement yet; until it has, the same dry run is
+	// refused `judging`, so it is asked again every few seconds for a few minutes.
+	async function judgeDry() {
+		const s = slug;
+		msg = '';
+		proposed = null;
+		judging = true;
+		try {
+			for (let i = 0; i < 60 && slug === s; i++) {
+				try {
+					proposed = { ...(await cols.judgeRun(s)), kind: 'judge' };
+					return;
+				} catch (e) {
+					if (!(e instanceof cols.HttpError && e.detail === 'judging')) {
+						msg = e instanceof cols.HttpError && e.detail ? e.detail : 'failed';
+						return;
+					}
+				}
+				await new Promise((r) => setTimeout(r, 3000));
+			}
+			msg = 'judging';
+		} finally {
+			judging = false;
+		}
+	}
+	async function judgeNow() {
+		const plan = proposed;
+		if (!plan || plan.kind !== 'judge') return;
+		proposed = null;
+		await act(() => cols.judgeApply(slug, plan));
 	}
 
 	// While a re-sort or a filing waits, keep the page current.
@@ -309,29 +345,47 @@
 	<div class="row">
 		<button onclick={dry}>dry run</button>
 		<button
-			disabled={d.resort?.status === 'queued' || d.resort?.status === 'running'}
+			disabled={proposed?.kind !== 'resort' || d.resort?.status === 'queued' || d.resort?.status === 'running'}
 			onclick={resortNow}>re-sort now</button
 		>
+		<button disabled={judging} onclick={judgeDry}>judge</button>
+		<button disabled={proposed?.kind !== 'judge'} onclick={judgeNow}>apply</button>
+		{#if judging}<span class="dim">judging</span>{/if}
 		{#if d.resort}<span class="dim" class:hot={d.resort.status === 'failed'}>{d.resort.status}</span>{/if}
 		{#if d.last_resort_at}<span class="dim">last {when(d.last_resort_at)}</span>{/if}
 	</div>
 	{#if d.resort?.last_error && d.resort.status === 'failed'}<p class="hot err">{d.resort.last_error}</p>{/if}
 	{#if proposed}
-		{#if proposed.length}
+		{#if proposed.moves.length}
 			<table class="moves">
 				<tbody>
-					{#each proposed as m (m.image_id)}
+					{#each proposed.moves as m (m.image_id)}
 						<tr>
 							<td><a href="/admin/pictures/{m.image_id}">{m.slug ?? m.image_id}</a></td>
 							<td class="dim">{pair(m.before)}</td>
 							<td>{pair(m.after)}</td>
-							{#if m.before && m.after && m.before[0] !== m.after[0]}<td class="hot">book</td>{/if}
+							<td class="hot">{m.before[0] !== m.after[0] ? 'book' : ''}</td>
+							{#if m.reason}<td class="dim">{m.reason}</td>{/if}
 						</tr>
 					{/each}
 				</tbody>
 			</table>
 		{:else}
 			<p class="dim">0 moves</p>
+		{/if}
+		{#if proposed.kind === 'judge' && proposed.held.length}
+			<table class="moves">
+				<tbody>
+					{#each proposed.held as h (h.image_id)}
+						<tr>
+							<td><a href="/admin/pictures/{h.image_id}">{h.slug ?? h.image_id}</a></td>
+							<td class="dim">{pair(h.before)}</td>
+							<td>{h.book === null ? '' : roman(h.book)}</td>
+							<td class="dim">{h.why}</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
 		{/if}
 	{/if}
 

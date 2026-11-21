@@ -85,6 +85,22 @@ def test_prompt_is_house_style() -> None:
         assert word not in text
 
 
+@pytest.mark.parametrize(
+    "example",
+    [
+        "Greek, Peloponnesian hand, probably fifteenth century. Marginalia in Polish, later."
+        " Leaves 14 through 22 in a different ink, same hand as the marginalia.",
+        "The paper is wove. Wove paper is not recorded before the 1750s."
+        " Retained in sequence pending review.",
+        "A second fold line does not match the first.",
+    ],
+)
+def test_prompt_examples_pass_the_check(example: str) -> None:
+    # A register the prompt shows the model has to be one the check lets through.
+    assert example in runtime.default("conservator.prompt")
+    assert clean({"note": example}) == example
+
+
 def test_clean_keeps_flat_fact() -> None:
     got = clean({"note": "Greek, probably fifteenth century.  Marginalia in Polish \u2014 later."})
     assert got == "Greek, probably fifteenth century. Marginalia in Polish -- later."

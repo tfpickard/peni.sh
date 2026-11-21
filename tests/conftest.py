@@ -20,10 +20,12 @@ from penish.db import make_pool
 
 MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
 _UP = re.compile(r"--\s*migrate:up(.*?)(?:--\s*migrate:down|\Z)", re.S)
-# Re-applied after every test, in order: the collection, then its owner text.
+# Re-applied after every test, in order: the collection, its owner text, then the rewrite
+# of its books. Without the last, a test would start from the books 018 first wrote.
 COLLECTION_SEEDS = (
     MIGRATIONS / "018_seed_pansophicon.sql",
     MIGRATIONS / "020_seed_pansophicon_text.sql",
+    MIGRATIONS / "023_pansophicon_of_man.sql",
 )
 
 
@@ -33,6 +35,32 @@ def _apply_migrations(dsn: str) -> None:
             m = _UP.search(f.read_text())
             if m:
                 conn.execute(m.group(1).encode())
+
+
+class _NoModel:
+    """The filer's judge as tests meet it unless they hand it a fake: the environment may
+    hold a real key, and a filing must not spend it. Raising alone would prove nothing,
+    since the judge turns any exception into a failed judgement and files by score, so
+    every call is noted and the test fails at teardown."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+        self.messages = self
+
+    async def create(self, **kw: object) -> object:
+        self.calls.append(str(kw.get("model")))
+        raise AssertionError("a real model call in a test")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_judge(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    from penish.collection import judge
+
+    calls: list[str] = []
+    monkeypatch.setattr(judge, "default_client", lambda settings: _NoModel(calls))
+    yield calls
+    if calls:
+        pytest.fail(f"a real model call in a test: {calls}", pytrace=False)
 
 
 @pytest.fixture(scope="session")

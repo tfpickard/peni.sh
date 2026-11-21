@@ -3,12 +3,14 @@
 	import * as ops from '../../../lib/admin-ops';
 
 	const OTHER = '__other';
-	const purposes = ['describe', 'haiku', 'grow', 'extract', 'name', 'conservator'] as const;
+	const purposes = ['describe', 'haiku', 'grow', 'extract', 'name', 'conservator', 'filer'] as const;
 	type Purpose = (typeof purposes)[number];
 	// The purposes with an effort key; the others always run at the model's own default.
 	const withEffort: readonly Purpose[] = ['describe', 'extract'];
 	const CAP = 'mycelium.daily_calls';
 	const FALLBACK = 'haiku.fallback';
+	// Whether a filing asks the filer's model which book; off, the scores alone file it.
+	const JUDGE = 'filer.judge';
 
 	type Block = {
 		loaded: { model: string; effort: string; prompt: string };
@@ -26,6 +28,7 @@
 	// haiku.fallback as typed: `provider:model` ids, comma separated.
 	let fallback = $state('');
 	let fallbackLoaded = $state('');
+	let judge = $state(true);
 
 	// Effort null means none; the select needs a string for it.
 	const eff = (v: string | number | null) => (v === null ? 'none' : String(v));
@@ -57,8 +60,10 @@
 			grow: block(data, 'grow'),
 			extract: block(data, 'extract'),
 			name: block(data, 'name'),
-			conservator: block(data, 'conservator')
+			conservator: block(data, 'conservator'),
+			filer: block(data, 'filer')
 		};
+		judge = data.current[JUDGE] === true;
 		cap = Number(data.current[CAP]);
 		const f = data.current[FALLBACK];
 		fallback = fallbackLoaded = Array.isArray(f) ? f.join(', ') : '';
@@ -103,6 +108,8 @@
 			)
 		);
 	const resetFallback = () => run(() => ops.resetSetting(FALLBACK));
+	const saveJudge = () => run(() => ops.putSetting(JUDGE, judge));
+	const resetJudge = () => run(() => ops.resetSetting(JUDGE));
 	const keyed = $derived(
 		data?.keyed == null ? 'unknown' : data.keyed.length ? data.keyed.join(' ') : 'none'
 	);
@@ -155,6 +162,14 @@
 					/>
 					<button disabled={fallback.trim() === fallbackLoaded} onclick={saveFallback}>save</button>
 					<button class="link" disabled={!custom(FALLBACK)} onclick={resetFallback}>reset</button>
+				</div>
+			{/if}
+
+			{#if p === 'filer'}
+				<div class="row gap">
+					<label><input type="checkbox" bind:checked={judge} /> judge</label>
+					<button disabled={judge === data.current[JUDGE]} onclick={saveJudge}>save</button>
+					<button class="link" disabled={!custom(JUDGE)} onclick={resetJudge}>reset</button>
 				</div>
 			{/if}
 

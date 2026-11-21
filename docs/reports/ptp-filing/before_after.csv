@@ -1,0 +1,31 @@
+anchor_k,image_id,slug,book_now,leaf_now,book_proposed,leaf_proposed,margin,gain,book_pinned,pinned,gold
+3,180,illustrated-chart-with-ten-framed-panels,iii,44,iii,44,0.22468109,0,False,False,vii
+3,185,bread-being-baked-over-an-open-fire,iv,77,iv,77,0.11945805,0,False,False,i
+3,186,monks-harvesting-the-shell-tree-by-the-shore,vi,1,ii,1,0.090855107,0.13673465,False,False,ii
+3,187,aged-sheet-with-handwritten-margin-notes,iii,32,iii,32,0.13502127,0,False,False,vii
+3,188,legibility-of-label-banners-on-a-framed-map,iv,1,iv,1,0.11951939,0,False,False,iv
+3,189,towel-and-slipper-racks-in-a-bathhouse-changing-room,v,1,v,1,0.091899632,0,False,False,vii
+3,190,meal-service-at-a-table-inside-the-initial,iv,24,iv,24,0.082639151,0,False,False,i or vii
+3,191,zodiac-chart-plate-i-with-numbered-body-sections,iii,16,iii,16,0.40004913,0,True,False,iv
+3,192,plate-vii-in-a-numbered-series,iii,9,iii,9,0.28736525,0,True,False,iv
+3,193,plate-one-with-one-blank-panel,iii,1,iii,1,0.24127142,0,True,False,iv
+3,194,plate-three-on-ruled-paper,iii,66,iii,66,0.26528376,0,True,False,vii
+3,195,furniture-being-moved-in-a-row,iii,77,iii,77,0.17440186,0,True,False,vii
+3,196,listening-station-with-recording-attendants,iv,47,iv,47,-0.0072274228,0,False,False,iii
+3,197,aged-plate-with-blank-caption-panel,iii,56,iii,56,0.20017296,0,False,False,i
+3,198,reference-chart-with-ten-labelled-roundels,iii,24,iii,24,0.31945513,0,False,False,iv
+10,180,illustrated-chart-with-ten-framed-panels,iii,44,iii,20,0.1527688,0,False,False,vii
+10,185,bread-being-baked-over-an-open-fire,iv,77,vii,1,0.026135583,0.058470132,False,False,i
+10,186,monks-harvesting-the-shell-tree-by-the-shore,vi,1,ii,1,0.11632711,0.13673465,False,False,ii
+10,187,aged-sheet-with-handwritten-margin-notes,iii,32,iii,34,0.14595098,0,False,False,vii
+10,188,legibility-of-label-banners-on-a-framed-map,iv,1,iv,1,-0.0095733671,0,False,False,iv
+10,189,towel-and-slipper-racks-in-a-bathhouse-changing-room,v,1,v,1,0.079883199,0,False,False,vii
+10,190,meal-service-at-a-table-inside-the-initial,iv,24,iii,43,0.10440332,0.11184679,False,False,i or vii
+10,191,zodiac-chart-plate-i-with-numbered-body-sections,iii,16,iii,13,0.22543681,0,True,False,iv
+10,192,plate-vii-in-a-numbered-series,iii,9,iii,8,0.15328245,0,True,False,iv
+10,193,plate-one-with-one-blank-panel,iii,1,iii,1,0.18172075,0,True,False,iv
+10,194,plate-three-on-ruled-paper,iii,66,iii,69,0.061329875,0,True,False,vii
+10,195,furniture-being-moved-in-a-row,iii,77,iii,77,0.058881522,0,True,False,vii
+10,196,listening-station-with-recording-attendants,iv,47,iii,50,0.12488717,0.22394082,False,False,iii
+10,197,aged-plate-with-blank-caption-panel,iii,56,iii,60,0.14651546,0,False,False,i
+10,198,reference-chart-with-ten-labelled-roundels,iii,24,iii,28,0.31687271,0,False,False,iv

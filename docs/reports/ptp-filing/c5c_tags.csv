@@ -1,0 +1,33 @@
+source,anchor_k,tag_alpha,tags,loo_right_all,loo_right_unpinned,resort_right_unpinned,pins_at_gold_resort_right_unpinned
+a,3,0,as stored,3,3,2,3
+a,3,0,hyphens as spaces,3,3,2,3
+a,3,0.05,as stored,3,3,2,3
+a,3,0.05,hyphens as spaces,3,3,2,3
+a,3,0.15,as stored,3,3,2,3
+a,3,0.15,hyphens as spaces,3,3,2,3
+a,3,1,as stored,3,3,2,3
+a,3,1,hyphens as spaces,3,3,2,3
+a,10,0,as stored,3,3,3,3
+a,10,0,hyphens as spaces,3,3,3,3
+a,10,0.05,as stored,3,3,3,3
+a,10,0.05,hyphens as spaces,3,3,3,3
+a,10,0.15,as stored,3,3,3,3
+a,10,0.15,hyphens as spaces,3,3,3,3
+a,10,1,as stored,3,3,3,3
+a,10,1,hyphens as spaces,3,3,3,3
+b,3,0,as stored,3,3,2,3
+b,3,0,hyphens as spaces,3,3,2,3
+b,3,0.05,as stored,3,3,2,3
+b,3,0.05,hyphens as spaces,3,3,2,3
+b,3,0.15,as stored,3,3,2,3
+b,3,0.15,hyphens as spaces,3,3,2,3
+b,3,1,as stored,3,3,3,4
+b,3,1,hyphens as spaces,2,2,3,4
+b,10,0,as stored,6,4,2,3
+b,10,0,hyphens as spaces,6,4,2,3
+b,10,0.05,as stored,6,4,2,3
+b,10,0.05,hyphens as spaces,6,4,3,3
+b,10,0.15,as stored,6,4,2,4
+b,10,0.15,hyphens as spaces,6,4,3,5
+b,10,1,as stored,7,4,3,4
+b,10,1,hyphens as spaces,7,4,4,5

@@ -1,5 +1,6 @@
 """Admin collections: the collection's own text and switches, the books' anchors and hints,
-every leaf by position, owner moves and pins, unfiled requests, re-sorts and history.
+every leaf by position, owner moves and pins, unfiled requests, re-sorts, re-judging and
+history.
 
 Every write answers with the whole collection, so the page just swaps it in.
 """
@@ -13,10 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ConfigDict, Field
 
-from penish import uploads
+from penish import runtime, uploads
 from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for_many
 from penish.collection import store
+from penish.collection.judge import Judgement
 from penish.collection.plan import LIMITS, Tuning
 from penish.config import get_settings
 
@@ -344,15 +346,7 @@ async def edit_book(request: Request, slug: str, number: int, body: BookEdit) ->
                     " where collection_id = %s and number = %s",
                     (text, c["id"], number),
                 )
-                await conn.execute(
-                    "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s)"
-                    " on conflict do nothing",
-                    (
-                        store.ANCHOR_JOB,
-                        Jsonb({"collection_id": c["id"]}),
-                        f"{store.ANCHOR_JOB}:{c['id']}",
-                    ),
-                )
+                await store.enqueue_anchor_job(conn, c["id"])
     return await _answer(request, slug)
 
 
@@ -481,39 +475,184 @@ async def retry_request(request: Request, slug: str, image_id: int) -> dict[str,
 # -- re-sort ------------------------------------------------------------------------
 
 
+class PlannedMove(BaseModel):
+    # The dry run's moves come back as they were sent; their other fields are for display.
+    image_id: int
+    before: tuple[int, int]
+    after: tuple[int, int]
+
+
 class Resort(BaseModel):
     dry_run: bool = True
+    # The dry run's answer, sent back to apply it.
+    plan_id: str | None = Field(None, max_length=128)
+    moves: list[PlannedMove] | None = Field(None, max_length=100_000)
 
 
 @router.post("/{slug}/resort")
 async def resort(request: Request, slug: str, body: Resort) -> dict[str, Any]:
-    """A dry run plans against the vectors as they stand and answers with the moves. The
-    real one is a job, so the worker can embed any anchor still waiting first."""
+    """A dry run answers with the plan and its id; sending both back applies exactly that
+    plan, or refuses `changed` if the collection has moved on since. A dry run while an
+    anchor waits for its vector is refused `anchors`, and the anchor is queued, so the
+    next one a minute later can score every book."""
+    settings = get_settings()
     async with request.app.state.pool.connection() as conn:
         c = await _collection(conn, slug)
         if body.dry_run:
-            moves = await store.resort(conn, c, get_settings(), dry_run=True)
+            try:
+                plan = await store.plan(conn, c, settings)
+            except store.AnchorsWaiting as e:
+                await store.enqueue_anchor_job(conn, c["id"])
+                # Committed here: the refusal below would otherwise roll the job back.
+                await conn.commit()
+                raise _refused(e) from None
+            except store.Refused as e:
+                raise _refused(e) from None
             cur = await conn.execute(
-                "select id, slug from images where id = any(%s)", ([m.image_id for m in moves],)
+                f"select {_PICTURE} from images i where i.id = any(%s)".encode(),
+                ([m.image_id for m in plan.moves],),
             )
-            slugs = {r["id"]: r["slug"] for r in await cur.fetchall()}
+            pictures = {r["id"]: r for r in await cur.fetchall()}
+            thumbs = _thumbs(list(pictures.values()))
             return {
+                "plan_id": plan.id,
                 "moves": [
                     {
                         "image_id": m.image_id,
-                        "slug": slugs.get(m.image_id),
+                        "slug": pictures[m.image_id]["slug"] if m.image_id in pictures else None,
+                        "thumb": thumbs.get(m.image_id),
                         "before": m.before,
                         "after": m.after,
+                        "margin": plan.leads.get(m.image_id),
                     }
-                    for m in moves
-                ]
+                    for m in plan.moves
+                ],
             }
-        await conn.execute(
-            "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s)"
-            " on conflict do nothing",
-            (store.RESORT_JOB, Jsonb({"collection_id": c["id"]}), f"{store.RESORT_JOB}:{c['id']}"),
-        )
+        if body.plan_id is None or body.moves is None:
+            raise HTTPException(status_code=422, detail="no plan")
+        try:
+            await store.apply(
+                conn,
+                c,
+                settings,
+                body.plan_id,
+                [(m.image_id, m.before, m.after) for m in body.moves],
+            )
+        except store.Refused as e:
+            raise _refused(e) from None
     return await _answer(request, slug)
+
+
+async def _pictures(conn: Any, image_ids: list[int]) -> tuple[dict[int, Any], dict[int, Any]]:
+    cur = await conn.execute(
+        f"select {_PICTURE} from images i where i.id = any(%s)".encode(), (image_ids,)
+    )
+    pictures = {r["id"]: r for r in await cur.fetchall()}
+    return pictures, _thumbs(list(pictures.values()))
+
+
+@router.post("/{slug}/judge")
+async def judge(request: Request, slug: str, body: Resort) -> dict[str, Any]:
+    """Every leaf the owner did not hold to a book, in the book the judge names for it. As
+    the re-sort: a dry run answers the plan and its id, and both sent back apply exactly
+    that plan or are refused `changed`. The judgements come from the worker, which holds
+    the keys: a dry run with any leaf not yet judged is refused `judging` and the judging
+    queued, so the same dry run a little later has them all. With filer.judge off it is
+    refused `off` and nothing is queued."""
+    settings = get_settings()
+    pool = request.app.state.pool
+    get = runtime.getter(pool, settings)
+    async with pool.connection() as conn:
+        c = await _collection(conn, slug)
+        if body.dry_run:
+            if not await get(runtime.JUDGE_KEY):
+                # The dry run is what queues the paid asking, so the switch stops it here.
+                raise HTTPException(status_code=409, detail="off")
+            try:
+                plan = await store.judge_plan(conn, c, settings, get)
+            except (store.AnchorsWaiting, store.Judging) as e:
+                if isinstance(e, store.Judging):
+                    await store.enqueue_judge_job(conn, c["id"])
+                else:
+                    await store.enqueue_anchor_job(conn, c["id"])
+                # Committed here: the refusal below would otherwise roll the job back.
+                await conn.commit()
+                raise _refused(e) from None
+            except store.Refused as e:
+                raise _refused(e) from None
+            if plan.retry:
+                # A failure that may not happen twice is shown as held, and asked again.
+                await store.enqueue_judge_job(conn, c["id"])
+            pictures, thumbs = await _pictures(
+                conn, [m.image_id for m in plan.moves] + [h.image_id for h in plan.held]
+            )
+
+            def said(image_id: int, chosen_by: str | None) -> dict[str, Any]:
+                v = plan.verdicts.get(image_id)
+                if chosen_by != "judge" or not isinstance(v, Judgement):
+                    return {"reason": None, "runner_up": None}
+                return {"reason": v.reason, "runner_up": v.runner_up}
+
+            def slug_of(image_id: int) -> str | None:
+                return pictures[image_id]["slug"] if image_id in pictures else None
+
+            return {
+                "plan_id": plan.id,
+                "moves": [
+                    {
+                        "image_id": m.image_id,
+                        "slug": slug_of(m.image_id),
+                        "thumb": thumbs.get(m.image_id),
+                        "before": m.before,
+                        "after": m.after,
+                        "margin": plan.leads.get(m.image_id),
+                        **said(m.image_id, m.chosen_by),
+                    }
+                    for m in plan.moves
+                ],
+                "held": [
+                    {
+                        "image_id": h.image_id,
+                        "slug": slug_of(h.image_id),
+                        "thumb": thumbs.get(h.image_id),
+                        "before": h.before,
+                        "book": h.book,
+                        "why": h.why,
+                    }
+                    for h in plan.held
+                ],
+            }
+        if body.plan_id is None or body.moves is None:
+            raise HTTPException(status_code=422, detail="no plan")
+        try:
+            await store.apply_judged(
+                conn,
+                c,
+                settings,
+                get,
+                body.plan_id,
+                [(m.image_id, m.before, m.after) for m in body.moves],
+            )
+        except store.Refused as e:
+            raise _refused(e) from None
+    return await _answer(request, slug)
+
+
+@router.get("/{slug}/explain")
+async def explain(request: Request, slug: str, image_id: int) -> dict[str, Any]:
+    """Why a leaf is in its book: every book's terms now, with the leaf left out of its own
+    as a re-sort sees it, the scores kept when it was filed (with the judge's word when it
+    decided), and the judgement kept for the leaf as it is now."""
+    settings = get_settings()
+    pool = request.app.state.pool
+    async with pool.connection() as conn:
+        c = await _collection(conn, slug)
+        got = await store.explain(conn, c, image_id, settings, runtime.getter(pool, settings))
+        if got is None:
+            raise _not_here()
+        cur = await conn.execute("select slug from images where id = %s", (image_id,))
+        row = await cur.fetchone()
+    return {**got, "slug": row["slug"] if row else None}
 
 
 # -- the admin picture page -----------------------------------------------------------

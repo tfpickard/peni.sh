@@ -9,10 +9,11 @@ from typing import Any
 import numpy as np
 import pytest
 
+from penish import runtime
 from penish.collection import store
 from penish.config import Settings
 from penish.worker import collection_jobs, unpublish
-from penish.worker.jobs import Job, SoftError
+from penish.worker.jobs import Job, SoftError, claim, enqueue
 from tests.test_ingest import DIM, FakeEmbedder, drop, png, q, run
 
 SLUG = "pansophicon"
@@ -172,6 +173,9 @@ async def test_sidecar_on_a_retried_ingest_fails_once(p: Any, settings: Settings
 
 
 async def test_auto_filing_from_a_bare_sidecar(p: Any, settings: Settings) -> None:
+    # The ingest wrote the picture's text, so the judge would be asked; these are the
+    # scores' tests, and the judge has its own.
+    await runtime.put(p, "filer.judge", False)
     await run(drop(settings, "drolly", png(4), collection="pansophicon"), p, settings)
     img = (await q(p, "select id from images"))[0]
     await file(p, settings, img["id"])
@@ -452,3 +456,134 @@ async def test_republish_files_a_request_made_while_down(p: Any, settings: Setti
     assert [r["payload"] for r in rows] == [{"image_id": image_id, "collection_id": c["id"]}]
     await file(p, settings, image_id)
     assert (await leaves(p))[image_id][0] == 3
+
+
+# -- why a leaf went where it did ------------------------------------------------------
+
+
+async def test_filing_by_score_keeps_the_scores(p: Any, settings: Settings) -> None:
+    a, b = await _filed(p, settings, [e(2), e(2, 4)])
+    rows = {r["image_id"]: r for r in await history(p) if r["from_book"] is None}
+    got = rows[a]
+    assert (got["chosen_by"], got["to_book"]) == ("score", 3)
+    s = got["scores"]
+    assert (s["best"], s["runner_up"]) == (3, 1)
+    assert s["margin"] == pytest.approx(1.0)
+    assert s["tuning"]["anchor_k"] == 10.0
+    assert [x["number"] for x in s["books"]] == list(range(1, 8))
+    for x in s["books"]:
+        assert x["cos"] + x["tag"] + x["fill"] == pytest.approx(x["total"])
+    # The second saw the first in book iii, and its best is the book it went to.
+    assert rows[b]["scores"]["best"] == rows[b]["to_book"]
+    # A leaf pushed along inside its book decides no book.
+    assert all(r["chosen_by"] is None for r in await history(p) if r["from_book"] is not None)
+
+
+async def test_a_book_the_owner_gave_is_owner_and_still_scored(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    c = await collection(p)
+    a = await picture(p, settings, 1, e(0))
+    async with p.connection() as conn:
+        await store.request(conn, c, a, 5, None)
+    await file(p, settings, a)
+    (row,) = await history(p)
+    assert (row["chosen_by"], row["to_book"], row["scores"]["best"]) == ("owner", 5, 1)
+    # A move of a filed leaf by the owner says so too.
+    async with p.connection() as conn:
+        await store.place(conn, c, a, 6, None, settings)
+    assert (await history(p))[-1]["chosen_by"] == "owner"
+
+
+async def test_resort_records_the_scores_of_a_book_move(p: Any, settings: Settings) -> None:
+    (a,) = await _filed(p, settings, [e(0)])
+    c = await collection(p)
+    async with p.connection() as conn:
+        await store.place(conn, c, a, 4, None, settings)
+        await store.set_pin(conn, c, a, False, settings)
+        moves = await store.resort(conn, c, settings, dry_run=False)
+    assert [(m.image_id, m.after[0] if m.after else None) for m in moves] == [(a, 1)]
+    last = (await history(p))[-1]
+    assert (last["reason"], last["chosen_by"], last["scores"]["best"]) == ("resort", "score", 1)
+
+
+# -- the note sweep ------------------------------------------------------------------
+
+
+async def test_note_sweep(p: Any, settings: Settings) -> None:
+    c = await collection(p)
+    a, b, m = [await picture(p, settings, n, e(n)) for n in (1, 2, 3)]
+    for i, pos in ((a, 1), (b, 2), (m, 3)):
+        await q(
+            p,
+            "insert into collection_leaves (image_id, collection_id, book, position)"
+            " values (%s, %s, 1, %s) returning 1",
+            i,
+            c["id"],
+            pos,
+        )
+    await q(
+        p,
+        "update collection_leaves set note = 'Vellum.', note_source = 'owner'"
+        " where image_id = %s returning 1",
+        b,
+    )
+    await q(
+        p,
+        "update collection_leaves set note = 'Rag paper.', note_source = 'model',"
+        " note_model = 'm' where image_id = %s returning 1",
+        m,
+    )
+    assert await collection_jobs.enqueue_unnoted(p) == 1
+    rows = await q(p, "select payload, dedupe_key from jobs where type = %s", store.NOTE_JOB)
+    assert rows == [
+        {
+            "payload": {"image_id": a, "collection_id": c["id"], "rewrite": False},
+            "dedupe_key": f"{store.NOTE_JOB}:{a}:{c['id']}",
+        }
+    ]
+    # A restart while it waits queues nothing more.
+    assert await collection_jobs.enqueue_unnoted(p) == 0
+    # Nor once it has run and the model came back with nothing to keep: that leaf waits
+    # for the owner, not for the next restart.
+    await q(p, "update jobs set status = 'failed' returning 1")
+    assert await collection_jobs.enqueue_unnoted(p) == 0
+    # The owner's note and the model's are never touched.
+    notes = await q(p, "select image_id, note, note_source from collection_leaves order by 1")
+    assert [(r["note"], r["note_source"]) for r in notes] == [
+        (None, None),
+        ("Vellum.", "owner"),
+        ("Rag paper.", "model"),
+    ]
+
+
+async def test_note_sweep_waits_behind_the_queue(p: Any, settings: Settings) -> None:
+    """The backlog is due later and spaced out, so work queued meanwhile is claimed first."""
+    c = await collection(p)
+    ids = [await picture(p, settings, n, e(n)) for n in (1, 2, 3)]
+    for pos, i in enumerate(ids, start=1):
+        await q(
+            p,
+            "insert into collection_leaves (image_id, collection_id, book, position)"
+            " values (%s, %s, 1, %s) returning 1",
+            i,
+            c["id"],
+            pos,
+        )
+    assert await collection_jobs.enqueue_unnoted(p) == 3
+    rows = await q(
+        p,
+        "select (payload->>'image_id')::bigint as image_id,"
+        " extract(epoch from run_after - now())::float as wait,"
+        " extract(epoch from run_after - min(run_after) over ())::float as after"
+        " from jobs where type = %s order by run_after",
+        store.NOTE_JOB,
+    )
+    assert [r["image_id"] for r in rows] == ids
+    start = collection_jobs.NOTE_SWEEP_START.total_seconds()
+    step = collection_jobs.NOTE_SWEEP_STEP.total_seconds()
+    assert start - 60 < rows[0]["wait"] <= start
+    assert [r["after"] for r in rows] == [0, step, 2 * step]
+    # An upload queued now is claimed before any of them.
+    queued = await enqueue(p, "ingest", {"path": "x"})
+    job = await claim(p)
+    assert job is not None and job.id == queued

@@ -1,0 +1,17 @@
+source,anchors,anchor_k,right_all,n_all,right_unpinned,n_unpinned,two_book_leaf
+a,old,3,6,15,3,10,meal-service-at-a-table-inside-the-initial in i
+a,old,10,4,15,2,10,meal-service-at-a-table-inside-the-initial in i
+a,new,3,6,15,2,10,meal-service-at-a-table-inside-the-initial in vii
+a,new,10,5,15,2,10,meal-service-at-a-table-inside-the-initial in vii
+b,old,3,4,15,1,10,meal-service-at-a-table-inside-the-initial in i
+b,old,10,2,15,2,10,meal-service-at-a-table-inside-the-initial in i
+b,new,3,5,15,2,10,meal-service-at-a-table-inside-the-initial in vii
+b,new,10,7,15,4,10,meal-service-at-a-table-inside-the-initial in vii
+c,old,3,4,15,2,10,meal-service-at-a-table-inside-the-initial in i
+c,old,10,2,15,2,10,meal-service-at-a-table-inside-the-initial in i
+c,new,3,6,15,3,10,meal-service-at-a-table-inside-the-initial in vii
+c,new,10,6,15,3,10,meal-service-at-a-table-inside-the-initial in vii
+d,old,3,4,15,2,10,meal-service-at-a-table-inside-the-initial in i
+d,old,10,4,15,3,10,meal-service-at-a-table-inside-the-initial in i
+d,new,3,4,15,1,10,meal-service-at-a-table-inside-the-initial in vii
+d,new,10,5,15,2,10,meal-service-at-a-table-inside-the-initial in vii

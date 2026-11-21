@@ -36,6 +36,7 @@ _PROMPT_FILES = {
     "name.prompt": "mycelium_name.md",
     "nudity.prompt": "nudity.md",
     "conservator.prompt": "conservator.md",
+    "filer.prompt": "filer.md",
 }
 KEYS = (
     "describe.model",
@@ -55,15 +56,19 @@ KEYS = (
     "nudity.prompt",
     "conservator.model",
     "conservator.prompt",
+    "filer.model",
+    "filer.prompt",
+    "filer.judge",
     "mycelium.daily_calls",
     "log.level",
     "log.keep_days",
 )
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
-PURPOSES = ("describe", "haiku", "grow", "extract", "name", "nudity", "conservator")
-# The purposes that count against mycelium.daily_calls. Describe, haiku, grow and nudity run once
-# per upload or per click; these two run from sweeps and the organism, so they are the
-# ones that could run away.
+PURPOSES = ("describe", "haiku", "grow", "extract", "name", "nudity", "conservator", "filer")
+# The purposes that count against mycelium.daily_calls. Describe, haiku, grow and nudity run
+# once per upload or per click. The filer runs once per filing, and on the owner's judge click
+# once per leaf whose question has no kept answer; filer.judge off stops both. These two run
+# from sweeps and the organism, so they are the ones that could run away.
 CAPPED_PURPOSES = ("extract", "name")
 DAILY_CALLS_DEFAULT = 400
 DAILY_CALLS_MAX = 100_000
@@ -75,6 +80,8 @@ PROVIDERS = ("openai", "openrouter", "xai")
 # only: an Anthropic model is the one that refused, or is offered by Anthropic's own
 # server-side fallback inside the same call already.
 FALLBACK_KEY = "haiku.fallback"
+# Whether a filing asks the model which book. Off, every leaf is filed by its scores alone.
+JUDGE_KEY = "filer.judge"
 # What the database log keeps (penish/logs.py). Stdout keeps its own LOG_LEVEL, so turning
 # this up fills the admin logs page without flooding docker logs.
 LOG_LEVELS = ("debug", "info", "warning", "error")
@@ -121,6 +128,10 @@ def default(key: str, settings: Settings | None = None) -> Any:
         return s.describe_model
     if key == "haiku.model":
         return s.haiku_model
+    if key == "filer.model":
+        return s.filer_model
+    if key == JUDGE_KEY:
+        return True
     if key == FALLBACK_KEY:
         return []
     if key.endswith(".effort"):
@@ -150,6 +161,10 @@ def validate(key: str, value: Any) -> Any:
         return value
     if key == FALLBACK_KEY:
         return _fallback(value)
+    if key == JUDGE_KEY:
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be true or false")
+        return value
     if key == "log.level":
         if value in LOG_LEVELS:
             return value

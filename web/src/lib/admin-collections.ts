@@ -120,9 +120,28 @@ export type Detail = Summary & {
 export type ProposedMove = {
 	image_id: number;
 	slug: string | null;
-	before: [number, number] | null;
-	after: [number, number] | null;
+	thumb: string | null;
+	before: [number, number];
+	after: [number, number];
+	// How far the leaf's new book scores above the best other book; null with no vector.
+	margin: number | null;
+	// Re-judging only: what the judge said of a move to another book; null on a shift within one.
+	reason?: string | null;
+	runner_up?: number | null;
 };
+// A dry run's answer. Sent back whole, it applies exactly these moves or is refused `changed`.
+export type Plan = { plan_id: string; moves: ProposedMove[] };
+// A leaf re-judging leaves where it is: its judged book is full (`book` set), or the judge
+// gave no judgement (`why` says what happened instead).
+export type HeldLeaf = {
+	image_id: number;
+	slug: string | null;
+	thumb: string | null;
+	before: [number, number];
+	book: number | null;
+	why: string;
+};
+export type JudgePlan = Plan & { held: HeldLeaf[] };
 
 const at = (slug: string) => `/${encodeURIComponent(slug)}`;
 
@@ -160,6 +179,12 @@ export const writeNote = (slug: string, imageId: number) =>
 export const writeMissingNotes = (slug: string) => call<Detail>('POST', `${at(slug)}/notes`, {});
 export const retry = (slug: string, imageId: number) =>
 	call<Detail>('POST', `${at(slug)}/requests/${imageId}/retry`, {});
-export const dryRun = (slug: string) =>
-	call<{ moves: ProposedMove[] }>('POST', `${at(slug)}/resort`, { dry_run: true });
-export const resort = (slug: string) => call<Detail>('POST', `${at(slug)}/resort`, { dry_run: false });
+// Refused `anchors` while a book's anchor waits for its vector; the server queues it.
+export const dryRun = (slug: string) => call<Plan>('POST', `${at(slug)}/resort`, { dry_run: true });
+export const resort = (slug: string, plan: Plan) =>
+	call<Detail>('POST', `${at(slug)}/resort`, { dry_run: false, ...plan });
+// Refused `judging` while the worker still has leaves to judge; the server queues it.
+// Refused `off` while filer.judge is off, and nothing is queued.
+export const judgeRun = (slug: string) => call<JudgePlan>('POST', `${at(slug)}/judge`, { dry_run: true });
+export const judgeApply = (slug: string, plan: Plan) =>
+	call<Detail>('POST', `${at(slug)}/judge`, { dry_run: false, plan_id: plan.plan_id, moves: plan.moves });
