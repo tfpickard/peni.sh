@@ -14,7 +14,7 @@ import secrets
 import shutil
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -710,6 +710,36 @@ async def _voted(conn: Any, order: str, cmp: str) -> list[dict[str, Any]]:
     return list(await cur.fetchall())
 
 
+async def _viewed(conn: Any, days: int) -> list[dict[str, Any]]:
+    """Most viewed live pictures over the last `days` days, with a count for each of them."""
+    cur = await conn.execute(
+        "select i.id, i.slug, i.pub_sha, i.width, i.height, sum(v.n)::int as n,"
+        " array_agg(v.day::text || ':' || v.n order by v.day) as per_day"
+        " from picture_views v join images i on i.id = v.image_id"
+        " where i.status = 'live' and i.slug is not null"
+        " and v.day > current_date - %s"
+        " group by i.id order by n desc, i.id limit 10",
+        (days,),
+    )
+    return list(await cur.fetchall())
+
+
+def _series(per_day: list[str], days: int) -> list[int]:
+    """Oldest to newest, a zero for each quiet day, so sparklines share a clock."""
+    got = {d: int(n) for d, n in (e.split(":") for e in per_day)}
+    today = datetime.now(UTC).date()
+    return [got.get((today - timedelta(days=k)).isoformat(), 0) for k in range(days - 1, -1, -1)]
+
+
+async def _hosts(conn: Any, days: int) -> list[dict[str, Any]]:
+    cur = await conn.execute(
+        "select host, sum(n)::int as n from view_referrers"
+        " where day > current_date - %s group by host order by n desc, host limit 10",
+        (days,),
+    )
+    return [{"host": r["host"], "n": r["n"]} for r in await cur.fetchall()]
+
+
 @router.get("/stats")
 async def stats(request: Request) -> dict[str, Any]:
     async with _pool(request).connection() as conn:
@@ -736,12 +766,28 @@ async def stats(request: Request) -> dict[str, Any]:
             " group by 1, 2 order by 1, 2"
         )
         usage = await cur.fetchall()
-    thumbs = _thumbs(top + bottom)
+        viewed = {d: await _viewed(conn, d) for d in (7, 30)}
+        hosts = {d: await _hosts(conn, d) for d in (7, 30)}
+    thumbs = _thumbs(top + bottom + viewed[7] + viewed[30])
 
     def pic(r: dict[str, Any]) -> dict[str, Any]:
         return {"id": r["id"], "slug": r["slug"], "thumb": thumbs[r["pub_sha"]], "net": r["net"]}
 
+    def seen(d: int) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": r["id"],
+                "slug": r["slug"],
+                "thumb": thumbs[r["pub_sha"]],
+                "n": r["n"],
+                "days": _series(r["per_day"], d),
+            }
+            for r in viewed[d]
+        ]
+
     return {
+        "viewed": {"last_7d": seen(7), "last_30d": seen(30)},
+        "referrers": {"last_7d": hosts[7], "last_30d": hosts[30]},
         "pictures": sum(by_status.values()),
         "by_status": by_status,
         "votes_total": votes_total,

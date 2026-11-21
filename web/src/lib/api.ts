@@ -157,8 +157,17 @@ export const postView = (slug: string, from: string | null) =>
 		method: 'POST',
 		keepalive: true,
 		headers: { 'x-requested-with': 'penish', 'content-type': 'application/json' },
-		body: JSON.stringify({ from })
+		// Host only; the server keeps a bare hostname or nothing, and drops its own.
+		body: JSON.stringify({ from, ref: refHost() })
 	}).then((r) => r.ok);
+
+function refHost(): string | null {
+	try {
+		return document.referrer ? new URL(document.referrer).hostname : null;
+	} catch {
+		return null;
+	}
+}
 
 export const getConfig = () => get<{ turnstile_site_key: string | null }>('/api/config');
 

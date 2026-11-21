@@ -108,7 +108,10 @@ export const retryFailed = (name: string) => post(`/queue/failed/${encodeURIComp
 export const deleteFailed = (name: string) => del(`/queue/failed/${encodeURIComponent(name)}`);
 
 export type Ranked = { id: number; slug: string; thumb: string | null; net: number };
+export type Viewed = { id: number; slug: string; thumb: string | null; n: number; days: number[] };
 export type Stats = {
+	viewed: { last_7d: Viewed[]; last_30d: Viewed[] };
+	referrers: { last_7d: { host: string; n: number }[]; last_30d: { host: string; n: number }[] };
 	pictures: number;
 	by_status: Record<string, number>;
 	votes_total: number;

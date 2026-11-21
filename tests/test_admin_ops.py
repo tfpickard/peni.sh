@@ -775,11 +775,45 @@ async def test_stats(client: httpx.AsyncClient, clean_db: str, tmp_path: Path) -
     assert len(usage["m1"]["day"]) == 10
 
 
+async def test_stats_views(client: httpx.AsyncClient, clean_db: str, tmp_path: Path) -> None:
+    a = image(clean_db, SHA_A, "a-cat")
+    b = image(clean_db, SHA_B, "b-dog")
+    try:
+        sql(
+            clean_db,
+            "insert into picture_views (image_id, day, n) values"
+            " (%s, current_date, 3), (%s, current_date - 10, 9), (%s, current_date, 1)",
+            a,
+            a,
+            b,
+        )
+        sql(
+            clean_db,
+            "insert into view_referrers (day, host, n) values"
+            " (current_date, 'x.example', 2), (current_date - 10, 'x.example', 5)",
+        )
+        body = (await client.get("/api/admin/stats")).json()
+        assert [(p["slug"], p["n"]) for p in body["viewed"]["last_7d"]] == [
+            ("a-cat", 3),
+            ("b-dog", 1),
+        ]
+        top30 = body["viewed"]["last_30d"][0]
+        assert (top30["slug"], top30["n"]) == ("a-cat", 12)
+        assert len(top30["days"]) == 30 and top30["days"][-1] == 3 and top30["days"][-11] == 9
+        assert body["viewed"]["last_7d"][0]["days"] == [0, 0, 0, 0, 0, 0, 3]
+        assert body["referrers"]["last_7d"] == [{"host": "x.example", "n": 2}]
+        assert body["referrers"]["last_30d"] == [{"host": "x.example", "n": 7}]
+    finally:
+        sql(clean_db, "truncate picture_views, view_referrers")
+
+
 async def test_stats_empty(client: httpx.AsyncClient) -> None:
     body = (await client.get("/api/admin/stats")).json()
     assert body["pictures"] == 0 and body["by_status"] == {}
     assert body["top"] == [] and body["bottom"] == [] and body["temperature_history"] == []
     assert body["api_usage"] == {"last_30d": []}
+    assert body["viewed"] == {"last_7d": [], "last_30d": []}
+    assert body["referrers"] == {"last_7d": [], "last_30d": []}
 
 
 # -- system ---------------------------------------------------------------

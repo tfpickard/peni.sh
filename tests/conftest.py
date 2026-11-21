@@ -122,7 +122,8 @@ def clean_db(database_url: str) -> str:
         conn.execute("update haikus set active = true where source = 'seed' and not active")
         conn.execute(
             "truncate jobs, corpus_stats, corpus_stats_history, settings, api_usage, heartbeats,"
-            " picture_attention, view_days, candidate_edges, edge_state, mycelium_traffic,"
+            " picture_attention, view_days, picture_views, view_referrers, candidate_edges,"
+            " edge_state, mycelium_traffic,"
             " mycelium_ticks, mycelium_tunables, colony_ticks, colony_events, colony_members,"
             " image_facets, image_extracts, served_media, offers_needs, app_log, uploads"
             " restart identity"
