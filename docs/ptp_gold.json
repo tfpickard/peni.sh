@@ -1,0 +1,97 @@
+{
+  "confirmed": false,
+  "source": "docs/ptp-and-site-pass.md, C2 (proposed, not confirmed by the owner)",
+  "leaves": {
+    "plate-one-with-one-blank-panel": {
+      "books": [
+        "iv"
+      ],
+      "why": "zodiac man"
+    },
+    "plate-vii-in-a-numbered-series": {
+      "books": [
+        "iv"
+      ],
+      "why": "zodiac body-part grid"
+    },
+    "zodiac-chart-plate-i-with-numbered-body-sections": {
+      "books": [
+        "iv"
+      ],
+      "why": "zodiac man"
+    },
+    "reference-chart-with-ten-labelled-roundels": {
+      "books": [
+        "iv"
+      ],
+      "why": "ptp-50, the signs move into an old man's body"
+    },
+    "legibility-of-label-banners-on-a-framed-map": {
+      "books": [
+        "iv"
+      ],
+      "why": "world map"
+    },
+    "listening-station-with-recording-attendants": {
+      "books": [
+        "iii"
+      ],
+      "why": "ptp-48, the listening chair"
+    },
+    "bread-being-baked-over-an-open-fire": {
+      "books": [
+        "i"
+      ],
+      "why": "the bonnacon: a bestiary beast and its use"
+    },
+    "aged-plate-with-blank-caption-panel": {
+      "books": [
+        "i"
+      ],
+      "why": "beast parts with a small man for scale"
+    },
+    "monks-harvesting-the-shell-tree-by-the-shore": {
+      "books": [
+        "ii"
+      ],
+      "why": "the barnacle tree"
+    },
+    "towel-and-slipper-racks-in-a-bathhouse-changing-room": {
+      "books": [
+        "vii"
+      ],
+      "why": "the bath"
+    },
+    "illustrated-chart-with-ten-framed-panels": {
+      "books": [
+        "vii"
+      ],
+      "why": "zm2-7, pregnant with knowledge"
+    },
+    "aged-sheet-with-handwritten-margin-notes": {
+      "books": [
+        "vii"
+      ],
+      "why": "physiognomy: men set beside beasts"
+    },
+    "plate-three-on-ruled-paper": {
+      "books": [
+        "vii"
+      ],
+      "why": "creatures housed in a man"
+    },
+    "furniture-being-moved-in-a-row": {
+      "books": [
+        "vii"
+      ],
+      "why": "the conjoined household"
+    },
+    "meal-service-at-a-table-inside-the-initial": {
+      "books": [
+        "i",
+        "vii"
+      ],
+      "why": "drolleries around a table; count either"
+    }
+  }
+}

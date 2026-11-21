@@ -1,0 +1,104 @@
+{
+  "i": {
+    "anchor": "Animals and composite creatures presented one at a time for study: their parts, habits, uses and dangers. Beasts with impossible anatomy, hybrids of fish, bird and mammal, monsters from the edges of the known world, creatures in the margins acting like people. Small human figures sometimes stand beside them for scale.",
+    "hints": [
+      "animal",
+      "beast",
+      "creature",
+      "hybrid",
+      "monster",
+      "bird",
+      "fish",
+      "serpent",
+      "drollery"
+    ]
+  },
+  "ii": {
+    "anchor": "Plants shown whole from root to flower, with seeds and cross-sections. Trees that bear creatures, people or objects as fruit, roots shaped like people, gardens and harvests of impossible crops. Gems, minerals and stones laid out in rows with their virtues.",
+    "hints": [
+      "plant",
+      "tree",
+      "root",
+      "flower",
+      "seed",
+      "fruit",
+      "harvest",
+      "garden",
+      "gem",
+      "stone"
+    ]
+  },
+  "iii": {
+    "anchor": "Devices built to be applied to the body: chairs, frames, balances, tubes, gears and basins with lettered parts. Surgery, bloodletting and cures in progress, remedies and their ingredients, a body opened, flapped or diagrammed for teaching. A patient approaches the apparatus warily while practitioners wait.",
+    "hints": [
+      "apparatus",
+      "machine",
+      "device",
+      "instrument",
+      "surgery",
+      "remedy",
+      "cure",
+      "anatomy",
+      "patient"
+    ]
+  },
+  "iv": {
+    "anchor": "The heavens and what they foretell. Spheres, rings and orbits, planets with the people they govern, constellations drawn as figures, zodiac men whose body parts are ruled by the signs, winds, maps of seas and coasts. Dreams and their meanings, omens, divination and alphabets of signs.",
+    "hints": [
+      "celestial",
+      "stars",
+      "planet",
+      "zodiac",
+      "map",
+      "cosmos",
+      "sky",
+      "dream",
+      "divination",
+      "omen"
+    ]
+  },
+  "v": {
+    "anchor": "The changing of one thing into another. Flasks and furnaces with whole scenes sealed inside them, a crowned king and queen, lions, serpents, suns and moons, sequences of small stages, laboratory work. Baths and fountains that alter whoever enters them, or fail to.",
+    "hints": [
+      "alchemy",
+      "flask",
+      "furnace",
+      "transformation",
+      "serpent",
+      "sun",
+      "moon",
+      "laboratory"
+    ]
+  },
+  "vi": {
+    "anchor": "What heaven does. Gods, saints and the many-armed one-eyed sky god acting directly: creating, judging and weighing souls, sorting the saved from the damned, working miracles and martyrdoms. Heaven and hell, relics, processions and sacred scenes that belong to no known church.",
+    "hints": [
+      "god",
+      "saint",
+      "heaven",
+      "hell",
+      "judgement",
+      "soul",
+      "miracle",
+      "martyr",
+      "relic",
+      "icon"
+    ]
+  },
+  "vii": {
+    "anchor": "What people are and what they do. The human figure shown whole and unashamed as the measure of things, set between beasts below and heaven above. Virtues and vices as persons, the soul and its housing, knowledge carried in the body, conception, pregnancy, birth and the ages of life. The household, the bath, the table, trades and guilds, custom and festival. Law, trial and ordeal, and the prescribed punishment fitted exactly to the offence, carried out calmly by magistrates and executioners while daily life goes on around it.",
+    "hints": [
+      "people",
+      "crowd",
+      "nude",
+      "bath",
+      "pregnancy",
+      "virtue",
+      "custom",
+      "law",
+      "trial",
+      "punishment",
+      "execution"
+    ]
+  }
+}
