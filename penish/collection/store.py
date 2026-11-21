@@ -1390,7 +1390,8 @@ async def store_anchor(
     # Conditional on the text: an edit while the model ran would otherwise get the old vector.
     cur = await conn.execute(
         """
-        update collection_books set anchor_embedding = %s, anchor_model = %s, anchor_dim = %s
+        update collection_books set anchor_embedding = %s, anchor_model = %s, anchor_dim = %s,
+               anchor_embedded_at = now()
          where collection_id = %s and number = %s and anchor_text = %s
         """,
         (vec, settings.embed_model, settings.embed_dim, collection_id, number, text),

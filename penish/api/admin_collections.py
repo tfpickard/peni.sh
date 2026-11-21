@@ -19,7 +19,7 @@ from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for_many
 from penish.collection import store
 from penish.collection.judge import Judgement
-from penish.collection.plan import LIMITS, Tuning
+from penish.collection.plan import LIMITS, Tuning, tag_words
 from penish.config import get_settings
 
 log = logging.getLogger(__name__)
@@ -30,7 +30,10 @@ router = APIRouter(
     include_in_schema=False,
 )
 
-_HISTORY = 50
+_HISTORY = 20
+# Filings looked back over for judge failures: enough to see a broken model, few enough
+# that one fixed an hour ago stops showing soon after.
+_JUDGED = 20
 
 
 def original_url(image_id: int) -> str:
@@ -71,11 +74,63 @@ def _thumbs(rows: list[dict[str, Any]]) -> dict[int, str | None]:
 _PICTURE = "i.id, i.slug, i.status::text as status, i.pub_sha, i.width, i.height"
 
 
-async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
+def _anchor_state(anchored: bool, waiting: bool) -> str:
+    # A vector under another model is no vector to the filer, so it waits like a missing one.
+    if anchored:
+        return "embedded"
+    return "queued" if waiting else "stale"
+
+
+def _hint_leaves(hints: list[str], leaf_tags: list[list[str]]) -> dict[str, int]:
+    """How many leaves each hint meets, matched as plan.tag_overlap matches them."""
+    words = [tag_words(t) for t in leaf_tags]
+    return {h: sum(1 for w in words if h.lower().strip() in w) for h in hints}
+
+
+async def _history(conn: Any, collection_id: int, leaf: str | None) -> list[dict[str, Any]]:
+    # A leaf is asked for by image id or by slug; an unknown one has no history.
+    where = ""
+    params: dict[str, Any] = {"c": collection_id, "n": _HISTORY}
+    if leaf is not None and leaf.strip():
+        leaf = leaf.strip()
+        where = "and (h.image_id = %(id)s or i.slug = %(slug)s)"
+        params.update(id=int(leaf) if leaf.isdigit() else None, slug=leaf)
+    cur = await conn.execute(
+        f"""
+        select h.id, h.image_id, i.slug, h.from_book, h.from_position, h.to_book,
+               h.to_position, h.reason, h.chosen_by, h.at
+          from collection_leaf_history h join images i on i.id = h.image_id
+         where h.collection_id = %(c)s {where} order by h.id desc limit %(n)s
+        """.encode(),
+        params,
+    )
+    return [{**h, "at": _iso(h["at"])} for h in await cur.fetchall()]
+
+
+async def _judge_failures(conn: Any, collection_id: int) -> dict[str, int]:
+    """Failed judgements among the latest filings, by kind. `off` is the owner's switch,
+    not a failure."""
+    cur = await conn.execute(
+        """
+        select e as error, count(*)::int as n
+          from (select h.scores->'judge'->>'error' as e from collection_leaf_history h
+                 where h.collection_id = %s and h.from_book is null and h.to_book is not null
+                 order by h.id desc limit %s) f
+         where e is not null and e <> 'off'
+         group by e order by n desc, e
+        """,
+        (collection_id, _JUDGED),
+    )
+    return {r["error"]: r["n"] for r in await cur.fetchall()}
+
+
+async def detail(conn: Any, c: dict[str, Any], leaf: str | None = None) -> dict[str, Any]:
+    """The whole collection for the admin page. `leaf` (an image id or slug) narrows the
+    history to one leaf."""
     settings = get_settings()
     cur = await conn.execute(
         """
-        select number, title, anchor_text, tag_hints,
+        select number, title, anchor_text, tag_hints, anchor_embedded_at,
                anchor_embedding is not null and anchor_model = %s and anchor_dim = %s as anchored
           from collection_books where collection_id = %s order by number
         """,
@@ -83,14 +138,23 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
     )
     books = list(await cur.fetchall())
     cur = await conn.execute(
+        "select exists (select 1 from jobs where type = %s and status in ('queued', 'running')"
+        " and payload->>'collection_id' = %s) as waiting",
+        (store.ANCHOR_JOB, str(c["id"])),
+    )
+    anchor_waiting = bool((await cur.fetchone() or {"waiting": False})["waiting"])
+    cur = await conn.execute(
         f"""
-        select {_PICTURE}, l.book, l.position, l.pinned, l.book_pinned, l.note, l.note_source
+        select {_PICTURE}, l.book, l.position, l.pinned, l.book_pinned, l.note, l.note_source,
+               coalesce((select array_agg(t.tag) from tags t where t.image_id = l.image_id),
+                        '{{}}') as tags
           from collection_leaves l join images i on i.id = l.image_id
          where l.collection_id = %s order by l.book, l.position
         """.encode(),
         (c["id"],),
     )
     leaves = list(await cur.fetchall())
+    leaf_tags = [list(r["tags"]) for r in leaves]
     cur = await conn.execute(
         f"""
         select {_PICTURE}, r.book, r.position, r.error, r.created_at,
@@ -104,16 +168,8 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
         (store.FILE_JOB, c["id"]),
     )
     requests = list(await cur.fetchall())
-    cur = await conn.execute(
-        """
-        select h.id, h.image_id, i.slug, h.from_book, h.from_position, h.to_book,
-               h.to_position, h.reason, h.at
-          from collection_leaf_history h join images i on i.id = h.image_id
-         where h.collection_id = %s order by h.id desc limit %s
-        """,
-        (c["id"], _HISTORY),
-    )
-    history = await cur.fetchall()
+    history = await _history(conn, c["id"], leaf)
+    judge_failures = await _judge_failures(conn, c["id"])
     cur = await conn.execute(
         """
         select status::text as status, last_error from jobs
@@ -168,6 +224,7 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
         "published": c["published"],
         "tuning": Tuning.from_json(c["tuning"]).to_json(),
         "tuning_default": Tuning().to_json(),
+        "tuning_limits": {k: list(v) for k, v in LIMITS.items()},
         "last_resort_at": _iso(c["last_resort_at"]),
         "resort": resort,
         "books": [
@@ -177,6 +234,10 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
                 "anchor_text": b["anchor_text"],
                 "tag_hints": b["tag_hints"],
                 "anchored": bool(b["anchored"]),
+                "anchor_state": _anchor_state(bool(b["anchored"]), anchor_waiting),
+                # Null with a vector: embedded before the time was kept.
+                "anchor_embedded_at": _iso(b["anchor_embedded_at"]),
+                "hint_leaves": _hint_leaves(list(b["tag_hints"] or ()), leaf_tags),
                 "leaves": by_book.get(b["number"], []),
             }
             for b in books
@@ -208,13 +269,14 @@ async def detail(conn: Any, c: dict[str, Any]) -> dict[str, Any]:
             }
             for u in arriving
         ],
-        "history": [{**h, "at": _iso(h["at"])} for h in history],
+        "history": history,
+        "judge_failures": judge_failures,
     }
 
 
-async def _answer(request: Request, slug: str) -> dict[str, Any]:
+async def _answer(request: Request, slug: str, leaf: str | None = None) -> dict[str, Any]:
     async with request.app.state.pool.connection() as conn:
-        return await detail(conn, await _collection(conn, slug))
+        return await detail(conn, await _collection(conn, slug), leaf)
 
 
 # -- reading ---------------------------------------------------------------------
@@ -231,8 +293,8 @@ async def list_collections(request: Request) -> dict[str, Any]:
 
 
 @router.get("/{slug}")
-async def get_collection(request: Request, slug: str) -> dict[str, Any]:
-    return await _answer(request, slug)
+async def get_collection(request: Request, slug: str, leaf: str | None = None) -> dict[str, Any]:
+    return await _answer(request, slug, leaf)
 
 
 # -- the collection and its books ---------------------------------------------------
@@ -342,7 +404,8 @@ async def edit_book(request: Request, slug: str, number: int, body: BookEdit) ->
                 # gone; the job rides the same transaction so a crash cannot lose it.
                 await conn.execute(
                     "update collection_books set anchor_text = %s, anchor_embedding = null,"
-                    " anchor_model = null, anchor_dim = null, updated_at = now()"
+                    " anchor_model = null, anchor_dim = null, anchor_embedded_at = null,"
+                    " updated_at = now()"
                     " where collection_id = %s and number = %s",
                     (text, c["id"], number),
                 )

@@ -113,7 +113,7 @@ def _unit(v: np.ndarray) -> np.ndarray | None:
     return None if n < _EPS else v / n
 
 
-def _words(tags: Iterable[str]) -> set[str]:
+def tag_words(tags: Iterable[str]) -> set[str]:
     # A hint matches a whole tag or any word of one, so `serpent` finds `coiled serpent`.
     # Tags are written with hyphens (`zodiac-man`), so a hyphen separates words as well.
     out: set[str] = set()
@@ -131,7 +131,7 @@ def tag_overlap(tags: Iterable[str], hints: Iterable[str]) -> float:
     h = {x.lower().strip() for x in hints if x.strip()}
     if not h:
         return 0.0
-    words = _words(tags)
+    words = tag_words(tags)
     if not words:
         return 0.0
     hit = len(h & words)

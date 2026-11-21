@@ -3,9 +3,13 @@ the admin surface, and the upload form's collection fields."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
+import numpy as np
 import pytest
 
+from penish.collection import store
 from penish.config import get_settings
 from tests import test_admin, test_admin_pictures
 from tests.test_admin_pictures import XHR, add, sha, sql
@@ -202,6 +206,7 @@ async def test_admin_detail(client: httpx.AsyncClient, clean_db: str) -> None:
     assert (await client.get(ADM)).json()["collections"][0]["slug"] == SLUG
     d = (await client.get(f"{ADM}/{SLUG}")).json()
     assert d["published"] is False and d["tuning"]["anchor_k"] == 10.0
+    assert d["tuning_limits"]["anchor_k"] == [0.0, 1000.0]
     assert d["books"][0]["anchor_text"].startswith("Animals and composite creatures")
     assert d["books"][0]["anchored"] is False and "creature" in d["books"][0]["tag_hints"]
     assert d["books"][1]["leaves"] == [
@@ -306,6 +311,134 @@ async def test_admin_edit_book_reembeds_anchor(client: httpx.AsyncClient, clean_
     r = await client.patch(f"{ADM}/{SLUG}/books/1", json={"title": ""})
     assert r.json()["books"][0]["title"] is None
     assert (await client.patch(f"{ADM}/{SLUG}/books/9", json={"title": "x"})).status_code == 404
+
+
+async def test_anchor_state_and_when(client: httpx.AsyncClient, clean_db: str, pool: Any) -> None:
+    anchored(clean_db)
+    # Book ii was embedded under another model; book iii has none at all.
+    sql(clean_db, "update collection_books set anchor_model = 'old' where number = 2")
+    sql(clean_db, "update collection_books set anchor_embedding = null where number = 3")
+    d = (await client.get(f"{ADM}/{SLUG}")).json()
+    states = [b["anchor_state"] for b in d["books"]]
+    assert states == ["embedded", "stale", "stale", "embedded", "embedded", "embedded", "embedded"]
+    # Embedded before the time was kept.
+    assert d["books"][0]["anchor_embedded_at"] is None
+
+    for status in ("queued", "running"):
+        sql(clean_db, "delete from jobs")
+        sql(
+            clean_db,
+            "insert into jobs (type, payload, status) values ('collection_anchor', %s, %s)",
+            f'{{"collection_id": {cid(clean_db)}}}',
+            status,
+        )
+        d = (await client.get(f"{ADM}/{SLUG}")).json()
+        assert [b["anchor_state"] for b in d["books"]][:3] == ["embedded", "queued", "queued"]
+    sql(clean_db, "update jobs set status = 'done'")
+    d = (await client.get(f"{ADM}/{SLUG}")).json()
+    assert [b["anchor_state"] for b in d["books"]][:3] == ["embedded", "stale", "stale"]
+
+    settings = get_settings()
+    async with pool.connection() as conn:
+        c = await store.collection_by_slug(conn, SLUG)
+        assert c is not None
+        text = d["books"][2]["anchor_text"]
+        assert await store.store_anchor(conn, c["id"], 3, text, np.asarray([0, 0, 1, 0]), settings)
+    d = (await client.get(f"{ADM}/{SLUG}")).json()
+    assert d["books"][2]["anchor_state"] == "embedded" and d["books"][2]["anchor_embedded_at"]
+
+    # An edit drops the vector and its time together, and queues the embedding.
+    r = await client.patch(f"{ADM}/{SLUG}/books/3", json={"anchor_text": "Other words."})
+    b = r.json()["books"][2]
+    assert (b["anchor_state"], b["anchor_embedded_at"]) == ("queued", None)
+    assert sql(clean_db, "select anchor_embedded_at from collection_books where number = 3") == [
+        (None,)
+    ]
+
+
+def tagged(dsn: str, image_id: int, *tags: str) -> None:
+    for t in tags:
+        sql(dsn, "insert into tags (image_id, tag, source) values (%s, %s, 'model')", image_id, t)
+
+
+async def test_hint_leaves_count_matching_leaves(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    b = add(clean_db, 2, vec=[0, 1, 0, 0])
+    loose = add(clean_db, 3, vec=[0, 0, 1, 0])
+    leaf(clean_db, a, 1, 1)
+    leaf(clean_db, b, 5, 1)
+    # A tag's words match as tag_overlap matches them, hyphens included; a picture that is
+    # not a leaf counts for nothing.
+    tagged(clean_db, a, "coiled serpent", "zodiac-man")
+    tagged(clean_db, b, "serpent", "alchemy lab")
+    tagged(clean_db, loose, "serpent", "flask")
+    sql(
+        clean_db,
+        "update collection_books set tag_hints = %s where number = 1",
+        ["serpent", "man", "lab", "flask", "serp"],
+    )
+    d = (await client.get(f"{ADM}/{SLUG}")).json()
+    assert d["books"][0]["hint_leaves"] == {"serpent": 2, "man": 1, "lab": 1, "flask": 0, "serp": 0}
+    assert d["books"][1]["hint_leaves"] == dict.fromkeys(d["books"][1]["tag_hints"], 0)
+
+
+async def test_history_is_the_latest_twenty_and_filters_by_leaf(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    b = add(clean_db, 2, vec=[0, 1, 0, 0])
+    for k in range(25):
+        moved(clean_db, a, (1, k + 1), (1, k + 2))
+    moved(clean_db, b, None, (2, 1))
+    sql(clean_db, "update collection_leaf_history set chosen_by = 'judge' where image_id = %s", b)
+    hist = (await client.get(f"{ADM}/{SLUG}")).json()["history"]
+    assert len(hist) == 20
+    assert (hist[0]["slug"], hist[0]["chosen_by"], hist[0]["reason"]) == (
+        "img-2",
+        "judge",
+        "resort",
+    )
+    assert hist[1]["to_position"] == 26 and hist[1]["chosen_by"] is None and hist[1]["at"]
+    for leaf_ in (str(b), "img-2"):
+        got = (await client.get(f"{ADM}/{SLUG}", params={"leaf": leaf_})).json()["history"]
+        assert [h["image_id"] for h in got] == [b]
+    got = (await client.get(f"{ADM}/{SLUG}", params={"leaf": "img-1"})).json()["history"]
+    assert len(got) == 20 and {h["image_id"] for h in got} == {a}
+    assert (await client.get(f"{ADM}/{SLUG}", params={"leaf": "nope"})).json()["history"] == []
+    assert len((await client.get(f"{ADM}/{SLUG}", params={"leaf": " "})).json()["history"]) == 20
+
+
+async def test_judge_failures_among_recent_filings(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    assert (await client.get(f"{ADM}/{SLUG}")).json()["judge_failures"] == {}
+
+    def filed(n: int, error: str | None, at: tuple[int, int] | None = None) -> None:
+        i = add(clean_db, n, vec=[1, 0, 0, 0])
+        sql(
+            clean_db,
+            "insert into collection_leaf_history (image_id, collection_id, from_book,"
+            " from_position, to_book, to_position, reason, chosen_by, scores)"
+            " values (%s, %s, %s, %s, 1, %s, 'auto', 'score', %s)",
+            i,
+            cid(clean_db),
+            at[0] if at else None,
+            at[1] if at else None,
+            n,
+            f'{{"judge": {{"error": "{error}"}}}}' if error else '{"best": 1}',
+        )
+
+    # The oldest failure falls out of the last twenty filings; a move is not a filing.
+    filed(1, "error")
+    for n, e in enumerate(["refused", "timeout", "off", None, "refused"], start=2):
+        filed(n, e)
+    for n in range(7, 22):
+        filed(n, None)
+    filed(22, "invalid", at=(2, 1))
+    assert (await client.get(f"{ADM}/{SLUG}")).json()["judge_failures"] == {
+        "refused": 2,
+        "timeout": 1,
+    }
 
 
 async def test_admin_request_move_pin_unfile(client: httpx.AsyncClient, clean_db: str) -> None:

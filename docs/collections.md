@@ -256,6 +256,9 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   `owner`, `judge`) and `scores` (jsonb), set on the row where a leaf's book was decided:
   a filing, an owner move, a re-sort or re-judging that changes its book.
 - `migrations/025_collection_judgements.sql` keeps the judge's answers (see "The judge").
+- `migrations/026_anchor_embedded_at.sql` gives each book `anchor_embedded_at`, set with
+  the vector and cleared with it on an anchor edit. Null with a vector means embedded
+  before the time was kept.
 - `migrations/019_collection_text.sql` adds the owner text and the note's provenance;
   `020_seed_pansophicon_text.sql` seeds the Pansophicon's text, filling only what is still
   empty. Tests re-apply 018 and 020 between runs.
@@ -421,6 +424,12 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
 - `/admin/collections` has `judge` beside the dry run (it asks again every few seconds
   while the answer is `judging`) and `apply`, which sends the shown plan back. The moves
   list shows the reason beside a book move; held leaves follow it.
+- The admin's `GET .../<slug>` carries, per book, `anchor_state` (`embedded` under
+  today's model; `queued`, no usable vector and a `collection_anchor` job queued or
+  running; `stale` otherwise), `anchor_embedded_at` and `hint_leaves` (each hint with the
+  number of leaves it meets, matched as `tag_overlap` matches); `history`, the newest 20
+  rows with `chosen_by`, narrowed by `?leaf=` (image id or slug); and `judge_failures`,
+  the failed judgements among the last 20 filings by kind (`off` is not a failure).
 - `explain` returns `judged` (the judge chose its book), `filed.scores.judge` for a judged
   filing, and `judgement`: the kept answer for the leaf as it is now, or null.
 
