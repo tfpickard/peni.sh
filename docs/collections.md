@@ -292,8 +292,9 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   every leaf with none (`write missing notes`). A plain job and an asked-for rewrite have
   separate dedupe keys, so the rewrite never folds into a job that would keep the old note.
 - Worker start queues a note for every leaf with none and no note job on record (done or
-  failed), so the backlog is noted once and a leaf the model keeps refusing is not paid for
-  at every restart.
+  failed), the first five minutes out and the rest 30 seconds apart, so uploads, filings and
+  judging queued meanwhile are claimed first. The backlog is noted once, and a leaf the
+  model keeps refusing is not paid for at every restart.
 - Owner wins twice: the job skips a leaf with an owner note, and the model's write is an
   update conditional on `note_source` not being `owner`, so an owner note saved while the
   model ran stands. Clearing an owner note (saving it empty) hands the leaf back.
@@ -371,20 +372,25 @@ Vectors file by what a picture looks like, and pictures of one medium look alike
 they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and names its book.
 
 - `penish/collection/judge.py`, prompt `penish/prompts/filer.md`. One text-only call: the
-  caption, description and analysis (`image_texts`), and each book the leaf may enter
-  (every book with room, and its own) with its number, title and anchor text. It answers
+  caption, description and analysis (`image_texts`), and every book of the collection, full
+  or not, with its number, title and anchor text. It answers
   `{"book", "runner_up", "reason"}`, books as roman numerals. The prompt files by subject,
   never by medium, technique, style or layout; what heaven does is vi, what people do is
   vii even in heaven's name, and what people do in baths is vii.
-- An answer is a judgement only when both books are open to the leaf and differ, and the
-  reason is one line of at most 200 characters with no em dash. Anything else, a refusal,
-  an error or no answer in 60 seconds is a failure, and the filing goes by score.
+- An answer is a judgement only when both books are the collection's and differ, and the
+  reason is one line of at most 200 characters (an em dash in it is made `--`). Anything
+  else, a refusal, an error or no answer in 60 seconds is a failure, and the filing goes by
+  score. Whether the named book has room is checked after the answer: a filing into a full
+  book goes by score with `full`, and re-judging holds the leaf with `full`.
 - Settings on `/admin/models`: `filer.model` (default `claude-haiku-5-5`, the
   `FILER_MODEL` env var; Haiku did best in the trial and costs least), `filer.prompt`, and
-  `filer.judge` (on by default; off, nothing asks). Usage is recorded under `filer`.
+  `filer.judge` (on by default; off, nothing asks: a filing goes by score, the re-judging
+  dry run answers 409 `off` and queues nothing, and a `collection_judge` job already queued
+  returns without asking). Usage is recorded under `filer`.
 - `collection_judgements` keeps every answer by collection, picture and `input_hash`:
-  sha256 over the model, the prompt, the three texts and each open book's number, title and
-  anchor text. The same question is never paid for twice. A failure is kept too, so a dry
+  sha256 over the model, the prompt, the three texts and every book's number, title and
+  anchor text. A book filling or emptying does not change it. The same question is never
+  paid for twice. A failure is kept too, so a dry
   run can say why; a refusal is never asked again, the other failures are asked again the
   next time the question comes up. Change a text, a title, an anchor, the model or the
   prompt and it is a new question.
@@ -394,7 +400,7 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
   `chosen_by='judge'`, and `scores` keeps the weighing with `judge: {model, book,
   runner_up, reason}`. Otherwise the scores choose, and `scores.judge` says why not
   (`{error: "off" | "no text" | "refused" | "invalid" | "timeout" | "error" | "full"}`,
-  `full` being a book that filled between the answer and the lock), with a log line. The
+  `full` being a book with no room when the lock is taken), with a log line. The
   slot within the book is chosen as before. An owner's book never asks.
 - A leaf whose latest book decision in history is `judge` keeps its book in every vector
   re-sort, the owner's and the weekly one, as a `book_pinned` leaf does; it may still move

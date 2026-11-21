@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from penish import runtime
 from penish.config import get_settings
 from penish.worker import collection_jobs
 from penish.worker.jobs import Job
@@ -224,6 +225,16 @@ async def test_rejudge_apply_refuses_a_changed_collection(
     assert sql(clean_db, "select count(*) from collection_leaf_history") == [(0,)]
     r = await client.post(f"{ADM}/{SLUG}/judge", headers=XHR, json={"dry_run": False})
     assert r.status_code == 422
+
+
+async def test_rejudge_is_off_when_the_judge_is(
+    client: httpx.AsyncClient, clean_db: str, pool: Any
+) -> None:
+    collection_of_seven(clean_db)
+    await runtime.put(pool, "filer.judge", False)
+    r = await dry(client)
+    assert (r.status_code, r.json()) == (409, {"detail": "off"})
+    assert sql(clean_db, "select type from jobs") == []
 
 
 async def test_rejudge_waits_for_anchors(client: httpx.AsyncClient, clean_db: str) -> None:

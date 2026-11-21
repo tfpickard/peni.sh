@@ -557,13 +557,17 @@ async def judge(request: Request, slug: str, body: Resort) -> dict[str, Any]:
     the re-sort: a dry run answers the plan and its id, and both sent back apply exactly
     that plan or are refused `changed`. The judgements come from the worker, which holds
     the keys: a dry run with any leaf not yet judged is refused `judging` and the judging
-    queued, so the same dry run a little later has them all."""
+    queued, so the same dry run a little later has them all. With filer.judge off it is
+    refused `off` and nothing is queued."""
     settings = get_settings()
     pool = request.app.state.pool
     get = runtime.getter(pool, settings)
     async with pool.connection() as conn:
         c = await _collection(conn, slug)
         if body.dry_run:
+            if not await get(runtime.JUDGE_KEY):
+                # The dry run is what queues the paid asking, so the switch stops it here.
+                raise HTTPException(status_code=409, detail="off")
             try:
                 plan = await store.judge_plan(conn, c, settings, get)
             except (store.AnchorsWaiting, store.Judging) as e:

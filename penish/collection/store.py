@@ -21,7 +21,7 @@ from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
 from penish.collection import judge
-from penish.collection.judge import Failed, Judgement, OpenBook, Texts, Verdict
+from penish.collection.judge import Failed, Judgement, ShownBook, Texts, Verdict
 from penish.collection.numerals import parse_line, roman
 from penish.collection.plan import (
     Book,
@@ -740,24 +740,19 @@ async def book_texts(conn: Conn, collection_id: int) -> dict[int, tuple[str | No
     return {r["number"]: (r["title"], r["anchor_text"]) for r in await cur.fetchall()}
 
 
-def open_books(
-    state: State, image_id: int, texts: Mapping[int, tuple[str | None, str]]
-) -> list[OpenBook]:
-    """The books a picture may enter, as choose_book sees them: every book with room, and
-    the one it is in already however full."""
-    own = state.leaf(image_id)
+def shown_books(state: State, texts: Mapping[int, tuple[str | None, str]]) -> list[ShownBook]:
+    """Every book of the collection, full or not, as the judge is shown it. Room is
+    checked after the answer: store.choose and judge_plan both hold a full book's leaf."""
     out = []
     for b in state.shape.books:
-        mine = own is not None and own.book == b.number
-        if mine or state.occupied(b.number, besides=image_id) < state.shape.cap:
-            title, anchor = texts.get(b.number, (None, ""))
-            out.append(OpenBook(b.number, title, anchor))
+        title, anchor = texts.get(b.number, (None, ""))
+        out.append(ShownBook(b.number, title, anchor))
     return out
 
 
 async def filing_inputs(
     conn: Conn, image_id: int, collection_id: int, settings: Settings
-) -> tuple[Texts, list[OpenBook]] | None:
+) -> tuple[Texts, list[ShownBook]] | None:
     """What the judge is asked before a filing, read without the lock so the call never
     holds it. None when there is nothing to ask: no request, an owner's book, a picture
     already filed, or no book with room."""
@@ -772,9 +767,9 @@ async def filing_inputs(
     state = await load(conn, collection, settings)
     if state.leaf(image_id) is not None:
         return None
-    books = open_books(state, image_id, await book_texts(conn, collection_id))
-    if not books:
+    if all(state.occupied(b.number) >= state.shape.cap for b in state.shape.books):
         return None
+    books = shown_books(state, await book_texts(conn, collection_id))
     texts = (await judge.texts_of(conn, [image_id])).get(image_id, Texts())
     return texts, books
 
@@ -783,7 +778,7 @@ async def filing_inputs(
 class Question:
     image_id: int
     texts: Texts
-    books: list[OpenBook]
+    books: list[ShownBook]
 
 
 async def questions(conn: Conn, state: State) -> tuple[list[Question], dict[int, str]]:
@@ -801,7 +796,7 @@ async def questions(conn: Conn, state: State) -> tuple[list[Question], dict[int,
         elif not t.any():
             skipped[x.image_id] = "no text"
         else:
-            asks.append(Question(x.image_id, t, open_books(state, x.image_id, meta)))
+            asks.append(Question(x.image_id, t, shown_books(state, meta)))
     return asks, skipped
 
 
@@ -1004,7 +999,7 @@ async def explain(
     judgement: dict[str, Any] | None = None
     if get is not None:
         texts = (await judge.texts_of(conn, [image_id])).get(image_id, Texts())
-        books = open_books(state, image_id, await book_texts(conn, collection["id"]))
+        books = shown_books(state, await book_texts(conn, collection["id"]))
         found, _ = await _kept(conn, state, [Question(image_id, texts, books)], get)
         v = found.get(image_id)
         judgement = v.to_json() if v is not None else None

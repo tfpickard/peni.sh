@@ -65,9 +65,10 @@ KEYS = (
 )
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 PURPOSES = ("describe", "haiku", "grow", "extract", "name", "nudity", "conservator", "filer")
-# The purposes that count against mycelium.daily_calls. Describe, haiku, grow, nudity and the
-# filer run once per upload or per click; these two run from sweeps and the organism, so they
-# are the ones that could run away.
+# The purposes that count against mycelium.daily_calls. Describe, haiku, grow and nudity run
+# once per upload or per click. The filer runs once per filing, and on the owner's judge click
+# once per leaf whose question has no kept answer; filer.judge off stops both. These two run
+# from sweeps and the organism, so they are the ones that could run away.
 CAPPED_PURPOSES = ("extract", "name")
 DAILY_CALLS_DEFAULT = 400
 DAILY_CALLS_MAX = 100_000

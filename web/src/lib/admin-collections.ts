@@ -184,6 +184,7 @@ export const dryRun = (slug: string) => call<Plan>('POST', `${at(slug)}/resort`,
 export const resort = (slug: string, plan: Plan) =>
 	call<Detail>('POST', `${at(slug)}/resort`, { dry_run: false, ...plan });
 // Refused `judging` while the worker still has leaves to judge; the server queues it.
+// Refused `off` while filer.judge is off, and nothing is queued.
 export const judgeRun = (slug: string) => call<JudgePlan>('POST', `${at(slug)}/judge`, { dry_run: true });
 export const judgeApply = (slug: string, plan: Plan) =>
 	call<Detail>('POST', `${at(slug)}/judge`, { dry_run: false, plan_id: plan.plan_id, moves: plan.moves });

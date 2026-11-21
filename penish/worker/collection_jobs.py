@@ -176,8 +176,12 @@ async def handle_judge(
     client: Any = None,
 ) -> None:
     """A judgement for every leaf the owner's re-judging will ask about, so its dry run can
-    plan from kept answers alone. A kept judgement or refusal is not asked again."""
+    plan from kept answers alone. A kept judgement or refusal is not asked again. Nothing
+    is asked once filer.judge is off, though the job was queued while it was on."""
     collection_id = _int(job, "collection_id")
+    if not await runtime.get(pool, runtime.JUDGE_KEY, settings=settings):
+        log.info("collection %s: judge is off, nothing judged", collection_id)
+        return
     async with pool.connection() as conn:
         collection = await store.collection_by_id(conn, collection_id)
         if collection is None:
@@ -238,6 +242,14 @@ async def enqueue_anchors(pool: Pool, settings: Settings) -> int:
         return cur.rowcount
 
 
+# The note sweep's jobs start this far out and come due this far apart, so uploads, filings
+# and the owner's judging queued meanwhile are claimed first: the queue orders by
+# run_after, and a backlog already due would sit in front of them. A note is one paid
+# vision call; spaced wider than it takes, the backlog never piles up past due.
+NOTE_SWEEP_START = timedelta(minutes=5)
+NOTE_SWEEP_STEP = timedelta(seconds=30)
+
+
 async def enqueue_unnoted(pool: Pool) -> int:
     """A conservator's note for every leaf with none, the job filing would have queued.
     Run at worker start, so leaves filed before notes existed, or whose job was lost, are
@@ -247,11 +259,14 @@ async def enqueue_unnoted(pool: Pool) -> int:
     async with pool.connection() as conn:
         cur = await conn.execute(
             f"""
-            insert into jobs (type, payload, dedupe_key)
+            insert into jobs (type, payload, dedupe_key, run_after)
             select '{store.NOTE_JOB}',
                    jsonb_build_object('image_id', l.image_id, 'collection_id', l.collection_id,
                                       'rewrite', false),
-                   '{store.NOTE_JOB}:' || l.image_id || ':' || l.collection_id
+                   '{store.NOTE_JOB}:' || l.image_id || ':' || l.collection_id,
+                   now() + %(start)s
+                         + %(step)s * (row_number() over (
+                                         order by l.collection_id, l.book, l.position) - 1)
               from collection_leaves l
              where l.note is null
                and not exists (select 1 from jobs j
@@ -260,7 +275,8 @@ async def enqueue_unnoted(pool: Pool) -> int:
                                   and j.payload->>'collection_id' = l.collection_id::text)
              order by l.collection_id, l.book, l.position
             on conflict do nothing
-            """
+            """,
+            {"start": NOTE_SWEEP_START, "step": NOTE_SWEEP_STEP},
         )
         return cur.rowcount
 

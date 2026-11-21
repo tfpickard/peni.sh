@@ -39,20 +39,28 @@ def _apply_migrations(dsn: str) -> None:
 
 class _NoModel:
     """The filer's judge as tests meet it unless they hand it a fake: the environment may
-    hold a real key, and a filing must not spend it."""
+    hold a real key, and a filing must not spend it. Raising alone would prove nothing,
+    since the judge turns any exception into a failed judgement and files by score, so
+    every call is noted and the test fails at teardown."""
 
-    def __init__(self) -> None:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
         self.messages = self
 
     async def create(self, **kw: object) -> object:
+        self.calls.append(str(kw.get("model")))
         raise AssertionError("a real model call in a test")
 
 
 @pytest.fixture(autouse=True)
-def _no_real_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+def _no_real_judge(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     from penish.collection import judge
 
-    monkeypatch.setattr(judge, "default_client", lambda settings: _NoModel())
+    calls: list[str] = []
+    monkeypatch.setattr(judge, "default_client", lambda settings: _NoModel(calls))
+    yield calls
+    if calls:
+        pytest.fail(f"a real model call in a test: {calls}", pytrace=False)
 
 
 @pytest.fixture(scope="session")

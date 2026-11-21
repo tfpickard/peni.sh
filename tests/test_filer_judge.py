@@ -13,7 +13,7 @@ import pytest
 
 from penish import runtime
 from penish.collection import judge, store
-from penish.collection.judge import Failed, Judgement, OpenBook, Texts
+from penish.collection.judge import Failed, Judgement, ShownBook, Texts
 from penish.config import Settings
 from penish.worker import collection_jobs
 from penish.worker.jobs import Job
@@ -31,9 +31,9 @@ from tests.test_collections_worker import (  # noqa: F401
 from tests.test_ingest import FakeEmbedder, q
 
 BOOKS = [
-    OpenBook(1, None, "Animals and composite creatures presented one at a time."),
-    OpenBook(4, "Of the Sky", "The heavens and what they foretell."),
-    OpenBook(7, None, "What people are and what they do."),
+    ShownBook(1, None, "Animals and composite creatures presented one at a time."),
+    ShownBook(4, "Of the Sky", "The heavens and what they foretell."),
+    ShownBook(7, None, "What people are and what they do."),
 ]
 TEXTS = Texts(
     caption="the signs move in",
@@ -108,7 +108,7 @@ def test_prompt_holds_the_rules() -> None:
         assert word not in text.lower()
 
 
-def test_render_shows_the_open_books_and_the_three_texts() -> None:
+def test_render_shows_the_books_and_the_three_texts() -> None:
     text = judge.render(TEXTS, BOOKS)
     for want in (
         "book i\nAnimals and composite creatures presented one at a time.",
@@ -119,11 +119,12 @@ def test_render_shows_the_open_books_and_the_three_texts() -> None:
         "Analysis:\nSubject: an old man whose limbs are labelled with the twelve signs.",
     ):
         assert want in text, want
-    # Only the books given: a full book is not offered.
+    assert "The leaf goes into one of them" in text
+    # Only the books given.
     assert "book ii" not in text and "book v\n" not in text
     # The books come before the leaf, so the leaf is read against them.
     assert text.index("book vii") < text.index("Caption:")
-    # The enum offers exactly the open books.
+    # The enum offers exactly the books given.
     props = judge.schema(BOOKS)["properties"]
     assert props["book"]["enum"] == ["i", "iv", "vii"] == props["runner_up"]["enum"]
 
@@ -142,18 +143,23 @@ def test_check_takes_a_good_answer() -> None:
     ) == (4, 7, "A man the signs govern.")
 
 
+def test_check_makes_an_em_dash_two_hyphens() -> None:
+    # The answer is paid for; the dash is converted, not a reason to ask again.
+    raw = {"book": "iv", "runner_up": "i", "reason": "A man \u2014 governed."}
+    assert judge.check(raw, BOOKS) == (4, 1, "A man -- governed.")
+
+
 @pytest.mark.parametrize(
     ("raw", "why"),
     [
-        ({"book": "ix", "runner_up": "i", "reason": "x"}, "not open"),
+        ({"book": "ix", "runner_up": "i", "reason": "x"}, "no book 9"),
         ({"book": "book iv", "runner_up": "i", "reason": "x"}, "no book"),
-        # Book ii exists but is not open to this leaf.
-        ({"book": "ii", "runner_up": "i", "reason": "x"}, "not open"),
-        ({"book": "iv", "runner_up": "ii", "reason": "x"}, "not open"),
+        # A book that is not among those given.
+        ({"book": "ii", "runner_up": "i", "reason": "x"}, "no book 2"),
+        ({"book": "iv", "runner_up": "ii", "reason": "x"}, "no book 2"),
         ({"book": "iv", "runner_up": "iv", "reason": "x"}, "the same"),
         ({"book": "iv", "runner_up": "i", "reason": "   "}, "empty reason"),
         ({"book": "iv", "runner_up": "i", "reason": "a" * 201}, "201 characters"),
-        ({"book": "iv", "runner_up": "i", "reason": "A man \u2014 governed."}, "em dash"),
     ],
 )
 def test_check_refuses(raw: dict[str, str], why: str) -> None:
@@ -169,7 +175,6 @@ def test_check_refuses(raw: dict[str, str], why: str) -> None:
         reply("iv", "iv"),
         reply("iv", "i", ""),
         reply("iv", "i", "a" * 300),
-        reply("iv", "i", "A man \u2014 governed."),
         '{"book": "iv", "runner_up": "i"}',
         '{"book": "iv", "runner_up": "i", "reason": "x", "medium": "woodcut"}',
         "the fourth book",
@@ -214,8 +219,8 @@ def test_input_hash_names_the_question() -> None:
         judge.input_hash("m2", "p", TEXTS, BOOKS),
         judge.input_hash("m", "p2", TEXTS, BOOKS),
         judge.input_hash("m", "p", Texts(TEXTS.caption, TEXTS.description, "x"), BOOKS),
-        judge.input_hash("m", "p", TEXTS, [*BOOKS[:2], OpenBook(7, None, "changed")]),
-        judge.input_hash("m", "p", TEXTS, [*BOOKS[:2], OpenBook(7, "Of Man", BOOKS[2].anchor)]),
+        judge.input_hash("m", "p", TEXTS, [*BOOKS[:2], ShownBook(7, None, "changed")]),
+        judge.input_hash("m", "p", TEXTS, [*BOOKS[:2], ShownBook(7, "Of Man", BOOKS[2].anchor)]),
         judge.input_hash("m", "p", TEXTS, BOOKS[:2]),
     ]
     assert h not in others and len(set(others)) == len(others)
@@ -423,13 +428,13 @@ async def test_the_same_question_is_asked_once(p: Any, settings: Settings) -> No
     a = await picture(p, settings, 1, e(0))
     client = FakeJudge(GOOD, reply("i", "iv"), reply("vii", "iv"), REFUSE)
 
-    async def ask(books: list[OpenBook] = BOOKS) -> judge.Verdict:
+    async def ask(books: list[ShownBook] = BOOKS) -> judge.Verdict:
         return await judge.judged(p, c["id"], a, TEXTS, books, settings=settings, client=client)
 
     first = await ask()
     assert await ask() == first and len(client.calls) == 1
     # Another anchor text is another question.
-    changed = [*BOOKS[:2], OpenBook(7, None, "What people do.")]
+    changed = [*BOOKS[:2], ShownBook(7, None, "What people do.")]
     assert (await ask(changed)).book == 1  # type: ignore[union-attr]
     assert await ask(changed) == Judgement(1, 4, "A man the signs govern.", "claude-haiku-5-5")
     assert len(client.calls) == 2
@@ -537,3 +542,153 @@ async def test_the_judge_job_asks_once_per_leaf(p: Any, settings: Settings) -> N
     assert len(client.calls) == 2 and client.locks == [0, 0]
     rows = await q(p, "select image_id from collection_judgements order by image_id")
     assert [r["image_id"] for r in rows] == [a, b]
+
+
+async def test_the_judge_job_asks_nothing_when_off(p: Any, settings: Settings) -> None:
+    """Queued while the judge was on, run after it was turned off: nothing is paid for."""
+    await anchors(p, settings)
+    c = await collection(p)
+    a = await picture(p, settings, 1, e(0))
+    await texts(p, a)
+    await q(
+        p,
+        "insert into collection_leaves (image_id, collection_id, book, position)"
+        " values (%s, %s, 1, 1) returning 1",
+        a,
+        c["id"],
+    )
+    await runtime.put(p, "filer.judge", False)
+    job = Job(
+        id=0,
+        type=store.JUDGE_JOB,
+        payload={"collection_id": c["id"]},
+        attempts=1,
+        last_error=None,
+    )
+    client = FakeJudge()
+    await collection_jobs.handle_judge(
+        job, pool=p, settings=settings, embedder=FakeEmbedder(), client=client
+    )
+    assert client.calls == []
+    assert await q(p, "select id from collection_judgements") == []
+
+
+# -- fullness is the filing's business, not the question's ------------------------------
+
+
+async def test_a_book_filling_leaves_every_question_alone(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    await q(p, "update collections set leaves_per_book = 1 returning 1")
+    c = await collection(p)
+    a = await requested(p, settings, 1, e(0))
+    filed = await picture(p, settings, 2, e(1))
+    await texts(p, filed)
+    await q(
+        p,
+        "insert into collection_leaves (image_id, collection_id, book, position)"
+        " values (%s, %s, 1, 1) returning 1",
+        filed,
+        c["id"],
+    )
+
+    async def hashes() -> tuple[str, str]:
+        async with p.connection() as conn:
+            inputs = await store.filing_inputs(conn, a, c["id"], settings)
+            assert inputs is not None
+            asks, _ = await store.questions(conn, await store.load(conn, c, settings))
+        (ask,) = asks
+        assert len(inputs[1]) == len(ask.books) == 7
+        return (
+            judge.input_hash("m", "p", *inputs),
+            judge.input_hash("m", "p", ask.texts, ask.books),
+        )
+
+    before = await hashes()
+    # Book iv fills, then empties again.
+    other = await picture(p, settings, 3, e(3))
+    await q(
+        p,
+        "insert into collection_leaves (image_id, collection_id, book, position)"
+        " values (%s, %s, 4, 1) returning 1",
+        other,
+        c["id"],
+    )
+    assert await hashes() == before
+    await q(p, "delete from collection_leaves where image_id = %s returning 1", other)
+    assert await hashes() == before
+
+
+async def test_a_full_book_is_shown_and_its_judgement_falls_back(
+    p: Any, settings: Settings
+) -> None:
+    await anchors(p, settings)
+    await q(p, "update collections set leaves_per_book = 1 returning 1")
+    c = await collection(p)
+    other = await picture(p, settings, 2, e(3))
+    await q(
+        p,
+        "insert into collection_leaves (image_id, collection_id, book, position)"
+        " values (%s, %s, 4, 1) returning 1",
+        other,
+        c["id"],
+    )
+    a = await requested(p, settings, 1, e(0))
+    client = FakeJudge(GOOD)
+    await file_with(p, settings, a, client)
+    told = client.calls[0]["messages"][0]["content"][0]["text"]
+    assert "book iv" in told
+    assert (await leaves(p))[a][0] == 1
+    row = await filed_row(p, a)
+    assert (row["chosen_by"], row["to_book"]) == ("score", 1)
+    assert row["scores"]["judge"]["error"] == "full"
+
+
+async def test_rejudging_holds_a_leaf_judged_into_a_full_book(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    await q(p, "update collections set leaves_per_book = 1 returning 1")
+    c = await collection(p)
+    a = await picture(p, settings, 1, e(0))
+    b = await picture(p, settings, 2, e(3))
+    for i, book in ((a, 1), (b, 4)):
+        await texts(p, i)
+        await q(
+            p,
+            "insert into collection_leaves (image_id, collection_id, book, position)"
+            " values (%s, %s, %s, 1) returning 1",
+            i,
+            c["id"],
+            book,
+        )
+    job = Job(
+        id=0,
+        type=store.JUDGE_JOB,
+        payload={"collection_id": c["id"]},
+        attempts=1,
+        last_error=None,
+    )
+    client = FakeJudge(GOOD, GOOD)
+    await collection_jobs.handle_judge(
+        job, pool=p, settings=settings, embedder=FakeEmbedder(), client=client
+    )
+    assert all("book iv" in x["messages"][0]["content"][0]["text"] for x in client.calls)
+    async with p.connection() as conn:
+        plan = await store.judge_plan(conn, c, settings, runtime.getter(p, settings))
+    assert [(h.image_id, h.before, h.book, h.why) for h in plan.held] == [(a, (1, 1), 4, "full")]
+    assert all(m.image_id != a or m.after == (1, 1) for m in plan.moves)
+
+
+# -- the guard against paying from a test ------------------------------------------------
+
+
+async def test_the_guard_notes_a_real_call(
+    p: Any, settings: Settings, request: pytest.FixtureRequest
+) -> None:
+    """The judge swallows the guard's exception, so the guard counts calls instead."""
+    calls = request.getfixturevalue("_no_real_judge")
+    c = await collection(p)
+    a = await picture(p, settings, 1, e(0))
+    v = await judge.judged(p, c["id"], a, TEXTS, BOOKS, settings=settings)
+    assert isinstance(v, Failed) and v.error == "error"
+    assert calls == ["claude-haiku-5-5"]
+    # Cleared, or this test would fail at teardown as the guard means any other to.
+    calls.clear()

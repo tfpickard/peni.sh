@@ -9,10 +9,11 @@ from typing import Any
 import numpy as np
 import pytest
 
+from penish import runtime
 from penish.collection import store
 from penish.config import Settings
 from penish.worker import collection_jobs, unpublish
-from penish.worker.jobs import Job, SoftError
+from penish.worker.jobs import Job, SoftError, claim, enqueue
 from tests.test_ingest import DIM, FakeEmbedder, drop, png, q, run
 
 SLUG = "pansophicon"
@@ -172,6 +173,9 @@ async def test_sidecar_on_a_retried_ingest_fails_once(p: Any, settings: Settings
 
 
 async def test_auto_filing_from_a_bare_sidecar(p: Any, settings: Settings) -> None:
+    # The ingest wrote the picture's text, so the judge would be asked; these are the
+    # scores' tests, and the judge has its own.
+    await runtime.put(p, "filer.judge", False)
     await run(drop(settings, "drolly", png(4), collection="pansophicon"), p, settings)
     img = (await q(p, "select id from images"))[0]
     await file(p, settings, img["id"])
@@ -550,3 +554,36 @@ async def test_note_sweep(p: Any, settings: Settings) -> None:
         ("Vellum.", "owner"),
         ("Rag paper.", "model"),
     ]
+
+
+async def test_note_sweep_waits_behind_the_queue(p: Any, settings: Settings) -> None:
+    """The backlog is due later and spaced out, so work queued meanwhile is claimed first."""
+    c = await collection(p)
+    ids = [await picture(p, settings, n, e(n)) for n in (1, 2, 3)]
+    for pos, i in enumerate(ids, start=1):
+        await q(
+            p,
+            "insert into collection_leaves (image_id, collection_id, book, position)"
+            " values (%s, %s, 1, %s) returning 1",
+            i,
+            c["id"],
+            pos,
+        )
+    assert await collection_jobs.enqueue_unnoted(p) == 3
+    rows = await q(
+        p,
+        "select (payload->>'image_id')::bigint as image_id,"
+        " extract(epoch from run_after - now())::float as wait,"
+        " extract(epoch from run_after - min(run_after) over ())::float as after"
+        " from jobs where type = %s order by run_after",
+        store.NOTE_JOB,
+    )
+    assert [r["image_id"] for r in rows] == ids
+    start = collection_jobs.NOTE_SWEEP_START.total_seconds()
+    step = collection_jobs.NOTE_SWEEP_STEP.total_seconds()
+    assert start - 60 < rows[0]["wait"] <= start
+    assert [r["after"] for r in rows] == [0, step, 2 * step]
+    # An upload queued now is claimed before any of them.
+    queued = await enqueue(p, "ingest", {"path": "x"})
+    job = await claim(p)
+    assert job is not None and job.id == queued

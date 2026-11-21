@@ -2,8 +2,9 @@
 
 Vectors place pictures by what they look like, and pictures of one medium look alike
 whatever they show. The judge reads the caption, the description and the analysis beside
-each open book's title and anchor, and names a book by subject. The vector scores still
-place the leaf within its book, and stand in whenever the judge is off, fails or refuses.
+each of the collection's books with its title and anchor, and names a book by subject. The
+vector scores still place the leaf within its book, and stand in whenever the judge is off,
+fails or refuses, or names a book with no room.
 
 Every answer is kept by what was asked (`input_hash`), so the same question is never paid
 for twice. Nothing here takes a lock or writes a leaf: the caller asks first, then files.
@@ -75,8 +76,10 @@ class Texts:
 
 
 @dataclass(frozen=True)
-class OpenBook:
-    """A book the leaf may enter, as the judge is shown it."""
+class ShownBook:
+    """A book of the collection as the judge is shown it. Every book is shown, full or
+    not: a book filling would otherwise change every leaf's question and void every kept
+    answer. Whether the named book has room is the filing's business, after the answer."""
 
     number: int
     title: str | None
@@ -127,9 +130,9 @@ def default_client(settings: Settings) -> Any:
 # -- the question ------------------------------------------------------------------
 
 
-def render(texts: Texts, books: Iterable[OpenBook]) -> str:
+def render(texts: Texts, books: Iterable[ShownBook]) -> str:
     """The user turn: the books first, so the leaf is read against them."""
-    lines = ["The books this leaf may enter:", ""]
+    lines = ["The books of the codex. The leaf goes into one of them:", ""]
     for b in sorted(books, key=lambda x: x.number):
         head = f"book {roman(b.number)}"
         lines.append(f"{head}: {b.title}" if b.title else head)
@@ -146,8 +149,8 @@ def render(texts: Texts, books: Iterable[OpenBook]) -> str:
     return "\n".join(lines)
 
 
-def schema(books: Iterable[OpenBook]) -> dict[str, Any]:
-    # The open books as an enum, so a model that honours the schema cannot name another.
+def schema(books: Iterable[ShownBook]) -> dict[str, Any]:
+    # The books as an enum, so a model that honours the schema cannot name another.
     names = [roman(b.number) for b in sorted(books, key=lambda x: x.number)]
     props = {
         "book": {"type": "string", "enum": names},
@@ -157,7 +160,7 @@ def schema(books: Iterable[OpenBook]) -> dict[str, Any]:
     return {**_SHAPE, "properties": props}
 
 
-def input_hash(model: str, prompt: str, texts: Texts, books: Iterable[OpenBook]) -> str:
+def input_hash(model: str, prompt: str, texts: Texts, books: Iterable[ShownBook]) -> str:
     """Names the question. The prompt is in it as well: a rewritten prompt is a new one."""
     body = {
         "v": 1,
@@ -179,7 +182,7 @@ def _numeral(raw: str) -> int:
         raise ValueError(f"no book {raw[:20]!r}") from None
 
 
-def check(raw: Any, books: Iterable[OpenBook]) -> tuple[int, int, str]:
+def check(raw: Any, books: Iterable[ShownBook]) -> tuple[int, int, str]:
     """(book, runner_up, reason), or ValueError saying why the answer is not a judgement."""
     jsonschema.validate(raw, _SHAPE)
     numbers = {b.number for b in books}
@@ -187,22 +190,23 @@ def check(raw: Any, books: Iterable[OpenBook]) -> tuple[int, int, str]:
     runner_up = _numeral(raw["runner_up"])
     for n in (book, runner_up):
         if n not in numbers:
-            raise ValueError(f"book {n} is not open")
+            raise ValueError(f"no book {n}")
     if book == runner_up:
         raise ValueError("book and runner-up are the same")
     reason = " ".join(raw["reason"].split())
     if not reason:
         raise ValueError("empty reason")
+    # Converted rather than refused: the answer is paid for, and the dash is the house's
+    # rule, not the model's mistake about the leaf.
+    reason = no_em_dash(reason)
     if len(reason) > REASON_MAX:
         raise ValueError(f"reason is {len(reason)} characters")
-    if no_em_dash(reason) != reason:
-        raise ValueError("reason has an em dash")
     return book, runner_up, reason
 
 
 async def ask(
     texts: Texts,
-    books: list[OpenBook],
+    books: list[ShownBook],
     *,
     model: str,
     prompt: str,
@@ -308,7 +312,7 @@ async def judged(
     collection_id: int,
     image_id: int,
     texts: Texts,
-    books: list[OpenBook],
+    books: list[ShownBook],
     *,
     settings: Settings,
     client: Any = None,
