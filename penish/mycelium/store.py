@@ -779,8 +779,13 @@ async def overgrowth_by_id(
     return out
 
 
-async def record_view(conn: AsyncConnection[DictRow], image_id: int) -> bool:
+async def record_view(
+    conn: AsyncConnection[DictRow], image_id: int, ref_host: str | None = None
+) -> bool:
     """Count a view unless the picture was counted within the last minute; True if counted.
+
+    A counted view also lands in the per-picture day count and, when the caller names an
+    outside host, the per-host day count; a dropped view touches neither.
 
     The minute rule lives in the row itself so it holds across restarts and workers.
     An upsert rather than a bare update: a picture published before its attention row
@@ -807,6 +812,21 @@ async def record_view(conn: AsyncConnection[DictRow], image_id: int) -> bool:
             on conflict (day) do update set n = view_days.n + 1
             """
         )
+        await conn.execute(
+            """
+            insert into picture_views (image_id, day, n) values (%s, current_date, 1)
+            on conflict (image_id, day) do update set n = picture_views.n + 1
+            """,
+            (image_id,),
+        )
+        if ref_host:
+            await conn.execute(
+                """
+                insert into view_referrers (day, host, n) values (current_date, %s, 1)
+                on conflict (day, host) do update set n = view_referrers.n + 1
+                """,
+                (ref_host,),
+            )
     return True
 
 

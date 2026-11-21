@@ -30,7 +30,7 @@ from penish.worker.admin_jobs import (
     regen_key,
     remove_pub,
 )
-from penish.worker.derive import clamp_rect
+from penish.worker.derive import clamp_rect, og_key
 from penish.worker.ingest import EMBED_FIELD, _all_keys
 from penish.worker.jobs import enqueue
 from penish.worker.metrics import refresh_corpus_stats
@@ -336,7 +336,7 @@ async def _purge(conn: Any, request: Request, img: dict[str, Any], aliases: list
         # The ladder ingest and crop name files by, so the api need not see the held dir.
         urls += [
             f"{base}/media/pub/{k.removeprefix('pub/')}"
-            for k in _all_keys(r["pub_sha"], r["width"])
+            for k in (*_all_keys(r["pub_sha"], r["width"]), og_key(r["pub_sha"], r["width"]))
         ]
     return urls
 

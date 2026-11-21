@@ -1,6 +1,7 @@
 <script lang="ts" generics="T extends Tile">
 	import type { Snippet } from 'svelte';
 	import Hyphae from './Hyphae.svelte';
+	import LeafLine, { leafOf } from './LeafLine.svelte';
 	import type { Tile } from '../api';
 
 	// foot replaces the score under each tile, for strips whose items carry something else.
@@ -12,6 +13,7 @@
 		<h2>{label}</h2>
 		<ul>
 			{#each items as n (n.slug)}
+				{@const leaf = leafOf(n)}
 				<li>
 					<a href="/i/{n.slug}">
 						<span class="thumb" style:background-image={hashUrl(n.blurhash)}>
@@ -24,6 +26,7 @@
 					{:else if n.score !== undefined}
 						<span class="score">{n.score.toFixed(2)}</span>
 					{/if}
+					{#if leaf}<LeafLine {leaf} />{/if}
 				</li>
 			{/each}
 		</ul>

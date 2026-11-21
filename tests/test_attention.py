@@ -576,3 +576,52 @@ async def test_traffic_stores_nothing_about_the_visitor(
     assert {c for (c,) in cols} == {"id", "src", "dst", "created_at"}
     assert traffic(clean_db) == [(a, b)]
     assert ip not in dump
+
+
+# -- per picture and per referrer --------------------------------------------
+
+
+def rows(dsn: str, q: str) -> list[tuple[Any, ...]]:
+    with psycopg.connect(dsn) as conn:
+        return conn.execute(q).fetchall()
+
+
+async def test_view_counts_per_picture_and_referrer(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+) -> None:
+    i = add_image(clean_db, 1)
+    add_image(clean_db, 2)
+    try:
+        assert (await view(client, json={"ref": "News.Example.com"})).status_code == 204
+        # Inside the minute: dropped, so neither table moves.
+        assert (await view(client, json={"ref": "news.example.com"})).status_code == 204
+        assert (await view(client, "img-2", json={"ref": "https://x.example/p?q=1"})).status_code
+        # Own host and the absence of a referrer are not ways in.
+        unseen_for(clean_db, i, 1)
+        assert (await view(client, json={"ref": "test"})).status_code == 204
+        assert rows(clean_db, "select image_id, n from picture_views order by image_id") == [
+            (i, 2),
+            (i + 1, 1),
+        ]
+        assert rows(clean_db, "select host, n from view_referrers") == [("news.example.com", 1)]
+        assert today_views(clean_db) == 3
+    finally:
+        with psycopg.connect(clean_db, autocommit=True) as conn:
+            conn.execute("truncate picture_views, view_referrers")
+
+
+async def test_a_bad_ref_costs_the_referrer_not_the_view(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+) -> None:
+    i = add_image(clean_db, 1)
+    try:
+        for ref in ("a" * 300 + ".example.com", 5, ["x.example"], "not a host"):
+            unseen_for(clean_db, i, 1)
+            assert (await view(client, json={"ref": ref})).status_code == 204, ref
+        assert rows(clean_db, "select image_id, n from picture_views") == [(i, 4)]
+        assert rows(clean_db, "select host, n from view_referrers") == []
+    finally:
+        with psycopg.connect(clean_db, autocommit=True) as conn:
+            conn.execute("truncate picture_views, view_referrers")

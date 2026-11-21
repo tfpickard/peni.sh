@@ -15,7 +15,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from penish.api.routes_images import grid_items
+from penish.api.routes_images import grid_items, leaf_refs
 from penish.mycelium import store
 from penish.mycelium.store import (
     GALLERY_STATES,
@@ -153,18 +153,28 @@ async def gallery_row(conn: store.Conn, serial: int) -> dict[str, Any] | None:
 
 
 async def gallery_card(conn: store.Conn, serial: int) -> dict[str, Any] | None:
-    """What a link preview needs: `{title, state, size, died_days, cover}`, cover being a
-    grid item or None."""
+    """What a link preview needs: `{title, state, size, died_days, cover, cover_file}`,
+    cover being a grid item or None and cover_file the cover's `(pub_sha, width, height)`
+    for the preview JPEG, or None."""
     r = await gallery_row(conn, serial)
     if r is None:
         return None
     cover = await _items(conn, [r["cover_image_id"]] if r["cover_image_id"] else [])
+    files = {}
+    if r["cover_image_id"] in cover:
+        cur = await conn.execute(
+            "select pub_sha, width, height from images where id = %s", (r["cover_image_id"],)
+        )
+        f = await cur.fetchone()
+        if f is not None:
+            files = {r["cover_image_id"]: (f["pub_sha"], f["width"], f["height"])}
     return {
         "title": gallery_title(serial, r["title"]),
         "state": PUBLIC_STATES[r["state"]],
         "size": _size(r),
         "died_days": _days(r["died_at"], r["db_now"]) if r["state"] == "dead" else None,
         "cover": _thumb(cover.get(r["cover_image_id"])),
+        "cover_file": files.get(r["cover_image_id"]),
     }
 
 
@@ -191,7 +201,12 @@ async def list_galleries(request: Request, state: str = "all") -> list[dict[str,
             {"states": list(states), "order": list(GALLERY_STATES)},
         )
         rows = await cur.fetchall()
-        covers = await _items(conn, [r["cover_image_id"] for r in rows if r["cover_image_id"]])
+        cover_ids = [r["cover_image_id"] for r in rows if r["cover_image_id"]]
+        covers = await _items(conn, cover_ids)
+        # Only a leaf carries the key, so an ordinary cover reads as it always has.
+        for image_id, leaf in (await leaf_refs(conn, cover_ids)).items():
+            if image_id in covers:
+                covers[image_id]["leaf"] = leaf
     return [
         {
             "serial": int(r["serial"]),

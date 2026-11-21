@@ -2,10 +2,11 @@
 candidate neighbor is also a click, which feeds that edge on the next tick. Nothing
 about the visitor is stored: both limits key on an ip hash held in memory only."""
 
+import re
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from penish.api.routes_images import resolve_live
 from penish.api.social import RateLimit, _gate, ip_hash
@@ -28,11 +29,35 @@ click_limit = RateLimit(CLICK_LIMIT, CLICK_WINDOW)
 router = APIRouter()
 
 
+# A bare hostname: the client sends document.referrer's host, and anything else is dropped
+# rather than stored, so a path, a query or a port never reaches the table.
+HOST = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+
+
+def outside_host(request: Request, ref: str | None) -> str | None:
+    if ref is None:
+        return None
+    host = ref.strip().lower().removeprefix("www.")
+    if not HOST.match(host):
+        return None
+    own = (request.headers.get("host") or "").split(":")[0].lower().removeprefix("www.")
+    # Paging through the site is not a way in.
+    return None if host == own else host
+
+
 class ViewIn(BaseModel):
     # The picture the reader came from; a click when that pair is a candidate edge.
     from_: str | None = Field(
         default=None, alias="from", max_length=SLUG_MAX, pattern=r"^[a-z0-9-]+$"
     )
+    # Host of document.referrer when the reader arrived from another site.
+    ref: str | None = None
+
+    @field_validator("ref", mode="before")
+    @classmethod
+    def _bad_ref_is_no_ref(cls, v: Any) -> str | None:
+        # A referrer is a courtesy: one too long or not text must not cost the view itself.
+        return v if isinstance(v, str) and len(v) <= 253 else None
 
 
 @router.post("/api/images/{slug}/view", status_code=204, dependencies=[Depends(_gate)])
@@ -46,7 +71,9 @@ async def view(
         img = await resolve_live(conn, slug)
         if img is None:
             raise HTTPException(status_code=404, detail="not here")
-        await store.record_view(conn, int(img["id"]))
+        await store.record_view(
+            conn, int(img["id"]), outside_host(request, body.ref if body else None)
+        )
         # The lookup opened a transaction, so the view's attention row lock would
         # otherwise last through the click check, which reads network tables a tick
         # or genesis may be writing; the view stands on its own either way.

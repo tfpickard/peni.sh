@@ -59,6 +59,49 @@
 		{/each}
 	</div>
 
+	<div class="cols">
+		{#each [{ label: 'viewed 7 days', list: s.viewed.last_7d }, { label: 'viewed 30 days', list: s.viewed.last_30d }] as { label, list } (label)}
+			<div>
+				<h2>{label}</h2>
+				{#if list.length}
+					<ul class="plain tight">
+						{#each list as r}
+							<li class="row">
+								{#if r.thumb}<img class="thumb" src={r.thumb} alt="" />{:else}<span class="thumb"></span>{/if}
+								<a href="/i/{r.slug}">{r.slug}</a>
+								<span class="dim">{r.n}</span>
+								<svg viewBox="0 0 200 24" width="100" height="12" aria-label="views per day">
+									<polyline points={spark(r.days)} fill="none" stroke="var(--secondary)" stroke-width="1" />
+								</svg>
+							</li>
+						{/each}
+					</ul>
+				{:else}
+					<p class="dim">0 views</p>
+				{/if}
+			</div>
+		{/each}
+	</div>
+
+	<div class="cols">
+		{#each [{ label: 'referrers 7 days', list: s.referrers.last_7d }, { label: 'referrers 30 days', list: s.referrers.last_30d }] as { label, list } (label)}
+			<div>
+				<h2>{label}</h2>
+				{#if list.length}
+					<table>
+						<tbody>
+							{#each list as h}
+								<tr><td>{h.host}</td><td class="num">{h.n}</td></tr>
+							{/each}
+						</tbody>
+					</table>
+				{:else}
+					<p class="dim">0 referrers</p>
+				{/if}
+			</div>
+		{/each}
+	</div>
+
 	<h2>api usage</h2>
 	{#if usage.length}
 		<table>

@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import type { LayoutProps } from './$types';
 	import Chicken from '../lib/components/Chicken.svelte';
+	import { leafLine, type LeafRef } from '../lib/components/LeafLine.svelte';
 	import { getCollections, getStats, type Stats } from '../lib/api';
 
 	let { children }: LayoutProps = $props();
@@ -31,7 +32,17 @@
 	});
 
 	const home = $derived(page.url.pathname === '/');
-	let stats = $state<Stats | null>(null);
+	// The collection's latest change this week, sent only when there was one.
+	type Changed = LeafRef & { slug: string; from: { book: number; position: number } | null };
+	let stats = $state<(Stats & { changed?: Changed }) | null>(null);
+	// The register's word for what happened to the leaf: newly filed, renumbered within its
+	// book, or moved to another book.
+	const changed = $derived.by(() => {
+		const c = stats?.changed;
+		if (!c) return null;
+		const word = !c.from ? 'restored' : c.from.book === c.book ? 'refoliated' : 'reattributed';
+		return { href: `/i/${c.slug}`, text: leafLine(c, true), word };
+	});
 	$effect(() => {
 		// Fetched on every arrival at home so a picture published meanwhile is counted.
 		if (home) getStats().then((s) => (stats = s), () => {});
@@ -48,6 +59,9 @@
 							>temperature {stats.temperature.toFixed(2)}</span
 						>{/if}
 				</p>
+				{#if changed}
+					<p class="changed"><a href={changed.href}>{changed.text}</a> {changed.word}</p>
+				{/if}
 			{/if}
 			<nav>
 				{#each sections as s (s.label)}
@@ -91,6 +105,16 @@
 	.count span {
 		/* On a phone the temperature drops to its own line rather than either splitting. */
 		white-space: nowrap;
+	}
+	.changed {
+		/* Tucked under the count: the side column's gap is for the nav. */
+		margin: -0.6rem 0 0;
+		font-size: 0.8rem;
+		color: var(--muted-foreground);
+		text-align: right;
+	}
+	.changed a {
+		color: inherit;
 	}
 	.temp {
 		margin-left: 1rem;

@@ -81,9 +81,16 @@ async def enqueue(
     return None if row is None else int(row["id"])
 
 
+# Background sweeps that decode a full-size original: they go behind every other due job, and
+# the loop runs one of them at a time, so two slots are never both busy with a big decode.
+BULK_TYPES: tuple[str, ...] = ("og_image",)
+
+
 async def claim(pool: Pool, types: list[str] | None = None) -> Job | None:
     # One statement: the row lock from the subselect is held until the update commits,
-    # so concurrent claimers skip each other's candidate instead of blocking.
+    # so concurrent claimers skip each other's candidate instead of blocking. A bulk job
+    # sorts after every other due job, however overdue, so an upload never waits behind a
+    # sweep.
     type_filter = "and type = any(%(types)s)" if types is not None else ""
     sql = f"""
         update jobs set status = 'running', locked_at = now(),
@@ -91,14 +98,14 @@ async def claim(pool: Pool, types: list[str] | None = None) -> Job | None:
         where id = (
             select id from jobs
             where status = 'queued' and run_after <= now() {type_filter}
-            order by run_after, id
+            order by (type = any(%(bulk)s)), run_after, id
             for update skip locked
             limit 1
         )
         returning id, type, payload, attempts, last_error
     """  # noqa: S608 -- type_filter is a fixed literal
     async with pool.connection() as conn:
-        cur = await conn.execute(sql, {"types": types})
+        cur = await conn.execute(sql, {"types": types, "bulk": list(BULK_TYPES)})
         row = await cur.fetchone()
     if row is None:
         return None
@@ -208,14 +215,24 @@ async def _worker(
     handlers: dict[str, Callable[[Job], Awaitable[None]]],
     stop: asyncio.Event,
     idle_sleep: float,
+    bulk_running: set[str],
+    claiming: asyncio.Lock,
 ) -> None:
-    types = list(handlers)
     while not stop.is_set():
         job: Job | None = None
         try:
-            job = await claim(pool, types)
+            # Choosing the types and registering the claim are one step, or two workers
+            # could both be handed a bulk job before either is marked running.
+            async with claiming:
+                types = [t for t in handlers if t not in bulk_running]
+                job = await claim(pool, types)
+                if job is not None and job.type in BULK_TYPES:
+                    bulk_running.add(job.type)
             if job is not None:
-                await _run_one(pool, job, handlers[job.type])
+                try:
+                    await _run_one(pool, job, handlers[job.type])
+                finally:
+                    bulk_running.discard(job.type)
                 continue
         except Exception:
             # DB hiccups must not kill the loop; fall through to the sleep and retry.
@@ -233,4 +250,11 @@ async def run_loop(
     idle_sleep: float = 1.0,
     concurrency: int = 2,
 ) -> None:
-    await asyncio.gather(*(_worker(pool, handlers, stop, idle_sleep) for _ in range(concurrency)))
+    bulk_running: set[str] = set()
+    claiming = asyncio.Lock()
+    await asyncio.gather(
+        *(
+            _worker(pool, handlers, stop, idle_sleep, bulk_running, claiming)
+            for _ in range(concurrency)
+        )
+    )

@@ -12,6 +12,7 @@ from penish.api import (
     admin_ops,
     admin_pictures,
     attention,
+    feeds,
     index,
     media,
     routes_collections,
@@ -55,6 +56,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_mycelium.router)
     app.include_router(admin_logs.router)
     app.include_router(admin_collections.router)
+    app.include_router(feeds.router)
     app.include_router(social.router)
     app.include_router(attention.router)
     app.middleware("http")(admin.no_store)

@@ -1,6 +1,7 @@
 """Jobs the admin panel enqueues: per-image regen, crop, unpublish and republish, bulk
 re-embed and re-describe, haiku growth and mycelium genesis, plus the facet and phrase
-jobs (registered here for the embedder).
+jobs (registered here for the embedder). The og JPEG backfill lives here too, beside the
+crop it mirrors, and is wired in the worker entrypoint like the other start sweeps.
 
 Same contract as ingest: SoftError retries, HardError fails, and an image deleted while its
 job waited is a quiet no-op rather than an error.
@@ -12,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -35,10 +37,13 @@ from penish.worker import (
     unpublish,
 )
 from penish.worker.derive import (
+    Derivative,
     Public,
     UndecodableImage,
     clamp_rect,
     load_and_validate,
+    make_og,
+    og_key,
     rebuild_public,
 )
 from penish.worker.describe import Described, DescribeError, describe
@@ -52,9 +57,11 @@ from penish.worker.ingest import (
     DocumentEmbedder,
     HaikuWriter,
     _describe_bytes,
+    _have,
     _held,
     _texts,
     insert_haiku,
+    put_og,
     record_served,
 )
 from penish.worker.jobs import HardError, Job, Pool, SoftError
@@ -444,6 +451,10 @@ async def _crop_locked(
     for d in pub.derivatives:
         if not (storage.exists(d.key) or storage.exists(_held(d.key))):
             storage.put_bytes(_held(d.key) if hidden else d.key, d.data)
+    # Named for the new pub_sha like the ladder, so no page can point at the old framing's
+    # preview; that one leaves with the old files in settle below.
+    if pub.og is not None and not _have(storage, [pub.og.key], True):
+        put_og(storage, pub.og, hidden)
 
     old = str(row["pub_sha"])
     async with conn.transaction():
@@ -534,6 +545,138 @@ async def handle_crop(
         describer=describer,
         writer=writer,
     )
+
+
+# -- og image ---------------------------------------------------------------
+
+OG_JOB = "og_image"
+# After the other worker-start sweeps and the first uploads, then one every few seconds:
+# each job decodes a full original, and a backfill of the whole site must not stand in
+# front of a picture being uploaded.
+OG_SWEEP_START = timedelta(minutes=3)
+OG_SWEEP_STEP = timedelta(seconds=5)
+
+
+def _og_from(
+    path: Path, crop: Mapping[str, Any] | None, pub_sha: str, watermark: bool
+) -> tuple[int, Derivative | None]:
+    img = load_and_validate(path.read_bytes()).image
+    if crop:
+        rect = clamp_rect(crop, img.width, img.height)
+        if rect is not None:
+            img = img.crop(rect["x"], rect["y"], rect["w"], rect["h"])
+    return img.width, make_og(img, pub_sha, watermark)
+
+
+async def _og_locked(conn: Conn, job: Job, image_id: int, settings: Settings) -> None:
+    row = await _row(conn, image_id)
+    if row is None or row["pub_sha"] != job.payload.get("pub_sha"):
+        # Deleted, or cropped since the sweep: the crop wrote the new preview itself.
+        log.info("og: image %s is gone or reframed; nothing to do", image_id)
+        return
+    if row["status"] not in ("live", "unpublished") or not row["width"]:
+        # Ingest makes one on the way in.
+        return
+    pub_sha = str(row["pub_sha"])
+    storage = LocalStorage(settings.media_pub.parent)
+    if _have(storage, [og_key(pub_sha, int(row["width"]))], True):
+        return
+    orig = find_original(settings.media_orig, row["sha256"])
+    if orig is None:
+        raise HardError(f"original for image {image_id} is missing")
+    try:
+        width, og = await asyncio.to_thread(
+            _og_from, orig, row["crop"], pub_sha, settings.watermark
+        )
+    except (UndecodableImage, ValueError) as e:
+        raise HardError(f"og: {e}") from e
+    if og is None:
+        raise HardError("og: jpeg could not be encoded")
+    if width != row["width"]:
+        # The ladder was made from other pixels than the original and crop give now; a
+        # preview of these would not be the picture on the page.
+        raise HardError(f"og: displayed width {row['width']} but the original gives {width}")
+    put_og(storage, og, row["status"] == "unpublished")
+
+
+async def handle_og(job: Job, *, pool: Pool, settings: Settings) -> None:
+    """Make the link-preview JPEG for one picture that lacks it. A failure here fails only
+    this job: the picture, its page and its status are never touched."""
+    raw = job.payload.get("image_id")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise HardError("bad og payload: image_id must be an integer")
+    image_id = raw
+    async with pool.connection() as conn:
+        await conn.set_autocommit(True)
+        row = await _row(conn, image_id)
+        if row is None:
+            log.info("og: image %s is gone; nothing to do", image_id)
+            await conn.set_autocommit(False)
+            return
+        sha = row["sha256"]
+        # The ingest lock: a crop or delete in the middle would leave a preview named for
+        # a pub_sha nothing uses any more.
+        await conn.execute("select pg_advisory_lock(hashtextextended(%s, 0))", (sha,))
+        try:
+            await _og_locked(conn, job, image_id, settings)
+        finally:
+            with contextlib.suppress(psycopg.Error):
+                await conn.execute("select pg_advisory_unlock(hashtextextended(%s, 0))", (sha,))
+                await conn.set_autocommit(False)
+
+
+async def enqueue_missing_og(pool: Pool, settings: Settings) -> int:
+    """An og job for every live picture whose preview JPEG is not in pub. Run at worker
+    start, for pictures from before the preview existed and for any whose write failed.
+
+    One job per pub_sha, since pictures sharing one share the file. A queued or running job
+    for the same pub_sha keeps it out, and so does a failed one: the next try would fail the
+    same way at every restart, and a crop gives the picture a new pub_sha and a new chance."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select id, pub_sha, width from images"
+            " where status = 'live' and pub_sha is not null and width > 0 order by id"
+        )
+        rows = await cur.fetchall()
+    storage = LocalStorage(settings.media_pub.parent)
+
+    def missing() -> list[tuple[int, str]]:
+        seen: set[str] = set()
+        out: list[tuple[int, str]] = []
+        for r in rows:
+            sha = str(r["pub_sha"])
+            if sha in seen or storage.exists(og_key(sha, int(r["width"]))):
+                continue
+            seen.add(sha)
+            out.append((int(r["id"]), sha))
+        return out
+
+    todo = await asyncio.to_thread(missing)
+    if not todo:
+        return 0
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"""
+            insert into jobs (type, payload, dedupe_key, run_after)
+            select '{OG_JOB}', jsonb_build_object('image_id', m.id, 'pub_sha', m.pub_sha),
+                   '{OG_JOB}:' || m.pub_sha,
+                   now() + %(start)s + %(step)s * (m.n - 1)
+              from unnest(%(ids)s::bigint[], %(shas)s::text[]) with ordinality as m(id, pub_sha, n)
+             where not exists (select 1 from jobs j
+                                where j.type = '{OG_JOB}'
+                                  and j.dedupe_key = '{OG_JOB}:' || m.pub_sha
+                                  and j.status in ('queued', 'running', 'failed'))
+             order by m.n
+            on conflict do nothing
+            """.encode(),  # noqa: S608 -- OG_JOB is a constant of this module
+            {
+                "ids": [i for i, _ in todo],
+                "shas": [s for _, s in todo],
+                "start": OG_SWEEP_START,
+                "step": OG_SWEEP_STEP,
+            },
+        )
+        return cur.rowcount
 
 
 # -- bulk -------------------------------------------------------------------

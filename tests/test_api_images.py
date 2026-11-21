@@ -346,7 +346,16 @@ async def test_detail_hyphae(client: httpx.AsyncClient, clean_db: str) -> None:
         ("img-2", 0.45, "whole"),
         ("img-4", 0.2, "facet:style"),
     ]
-    assert set(got[0]) == {"slug", "score", "blurhash", "src", "overgrowth", "strength", "layer"}
+    assert set(got[0]) == {
+        "slug",
+        "score",
+        "blurhash",
+        "src",
+        "overgrowth",
+        "strength",
+        "layer",
+        "leaf",
+    }
     assert got[0]["score"] == 0.6
     assert got[0]["src"] == f"/media/pub/{sha(3)}-480.webp"
     assert got[0]["blurhash"] == "LEHV6n"

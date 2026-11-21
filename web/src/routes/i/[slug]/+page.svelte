@@ -8,6 +8,7 @@
 	import Comments from '../../../lib/components/Comments.svelte';
 	import Overlap from '../../../lib/components/Overlap.svelte';
 	import PtpLogo from '../../../lib/components/PtpLogo.svelte';
+	import { leafLine } from '../../../lib/components/LeafLine.svelte';
 	import { postView } from '../../../lib/api';
 	import { markViewed } from '../../../lib/viewed';
 	import { roman } from '../../../lib/roman';
@@ -28,7 +29,7 @@
 			home: `/collections/${l.collection.slug}`,
 			title: l.collection.title,
 			href: `/collections/${l.collection.slug}/${l.book}`,
-			text: `${abbrev} ${roman(l.book)}, leaf ${l.position}`,
+			text: leafLine(l),
 			was: !p
 				? null
 				: p.book === l.book

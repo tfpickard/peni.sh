@@ -43,6 +43,40 @@ def grid_items(rows: list[dict[str, Any]], overgrowth: Mapping[int, float]) -> l
     ]
 
 
+async def leaf_refs(conn: Any, image_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """The leaf line for each of `image_ids` that is a live leaf of a published collection,
+    in one query: `{collection: {slug, abbrev, abbrev_latin}, book, position}`.
+
+    Strips and covers name only where a leaf is now; its earlier places are for its own page.
+    """
+    if not image_ids:
+        return {}
+    cur = await conn.execute(
+        """
+        select distinct on (l.image_id) l.image_id, c.slug, c.abbrev, c.abbrev_latin,
+               l.book, l.position
+          from collection_leaves l
+          join collections c on c.id = l.collection_id and c.published
+          join images i on i.id = l.image_id
+         where l.image_id = any(%s) and i.status = 'live' and i.published_at is not null
+         order by l.image_id, c.id
+        """,
+        (list(image_ids),),
+    )
+    return {
+        r["image_id"]: {
+            "collection": {
+                "slug": r["slug"],
+                "abbrev": r["abbrev"],
+                "abbrev_latin": r["abbrev_latin"],
+            },
+            "book": r["book"],
+            "position": r["position"],
+        }
+        for r in await cur.fetchall()
+    }
+
+
 def _not_here() -> HTTPException:
     return HTTPException(status_code=404, detail="not here")
 
@@ -367,6 +401,7 @@ async def image_detail(
     ids = [n.image_id for n in (*nb.similar, *nb.dissimilar)] + [h.image_id for h in hyphae]
     meta: dict[int, dict[str, Any]] = {}
     og: dict[int, float] = {}
+    leaves: dict[int, dict[str, Any]] = {}
     if ids:
         async with pool.connection() as conn:
             cur = await conn.execute(
@@ -375,6 +410,7 @@ async def image_detail(
             )
             meta = {r["id"]: r for r in await cur.fetchall()}
             og = await overgrowth_by_id(conn, ids)
+            leaves = await leaf_refs(conn, ids)
     nb_variants = variants_for_many((m["pub_sha"], m["width"], m["height"]) for m in meta.values())
 
     def card(image_id: int, slug: str, score: float) -> dict[str, Any]:
@@ -388,6 +424,8 @@ async def image_detail(
             "blurhash": m["blurhash"],
             "src": (pick["webp"] or pick["avif"]) if pick else None,
             "overgrowth": og.get(image_id, 0.0),
+            # A neighbour that is a leaf carries its place, so a strip can name it.
+            "leaf": leaves.get(image_id),
         }
 
     def strip(neighbor_list: list[Any]) -> list[dict[str, Any]]:

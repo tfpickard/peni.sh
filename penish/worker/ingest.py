@@ -34,11 +34,14 @@ from penish.worker import facet_jobs, nudity
 from penish.worker.derive import (
     WIDTHS,
     Decoded,
+    Derivative,
     UndecodableImage,
     blurhash_of,
     clean_original,
     load_and_validate,
     make_derivatives,
+    make_og,
+    og_key,
     palette_of,
     rebuild_public,
 )
@@ -128,6 +131,27 @@ def _put(storage: LocalStorage, key: str, data: bytes, hidden: bool) -> None:
         storage.put_bytes(_held(key) if hidden else key, data)
 
 
+def put_og(storage: LocalStorage, og: Derivative | None, hidden: bool) -> None:
+    """Write the link-preview JPEG where the picture's other files are. Never raises: the
+    preview is a courtesy to other sites, and nothing about the picture waits on it."""
+    if og is None:
+        return
+    try:
+        _put(storage, og.key, og.data, hidden)
+    except OSError as e:
+        log.warning("og jpeg %s not written: %s", og.key, e)
+
+
+async def _ensure_og(
+    storage: LocalStorage, img: Any, sha: str, watermark: bool, hidden: bool
+) -> None:
+    # Only for images still displayed as uploaded, like _write_media.
+    if _have(storage, [og_key(sha, img.width)], hidden):
+        return
+    og = await asyncio.to_thread(make_og, img, sha, watermark)
+    put_og(storage, og, hidden)
+
+
 def _describe_bytes(img: Any) -> bytes:
     small = img.thumbnail_image(_DESCRIBE_EDGE, height=_DESCRIBE_EDGE, size="down")
     out = small.write_to_buffer(".webp", Q=85)
@@ -185,6 +209,7 @@ async def _rebuild(
     pub = await asyncio.to_thread(rebuild_public, data, row["crop"], settings.watermark)
     for d in pub.derivatives:
         _put(storage, d.key, d.data, hidden)
+    put_og(storage, pub.og, hidden)
     if row["status"] == "live" and pub.pub_sha != row["pub_sha"]:
         await record_served(conn, int(row["id"]), row["pub_sha"], row["width"])
     await conn.execute(
@@ -705,6 +730,9 @@ async def _ingest_locked(
             """,
             (decoded.width, decoded.height, size, decoded.mime, bh, Jsonb(palette), image_id),
         )
+    if pub_sha == sha:
+        # Also heals a picture from before the og JPEG existed when its file is dropped again.
+        await _ensure_og(storage, decoded.image, sha, settings.watermark, hidden)
 
     caption_changed = await _apply_owner(conn, image_id, group)
     line = group.values.get("collection")
@@ -777,6 +805,8 @@ async def _ingest_locked(
         (image_id, KIND, settings.embed_model),
     )
     emb = await cur.fetchone()
+    # The webp ladder only. The og JPEG stays out: a preview that could not be made must
+    # never keep a picture off the site.
     media_ok = _have(storage, _webp_keys(pub_sha, pub_width), hidden)
     ok_texts = "description" in texts and EMBED_FIELD in texts
     if not (media_ok and ok_texts and emb and emb["e"]):

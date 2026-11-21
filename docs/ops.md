@@ -84,6 +84,10 @@ Disable key expiry for the `peni` machine in the Tailscale admin console, or the
 
 The three packages `penish-api`, `penish-worker` and `penish-migrate` must be made public so the host pulls without credentials. GitHub, profile, Packages, each package, Package settings, Change visibility, Public. Packages are created private on the first push, so do this once after the first CI run on `main`.
 
+## collection preview
+
+The preview image of a collection's page is `web/static/og/<slug>.png`, 1200x630; it needs a deploy. Without one the page shows its first leaf.
+
 ## deploy
 
 `penish-deploy.timer` runs every 60 s. It reads the head sha of the latest successful `ci.yml` push run on `main` and compares it to `/var/lib/penish-deploy/deployed_sha`. On a difference: fetch `compose.yaml` for that sha from raw.githubusercontent.com, validate it with `docker compose config -q` (YAML, interpolation and the required `.env` variables, run against the real `.env`; bind-mount sources, modes and ownership are not checked) and overwrite the local copy (previous one kept as `/var/lib/penish-deploy/compose.yaml.prev`, restored on rollback; a fetch or validation failure aborts the attempt), set `IMAGE_TAG` in `.env`, `docker compose pull`, `up -d --remove-orphans`, then wait up to 120 s for `api` to be healthy. `deployed_sha` is written only on success. On failure the journal gets an error, `IMAGE_TAG` goes back to the previous sha, and the same sha is not retried for 10 minutes.
