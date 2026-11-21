@@ -42,7 +42,8 @@ hand.
 - Haikus invent in verse. Precise, never random: plain sentences whose logic
   does not close. They add what the picture and its description do not show,
   and they do not reuse the description's invented facts.
-- og tags: caption and description only. No taglines or calls to action.
+- og tags: caption and description only (the home page's is its haiku; a leaf's is its
+  conservator note). No taglines or calls to action.
 - Visual: lots of empty dark ground, one type scale, no cards or shadows,
   almost no chrome. Magenta and cyan sparingly. The Fungal haiku is the only
   flourish.
