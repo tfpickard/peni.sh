@@ -82,7 +82,7 @@ export type Upload = {
 	stem: string;
 	sha256: string;
 	filename: string | null;
-	stage: 'received' | 'inbox' | 'ingesting' | 'failed' | 'down' | 'live' | 'unfiled';
+	stage: 'received' | 'inbox' | 'ingesting' | 'failed' | 'down' | 'live' | 'unfiled' | 'lost';
 	error: string | null;
 	slug: string | null;
 	image_id: number | null;

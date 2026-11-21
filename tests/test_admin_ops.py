@@ -645,6 +645,60 @@ async def test_failed_delete(client: httpx.AsyncClient, tmp_path: Path) -> None:
     assert (await client.post("/api/admin/queue/failed/cat/retry", headers=XHR)).status_code == 404
 
 
+async def test_failed_delete_drops_the_upload_row_for_its_stem(
+    client: httpx.AsyncClient, clean_db: str, tmp_path: Path
+) -> None:
+    make_failed(tmp_path, "cat", {"cat.png": "x", "cat.err": "boom"})
+    sql(
+        clean_db,
+        "insert into uploads (stem, sha256, source, error) values"
+        " ('cat', %s, 'rsync', 'boom'), ('dog', %s, 'rsync', 'boom'),"
+        " ('cat', %s, 'rsync', null)",
+        SHA_A,
+        SHA_B,
+        "cc" * 32,
+    )
+    # A picture made from other bytes under the same stem keeps its record.
+    image(clean_db, "cc" * 32, "a-cat")
+    r = await client.delete("/api/admin/queue/failed/cat")
+    assert r.status_code == 200
+    assert sql(clean_db, "select stem, sha256 from uploads order by stem, sha256") == [
+        ("cat", "cc" * 32),
+        ("dog", SHA_B),
+    ]
+
+
+async def test_failed_delete_keeps_the_row_while_the_stem_has_files_elsewhere(
+    client: httpx.AsyncClient, clean_db: str, tmp_path: Path
+) -> None:
+    # Retried once and failed again: the older folder goes, the newer one still stands.
+    make_failed(tmp_path, "cat", {"cat.png": "old", "cat.err": "old"})
+    make_failed(tmp_path, "cat-2", {"cat.png": "new", "cat.err": "new"})
+    sql(
+        clean_db,
+        "insert into uploads (stem, sha256, source, error) values ('cat', %s, 'rsync', 'boom')",
+        SHA_A,
+    )
+    assert (await client.delete("/api/admin/queue/failed/cat")).status_code == 200
+    assert sql(clean_db, "select stem from uploads") == [("cat",)]
+    assert (await client.delete("/api/admin/queue/failed/cat-2")).status_code == 200
+    assert sql(clean_db, "select stem from uploads") == []
+
+
+async def test_failed_delete_still_answers_ok_when_the_rows_cannot_go(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = make_failed(tmp_path, "cat", {"cat.png": "x"})
+
+    class Broken:
+        def connection(self) -> Any:
+            raise psycopg.OperationalError("down")
+
+    monkeypatch.setattr(admin_ops, "_pool", lambda request: Broken())
+    r = await client.delete("/api/admin/queue/failed/cat")
+    assert r.status_code == 200 and not d.exists()
+
+
 @pytest.mark.parametrize(
     "name",
     ["..", ".", ".hidden", "a%2Fb", "..%2Fdata", "%2e%2e", "a..%2F..", "cat%00", "a b", "x."],

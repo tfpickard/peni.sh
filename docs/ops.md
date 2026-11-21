@@ -44,7 +44,7 @@ Accepted pictures are `.png`, `.jpg`, `.jpeg`, `.webp`, `.heic` and `.heif`, in 
 
 Missing fields are generated. Failures land in `data/failed/<stem>/` with `x.err`. The admin queue page retries one: the api moves the files back to `data/inbox` and removes the folder (not the `.err`). `inbox` and `failed` are separate mounts in the api container, so the move is a copy into a dotfile in the inbox, an fsync, a rename, sidecars first and the picture last, and only then the delete of the source; the `failed` mount is therefore writable for the api. The api runs as uid/gid 1002, the same as `upload`, which owns both folders, so owner write on `failed/<stem>/` is all it needs (group write is not).
 
-Every arrival is recorded in the `uploads` table before it is decoded, so an upload that fails to decode still shows on `/admin/collections` under `unfiled`, with its stage and reason. The stages, in the order they are checked, are `filed`, `unfiled`, `live`, `down`, `ingesting`, `inbox`, `failed` and `received`. The stage is worked out from the images row, the collection leaves and the data folders on each request, and is not stored.
+Every arrival is recorded in the `uploads` table before it is decoded, so an upload that fails to decode still shows on `/admin/collections` under `unfiled`, with its stage and reason. The stages, in the order they are checked, are `filed`, `unfiled`, `live`, `down`, `ingesting`, `inbox`, `failed`, `received` and `lost`. A `lost` upload is a record whose files never landed or are gone; the status check answers `waiting` for it, so the form sends it again. The stage is worked out from the images row, the collection leaves and the data folders on each request, and is not stored.
 
 ### bulk push
 

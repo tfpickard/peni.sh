@@ -673,9 +673,26 @@ async def retry_failed(name: str, request: Request) -> dict[str, Any]:
 
 
 @router.delete("/queue/failed/{name}")
-async def delete_failed(name: str) -> dict[str, bool]:
+async def delete_failed(name: str, request: Request) -> dict[str, bool]:
     directory = _failed_dir(name)
+    # Read before the folder goes, which takes the names with it.
+    stems = await run_in_threadpool(uploads.folder_stems, directory)
     await run_in_threadpool(shutil.rmtree, directory)
+    settings = get_settings()
+    # A retry may have put the same stem back in the inbox, and an older failure of it may
+    # still stand in another folder: the record goes only with the last of its files.
+    gone = [s for s in sorted(stems) if not await run_in_threadpool(uploads.held, settings, s)]
+    try:
+        async with _pool(request).connection() as conn:
+            # A picture that was made from these bytes keeps its record.
+            await conn.execute(
+                "delete from uploads u where u.stem = any(%s)"
+                " and not exists (select 1 from images i where i.sha256 = u.sha256)",
+                (gone,),
+            )
+    except psycopg.Error:
+        # The folder is gone either way.
+        log.warning("delete: could not drop the upload rows for %s", name, exc_info=True)
     return {"ok": True}
 
 

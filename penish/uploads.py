@@ -5,8 +5,9 @@ what it was and which collection it was meant for. Where an upload has got to is
 stored: `stages` reads it from the images row, the leaves and the data dirs every time,
 so it cannot drift from them. First match wins: filed, unfiled, live, down, ingesting
 (a processing folder or a waiting ingest job), inbox, failed (an error, a failed image or
-a failed folder), ingesting (any other image row), received. Shared by the api (form
-uploads, the admin's view) and the worker (rsync drops, failures).
+a failed folder), ingesting (any other image row), received (a fresh row with no files
+yet), lost (an older one still with none). Shared by the api (form uploads, the admin's
+view) and the worker (rsync drops, failures).
 """
 
 from __future__ import annotations
@@ -31,6 +32,9 @@ Conn = AsyncConnection[DictRow]
 # Enough to say what went wrong on the admin page; a traceback-length reason is noise.
 ERROR_MAX = 500
 _SLUG = re.compile(r"^[a-z0-9-]{1,40}$")
+# The row is written a moment before the files land, so a brand new row with no files is an
+# upload still arriving, not a loss.
+FRESH_SECONDS = 120
 
 
 async def record(
@@ -168,6 +172,19 @@ def failed_folders(settings: Settings, stem: str) -> list[Path]:
     return out
 
 
+def held(settings: Settings, stem: str) -> bool:
+    """Whether files for this exact stem are in the inbox, a processing folder or a failed
+    one. Dotfile temps are not files yet."""
+    # In this order and returning early: files only move forward through these three, so
+    # looking at the source before the destination cannot miss a file that moves mid-check.
+    if stem in _stems(_files(settings.inbox)):
+        return True
+    for e in _subdirs(settings.processing):
+        if stem in _stems(_files(Path(e.path))):
+            return True
+    return bool(failed_folders(settings, stem))
+
+
 def folder_stems(folder: Path) -> set[str]:
     """The stems a failed folder's files belong to, its name when they name none."""
     return _stems(_files(folder)) or {folder.name}
@@ -245,7 +262,7 @@ def _stage(
         return "failed"
     if status is not None:
         return "ingesting"
-    return "received"
+    return "received" if row["age"] < FRESH_SECONDS else "lost"
 
 
 async def stages(
@@ -262,7 +279,8 @@ async def stages(
         select * from (
           select distinct on (u.sha256)
                  u.id, u.stem, u.sha256, u.filename, u.bytes, u.collection_line, u.source,
-                 u.error, u.created_at, i.id as image_id, i.slug, i.status::text as status
+                 u.error, u.created_at, i.id as image_id, i.slug, i.status::text as status,
+                 extract(epoch from now() - u.updated_at) as age
             from uploads u
             left join images i on i.sha256 = u.sha256
            order by u.sha256, u.created_at desc, u.id desc

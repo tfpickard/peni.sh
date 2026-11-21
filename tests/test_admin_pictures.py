@@ -497,6 +497,24 @@ async def test_delete_keeps_shared_pub_files(client: httpx.AsyncClient, clean_db
     assert sql(clean_db, "select count(*) from corpus_stats_history") == [(0,)]
 
 
+async def test_delete_removes_its_upload_rows_and_no_others(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    a = add(clean_db, 1)
+    add(clean_db, 2)
+    sql(
+        clean_db,
+        "insert into uploads (stem, sha256, source) values"
+        " ('a', %s, 'form'), ('a-r1f2e', %s, 'rsync'), ('b', %s, 'form')",
+        sha(1),
+        sha(1),
+        sha(2),
+    )
+    r = await client.delete(f"{URL}/{a}", headers=XHR)
+    assert r.status_code == 200
+    assert sql(clean_db, "select stem from uploads") == [("b",)]
+
+
 async def test_bulk_delete(client: httpx.AsyncClient, clean_db: str) -> None:
     s = get_settings()
     a = add(clean_db, 1, vec=[1, 0, 0, 0])

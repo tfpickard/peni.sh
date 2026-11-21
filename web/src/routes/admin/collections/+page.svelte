@@ -359,7 +359,7 @@
 					{:else}
 						<span>{u.filename ?? u.stem}</span>
 					{/if}
-					<span class="dim" class:hot={u.stage === 'failed'}>{u.stage}</span>
+					<span class="dim" class:hot={u.stage === 'failed' || u.stage === 'lost'}>{u.stage}</span>
 					{#if u.error}<span class="hot">{u.error}</span>{/if}
 					<span class="dim">{when(u.created_at)}</span>
 					{#if u.stage === 'failed'}<a href="/admin/queue">queue</a>{/if}

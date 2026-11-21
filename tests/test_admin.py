@@ -253,6 +253,57 @@ async def test_status_received_after_a_form_upload_with_no_stem(
         assert r.json() == {"state": "received", "stem": stem}
 
 
+async def test_status_waiting_for_a_row_with_no_files(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    await _login(client)
+    sha = "34" * 32
+    # What a crash between the row and the rename leaves behind.
+    with psycopg.connect(clean_db, autocommit=True) as conn:
+        conn.execute("insert into uploads (stem, sha256, source) values ('x', %s, 'form')", (sha,))
+    r = await client.get("/api/admin/status", params={"sha256": sha})
+    assert r.json() == {"state": "waiting"}
+
+
+async def test_status_waiting_again_once_the_landed_file_is_gone(
+    client: httpx.AsyncClient,
+) -> None:
+    import hashlib
+
+    await _login(client)
+    data = _png()
+    sha = hashlib.sha256(data).hexdigest()
+    up = await client.post(
+        "/api/admin/upload", headers=XHR, files={"image": ("a.png", data, "image/png")}
+    )
+    assert up.status_code == 200, up.text
+    r = await client.get("/api/admin/status", params={"sha256": sha})
+    assert r.json() == {"state": "received", "stem": up.json()["stem"]}
+    for f in get_settings().inbox.iterdir():
+        f.unlink()
+    r = await client.get("/api/admin/status", params={"sha256": sha})
+    assert r.json() == {"state": "waiting"}
+
+
+async def test_status_looks_past_a_newer_row_with_no_files(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    await _login(client)
+    sha = "56" * 32
+    inbox = get_settings().inbox
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "x-old.png").write_bytes(b"x")
+    with psycopg.connect(clean_db, autocommit=True) as conn:
+        conn.execute(
+            "insert into uploads (stem, sha256, source, created_at) values"
+            " ('x-old', %s, 'form', now() - interval '1 hour'),"
+            " ('x-new', %s, 'form', now())",
+            (sha, sha),
+        )
+    r = await client.get("/api/admin/status", params={"sha256": sha})
+    assert r.json() == {"state": "received", "stem": "x-old"}
+
+
 async def test_status_failed_from_the_upload_row(client: httpx.AsyncClient, clean_db: str) -> None:
     await _login(client)
     sha = "ef" * 32

@@ -231,6 +231,63 @@ async def test_ingesting_from_a_waiting_job(p: Any, settings: Settings) -> None:
     assert (await one(p, settings))["stage"] == "received"
 
 
+async def age(p: Any, seconds: int) -> None:
+    await q(
+        p,
+        "update uploads set updated_at = now() - make_interval(secs => %s) returning id",
+        seconds,
+    )
+
+
+async def test_a_fresh_row_with_no_files_is_received(p: Any, settings: Settings) -> None:
+    await record(p, "x", 1, source="form")
+    await age(p, uploads.FRESH_SECONDS - 60)
+    assert (await one(p, settings))["stage"] == "received"
+
+
+async def test_an_old_row_with_no_files_is_lost(p: Any, settings: Settings) -> None:
+    await record(p, "x", 1, source="form")
+    await age(p, uploads.FRESH_SECONDS + 60)
+    got = await one(p, settings)
+    assert (got["stage"], got["error"]) == ("lost", None)
+    # Files turning up are all it takes to read as the stage they are in.
+    place(settings.inbox, "x.png")
+    assert (await one(p, settings))["stage"] == "inbox"
+
+
+# -- held -----------------------------------------------------------------------------
+
+
+def test_held_in_the_inbox(settings: Settings) -> None:
+    place(settings.inbox, "x.png", "y.png")
+    assert uploads.held(settings, "x")
+    assert not uploads.held(settings, "xy")
+
+
+def test_held_in_processing(settings: Settings) -> None:
+    place(settings.processing, "x.png", "x_caption.txt", sub=str(uuid.uuid4()))
+    assert uploads.held(settings, "x")
+
+
+def test_held_in_a_failed_folder(settings: Settings) -> None:
+    # `x-2` names the folder; the files inside say which stem they are.
+    place(settings.failed, "x.png", "x.err", sub="x-2")
+    assert uploads.held(settings, "x")
+    assert not uploads.held(settings, "x-2")
+
+
+def test_held_nowhere(settings: Settings) -> None:
+    assert not uploads.held(settings, "x")
+    place(settings.inbox, "y.png")
+    place(settings.processing, "z.png", sub=str(uuid.uuid4()))
+    assert not uploads.held(settings, "x")
+
+
+def test_a_dotfile_temp_is_not_held(settings: Settings) -> None:
+    place(settings.inbox, ".x.png.abcd1234", ".x_caption.txt.abcd1234")
+    assert not uploads.held(settings, "x")
+
+
 @pytest.mark.parametrize("status", ["processing", "pending_enrichment"])
 async def test_ingesting_from_the_image_row(p: Any, settings: Settings, status: str) -> None:
     await record(p, "x", 1)

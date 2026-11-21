@@ -410,19 +410,21 @@ async def status(request: Request, sha256: str, stem: str = "") -> dict[str, str
             err = next(iter(sorted(d.glob("*.err"))), None)
             text = err.read_text(errors="replace")[:500] if err else ""
             return {"state": "failed", "error": text}
-    # The row is written before any file lands, so it is what tells a file the server holds
-    # from bytes it has never seen; the directories are not scanned, as this is polled.
+    # Only reached while no images row exists yet. The row is written before the files land,
+    # so on its own it cannot say the bytes arrived: a crash between the two leaves a record
+    # with nothing behind it, and answering received would stop the form resending.
     async with request.app.state.pool.connection() as conn:
         cur = await conn.execute(
-            "select stem, error from uploads where sha256 = %s order by created_at desc, id desc"
-            " limit 1",
+            "select stem, error from uploads where sha256 = %s order by created_at desc, id desc",
             (sha256,),
         )
-        up = await cur.fetchone()
-    if up is not None:
+        ups = await cur.fetchall()
+    settings = get_settings()
+    for up in ups:
         if up["error"]:
             return {"state": "failed", "error": up["error"], "stem": up["stem"]}
-        return {"state": "received", "stem": up["stem"]}
+        if await run_in_threadpool(uploads.held, settings, up["stem"]):
+            return {"state": "received", "stem": up["stem"]}
     return {"state": "waiting"}
 
 
