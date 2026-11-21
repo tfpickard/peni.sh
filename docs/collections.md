@@ -256,6 +256,9 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   `owner`, `judge`) and `scores` (jsonb), set on the row where a leaf's book was decided:
   a filing, an owner move, a re-sort or re-judging that changes its book.
 - `migrations/025_collection_judgements.sql` keeps the judge's answers (see "The judge").
+- `migrations/026_anchor_embedded_at.sql` gives each book `anchor_embedded_at`, set with
+  the vector and cleared with it on an anchor edit. Null with a vector means embedded
+  before the time was kept.
 - `migrations/019_collection_text.sql` adds the owner text and the note's provenance;
   `020_seed_pansophicon_text.sql` seeds the Pansophicon's text, filling only what is still
   empty. Tests re-apply 018 and 020 between runs.
@@ -410,8 +413,9 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
   `{"dry_run": true}` plans from kept judgements only: while any leaf not `book_pinned`
   has none for what it is now, it answers 409 `judging` and queues `collection_judge`, and
   the worker asks for each (four at a time). Then it answers `{plan_id, moves, held}`:
-  every leaf whose judged book is not its own, moved there with its slot chosen as the
-  filer would (other leaves in that book may shift, as on a filing), each book move with
+  every leaf whose judged book is not its own, moved into a free slot of that book, chosen
+  among the free slots as the filer would. No leaf that keeps its book changes its slot,
+  so a number the owner gave stands. Each book move comes with
   the judge's `reason` and `runner_up`. `held` lists what stays: a leaf whose judged book
   is full (`book`, `why: "full"`), and one the judge did not judge (`why` is the failure,
   `no text` or `no vector`). 409 `anchors` as the re-sort's dry run. `{"dry_run": false,
@@ -421,6 +425,23 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
 - `/admin/collections` has `judge` beside the dry run (it asks again every few seconds
   while the answer is `judging`) and `apply`, which sends the shown plan back. The moves
   list shows the reason beside a book move; held leaves follow it.
+- The admin's `GET .../<slug>` carries, per book, `anchor_state` (`embedded` under
+  today's model; `queued`, no usable vector and a `collection_anchor` job queued or
+  running; `stale` otherwise), `anchor_embedded_at` and `hint_leaves` (each hint with the
+  number of leaves it meets, matched as `tag_overlap` matches); `history`, the newest 20
+  rows with `chosen_by`, narrowed by `?leaf=` (image id or slug); and `judge_failures`,
+  the failed judgements among the last 20 filings by kind (`off` is not a failure).
+- Each leaf in that answer carries `note_queued`: a `collection_note` job for it is queued or
+  running (a leaf holding a fill and a rewrite counts once; `notes_queued` still counts jobs).
+- `/admin/collections` edits in sections: the collection's fields, the record, tuning, each
+  book, each leaf's note. Each says `unsaved` while its draft differs from the server, `save
+  all` saves them one after another through the same endpoints (a refused one stays unsaved
+  with the server's reason beside it, and the rest are saved), and leaving with any unsaved
+  asks first. Saving a section, or any other action, leaves every other section's draft
+  alone; a clean section follows the server. The record has a live preview drawn by the same
+  component as the public page. Under each book's grid, `notes N` opens its leaves with
+  their notes: saving one stores it as the owner's, `write note` queues a model note and is
+  refused for an owner note, and clearing a note hands the leaf back.
 - `explain` returns `judged` (the judge chose its book), `filed.scores.judge` for a judged
   filing, and `judgement`: the kept answer for the leaf as it is now, or null.
 

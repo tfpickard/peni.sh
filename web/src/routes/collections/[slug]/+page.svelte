@@ -1,6 +1,7 @@
 <script lang="ts">
 	import PtpLogo from '../../../lib/components/PtpLogo.svelte';
 	import FungalHaiku from '../../../lib/haiku/FungalHaiku.svelte';
+	import RecordList from '../../../lib/components/RecordList.svelte';
 	import { roman } from '../../../lib/roman';
 	import type { Haiku } from '../../../lib/api';
 
@@ -17,12 +18,6 @@
 	);
 
 	const count = (n: number) => (n === 1 ? '1 leaf' : `${n} leaves`);
-	// A value may hold several lines (a provenance chain); each is shown as its own line.
-	const lines = (v: string) =>
-		v
-			.split('\n')
-			.map((x) => x.trim())
-			.filter(Boolean);
 </script>
 
 <svelte:head><title>{c ? c.title : 'not here'} -- peni.sh</title></svelte:head>
@@ -38,16 +33,7 @@
 	{/each}
 
 	{#if c.record.length}
-		<dl class="record">
-			{#each c.record as [label, value], i (i)}
-				<div>
-					<dt>{label}</dt>
-					<dd>
-						{#each lines(value) as line}<span>{line}</span>{/each}
-					</dd>
-				</div>
-			{/each}
-		</dl>
+		<div class="record"><RecordList record={c.record} /></div>
 	{/if}
 
 	{#if c.vendor_text}
@@ -113,35 +99,6 @@
 	}
 	.record {
 		margin: 2.5rem 0 0;
-		max-width: 40rem;
-	}
-	.record div {
-		display: grid;
-		grid-template-columns: 7rem 1fr;
-		gap: 0 1rem;
-	}
-	.record div + div {
-		margin-top: 0.5rem;
-	}
-	dt {
-		color: var(--muted-foreground);
-		font-size: 0.8rem;
-		line-height: 1.6rem;
-	}
-	dd {
-		margin: 0;
-	}
-	dd span {
-		display: block;
-	}
-	/* Narrow: the label sits over its value. */
-	@media (max-width: 30rem) {
-		.record div {
-			grid-template-columns: 1fr;
-		}
-		.record div + div {
-			margin-top: 0.75rem;
-		}
 	}
 	.vendor {
 		margin: 2.5rem 0 0;

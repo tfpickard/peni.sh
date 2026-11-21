@@ -926,7 +926,9 @@ async def judge_plan(
             if isinstance(v, Failed)
         ]
         held += [Held(i, (here[i].book, here[i].position), None, why) for i, why in skipped.items()]
-        placement = lay_books(state.shape, state.leaves, where, [])
+        # A leaf the judge leaves in its book keeps its number, which the owner may have
+        # chosen and the public page shows as `formerly` once it changes.
+        placement = lay_books(state.shape, state.leaves, where, [], settled=True)
         diff, leads = _diff(state, placement)
         moves = _judged_moves(diff, verdicts)
         judged = {m.image_id: hashes[m.image_id] for m in moves if m.chosen_by == "judge"}
@@ -1390,7 +1392,8 @@ async def store_anchor(
     # Conditional on the text: an edit while the model ran would otherwise get the old vector.
     cur = await conn.execute(
         """
-        update collection_books set anchor_embedding = %s, anchor_model = %s, anchor_dim = %s
+        update collection_books set anchor_embedding = %s, anchor_model = %s, anchor_dim = %s,
+               anchor_embedded_at = now()
          where collection_id = %s and number = %s and anchor_text = %s
         """,
         (vec, settings.embed_model, settings.embed_dim, collection_id, number, text),

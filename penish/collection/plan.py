@@ -113,7 +113,7 @@ def _unit(v: np.ndarray) -> np.ndarray | None:
     return None if n < _EPS else v / n
 
 
-def _words(tags: Iterable[str]) -> set[str]:
+def tag_words(tags: Iterable[str]) -> set[str]:
     # A hint matches a whole tag or any word of one, so `serpent` finds `coiled serpent`.
     # Tags are written with hyphens (`zodiac-man`), so a hyphen separates words as well.
     out: set[str] = set()
@@ -131,7 +131,7 @@ def tag_overlap(tags: Iterable[str], hints: Iterable[str]) -> float:
     h = {x.lower().strip() for x in hints if x.strip()}
     if not h:
         return 0.0
-    words = _words(tags)
+    words = tag_words(tags)
     if not words:
         return 0.0
     hit = len(h & words)
@@ -564,10 +564,17 @@ Placement = dict[int, tuple[int, int]]
 
 
 def lay_books(
-    shape: Shape, leaves: list[Leaf], where: Mapping[int, int], books: Iterable[int]
+    shape: Shape,
+    leaves: list[Leaf],
+    where: Mapping[int, int],
+    books: Iterable[int],
+    *,
+    settled: bool = False,
 ) -> Placement:
     """Positions for the named books, and for any book a leaf moves into, given each
-    leaf's book. Every other leaf keeps its place; a book a leaf left keeps its gap."""
+    leaf's book. Every other leaf keeps its place; a book a leaf left keeps its gap.
+    `settled`: a leaf already in the book keeps its slot too, and an arrival takes a free
+    one, chosen among the free slots as the filer would choose."""
     redo = set(books) | {where[x.image_id] for x in leaves if where[x.image_id] != x.book}
     out: Placement = {
         x.image_id: (x.book, x.position) for x in leaves if where[x.image_id] not in redo
@@ -582,7 +589,9 @@ def lay_books(
                 x.vec,
                 x.tags,
                 x.book_pinned,
-                x.pinned,
+                # Held as a pin holds it: a fixed point the arrivals are laid around. A slot
+                # past a shrunken book is no slot to keep, and goes free as before.
+                x.pinned or (settled and x.book == number and 1 <= x.position <= shape.cap),
                 x.judged,
             )
             for x in leaves
