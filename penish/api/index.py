@@ -301,11 +301,12 @@ async def _collection_image(conn: Any, c: dict[str, Any], base: str) -> list[str
 
 async def _collection_page(request: Request, slug: str, book: str | None) -> HTMLResponse:
     """A published collection says its gloss and shows an image; nothing else about itself."""
+    # The connection goes back before the shell is rendered: render_index takes one of its
+    # own, and holding two per request starves the pool under a burst of these pages.
+    tags: list[str] | None = None
     async with request.app.state.pool.connection() as conn:
         c = await published(conn, slug)
-        if c is None:
-            return await render_index(request, status_code=404)
-        if book is None:
+        if c is not None and book is None:
             tags = [_meta("og:type", "website")]
             if c["gloss"] and c["gloss"].strip():
                 tags.append(_meta("og:description", " ".join(c["gloss"].split())))
@@ -313,7 +314,11 @@ async def _collection_page(request: Request, slug: str, book: str | None) -> HTM
             if image:
                 tags.append(_meta("twitter:card", "summary_large_image", "name"))
                 tags.extend(image)
-            return await render_index(request, "".join(tags), title=c["title"])
+    if c is None:
+        return await render_index(request, status_code=404)
+    if tags is not None:
+        return await render_index(request, "".join(tags), title=c["title"])
+    assert book is not None
     if not (book.isascii() and book.isdigit()) or not 1 <= int(book) <= c["book_count"]:
         return await render_index(request, status_code=404)
     title = f"{c['abbrev']} {roman(int(book))}"

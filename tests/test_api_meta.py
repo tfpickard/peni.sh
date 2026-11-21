@@ -4,6 +4,7 @@ import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import psycopg
@@ -537,3 +538,36 @@ async def test_a_taken_down_pictures_haiku_is_not_shown(
         conn.execute("update haikus set image_id = null where l1 = 'from the gone one'")
     seen = {(await client.get("/api/haiku")).json()["lines"][0] for _ in range(30)}
     assert "from the gone one" in seen
+
+
+async def test_collection_page_holds_one_connection_at_a_time(
+    client: httpx.AsyncClient, clean_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Rendering the shell takes a connection of its own; the page must have given its back.
+    _publish(clean_db)
+    held = 0
+    peak = 0
+    pool = client._transport.app.state.pool  # type: ignore[attr-defined]
+    real = pool.connection
+
+    def counting(*a: Any, **kw: Any) -> Any:
+        cm = real(*a, **kw)
+
+        class Wrap:
+            async def __aenter__(self) -> Any:
+                nonlocal held, peak
+                held += 1
+                peak = max(peak, held)
+                return await cm.__aenter__()
+
+            async def __aexit__(self, *exc: Any) -> Any:
+                nonlocal held
+                held -= 1
+                return await cm.__aexit__(*exc)
+
+        return Wrap()
+
+    monkeypatch.setattr(pool, "connection", counting)
+    r = await client.get("/collections/pansophicon")
+    assert r.status_code == 200
+    assert peak == 1

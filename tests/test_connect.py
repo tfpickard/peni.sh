@@ -301,3 +301,19 @@ async def test_collection_haiku_comes_from_its_leaves(
     sql(clean_db, "update haikus set active = true")
     publish(clean_db, False)
     assert (await client.get(url)).status_code == 404
+
+
+async def test_search_by_name_answers_without_the_embedder(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No leaves, no tags, and nothing listening for embeddings: the name still finds it.
+    publish(clean_db)
+    monkeypatch.setenv("EMBED_SERVER_URL", "http://127.0.0.1:9")
+    get_settings.cache_clear()
+    r = await client.get("/api/search", params={"q": "pansophicon"})
+    assert r.status_code == 200, r.text
+    assert r.json()["collection"]["slug"] == SLUG
+    assert r.json()["items"] == []
+    assert (await client.get("/api/search", params={"q": "a chair"})).status_code == 503

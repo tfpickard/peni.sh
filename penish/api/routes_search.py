@@ -282,7 +282,8 @@ async def search(
             first = {r["id"] for r in held}
             rows = (held + [r for r in rows if r["id"] not in first])[:limit]
         og = await overgrowth_by_id(conn, [r["id"] for r in rows])
-    if emb is None and not rows and not tags:
+    # A collection found by name came from the database, not the embedder: it is an answer.
+    if emb is None and not rows and not tags and collection is None:
         raise HTTPException(status_code=503, detail="search unavailable")
     out: dict[str, Any] = {"q": q, "tags": tags, "items": grid_items(rows, og)}
     if collection is not None:
