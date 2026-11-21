@@ -87,7 +87,13 @@
 	// A section takes the server's answer when it was clean, so a model note arriving shows
 	// up; a dirty one keeps its draft, and so does the one just saved if it was typed in
 	// again while the save was out.
-	function take(x: cols.Detail, opts: { open?: boolean; saved?: { key: Key; sent: string } } = {}) {
+	// `refreshed`: x was asked for with the history filter, so its history is the one to show.
+	// An answer for a collection that is not the open one is dropped.
+	function take(
+		x: cols.Detail,
+		opts: { open?: boolean; refreshed?: boolean; saved?: { key: Key; sent: string } } = {}
+	) {
+		if (!opts.open && d && x.slug !== slug) return;
 		const was = new Set<Key>(d ? dirtyIn(d) : []);
 		const fresh = opts.open || !d;
 		d = x;
@@ -97,8 +103,8 @@
 			if (fresh || !was.has(k) || own) adopt(k, x);
 		}
 		// Every write answers unfiltered, so a filtered history asks again.
-		if (histLeaf) void loadHist();
-		else hist = x.history;
+		if (opts.refreshed || !histLeaf) hist = x.history;
+		else void loadHist();
 		if (picked) {
 			const b = x.books.find((bk) => bk.leaves.some((l) => l.image_id === picked?.leaf.image_id));
 			const l = b?.leaves.find((lf) => lf.image_id === picked?.leaf.image_id);
@@ -127,20 +133,28 @@
 	let histLeaf = $state('');
 	let histInput = $state('');
 
+	// The latest open wins; `slug` moves only with the drafts, so a detail that fails to
+	// arrive leaves the form saving to the collection it shows.
+	let opening = 0;
 	async function open(s: string) {
 		// Another collection's drafts would take the place of these.
 		if (dirtyKeys.length && s !== slug && !confirm('unsaved changes. leave?')) return;
+		const n = ++opening;
+		let x: cols.Detail;
+		try {
+			x = await cols.detail(s);
+		} catch {
+			if (n === opening) msg = 'failed';
+			return;
+		}
+		if (n !== opening) return;
 		slug = s;
 		picked = null;
 		explained = null;
 		proposed = null;
 		showNotes = {};
 		histLeaf = histInput = '';
-		try {
-			take(await cols.detail(s), { open: true });
-		} catch {
-			msg = 'failed';
-		}
+		take(x, { open: true });
 	}
 
 	onMount(async () => {
@@ -157,11 +171,13 @@
 
 	// Any action that is not a section's save; it leaves every draft as it is.
 	async function act(fn: () => Promise<cols.Detail>) {
+		const s = slug;
 		msg = '';
 		try {
-			take(await fn());
+			const x = await fn();
+			if (s === slug) take(x);
 		} catch (e) {
-			msg = flat(e);
+			if (s === slug) msg = flat(e);
 		}
 	}
 
@@ -180,21 +196,29 @@
 	}
 	// A failed section stays dirty and says why beside itself; the rest are unaffected.
 	async function save(k: Key): Promise<boolean> {
+		// A leaf unfiled since the list was made has no section to save.
+		if (!d || !keysOf(d).includes(k)) return true;
+		const s = slug;
 		const sent = snap(k);
 		errs[k] = '';
 		try {
-			take(await send(k), { saved: { key: k, sent } });
+			const x = await send(k);
+			if (s === slug) take(x, { saved: { key: k, sent } });
 			return true;
 		} catch (e) {
-			errs[k] = flat(e);
+			if (s === slug) errs[k] = flat(e);
 			return false;
 		}
 	}
 	// One after another through the same endpoints; the list is fixed before the first goes.
 	async function saveAll() {
+		const s = slug;
 		saving = true;
 		try {
-			for (const k of [...dirtyKeys]) await save(k);
+			for (const k of [...dirtyKeys]) {
+				if (s !== slug) break;
+				await save(k);
+			}
 		} finally {
 			saving = false;
 		}
@@ -209,11 +233,13 @@
 	}
 	async function writeNote(id: number) {
 		const k = dr.noteKey(id);
+		const s = slug;
 		errs[k] = '';
 		try {
-			take(await cols.writeNote(slug, id));
+			const x = await cols.writeNote(s, id);
+			if (s === slug) take(x);
 		} catch (e) {
-			errs[k] = flat(e);
+			if (s === slug) errs[k] = flat(e);
 		}
 	}
 
@@ -292,6 +318,8 @@
 		onLeaf((id) => cols.place(slug, id, Number(moveBook), moveLeaf ? Number(moveLeaf) : null));
 	const pinFlip = () => onLeaf((id) => cols.pin(slug, id, !picked!.leaf.pinned));
 	async function unfile(imageId: number) {
+		// An unfiled leaf has no note section left to keep the draft in.
+		if (dirty.has(dr.noteKey(imageId)) && !confirm('unsaved note. unfile anyway?')) return;
 		await act(() => cols.unfile(slug, imageId));
 		if (picked?.leaf.image_id === imageId) {
 			picked = null;
@@ -368,6 +396,19 @@
 		d ? Object.entries(d.judge_failures).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])) : []
 	);
 
+	// One query, with the history filter, and quiet: it leaves a message on the page alone,
+	// and an answer that is late for another collection or filter is dropped.
+	async function refresh() {
+		const s = slug;
+		const leaf = histLeaf;
+		try {
+			const x = await cols.detail(s, leaf);
+			if (s === slug && leaf === histLeaf) take(x, { refreshed: true });
+		} catch {
+			// The next poll asks again.
+		}
+	}
+
 	// While a re-sort, a filing or an anchor waits, keep the page current.
 	const busy = $derived(
 		!!d &&
@@ -380,7 +421,7 @@
 	$effect(() => {
 		if (!busy || !slug) return;
 		const t = setInterval(() => {
-			if (document.visibilityState === 'visible') act(() => cols.detail(slug));
+			if (document.visibilityState === 'visible') void refresh();
 		}, 3000);
 		return () => clearInterval(t);
 	});
@@ -753,6 +794,7 @@
 							class:sel={picked?.leaf.image_id === l.image_id}
 							class:pin={l.pinned}
 							title="{i + 1} {l.slug ?? ''}"
+							aria-label="leaf {i + 1} {l.slug ?? ''}"
 							onclick={() => pick(b.number, l)}
 						>
 							{#if l.thumb}<img src={l.thumb} alt="" loading="lazy" />{/if}

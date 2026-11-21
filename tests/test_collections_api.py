@@ -406,6 +406,11 @@ async def test_history_is_the_latest_twenty_and_filters_by_leaf(
     got = (await client.get(f"{ADM}/{SLUG}", params={"leaf": "img-1"})).json()["history"]
     assert len(got) == 20 and {h["image_id"] for h in got} == {a}
     assert (await client.get(f"{ADM}/{SLUG}", params={"leaf": "nope"})).json()["history"] == []
+    # Digits that are not ASCII, and a run too long for an id, are slugs that match nothing,
+    # not a 500.
+    for odd in ("\u00b2", "\u0661\u0662", "9" * 30):
+        r = await client.get(f"{ADM}/{SLUG}", params={"leaf": odd})
+        assert r.status_code == 200 and r.json()["history"] == []
     assert len((await client.get(f"{ADM}/{SLUG}", params={"leaf": " "})).json()["history"]) == 20
 
 

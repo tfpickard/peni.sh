@@ -94,7 +94,10 @@ async def _history(conn: Any, collection_id: int, leaf: str | None) -> list[dict
     if leaf is not None and leaf.strip():
         leaf = leaf.strip()
         where = "and (h.image_id = %(id)s or i.slug = %(slug)s)"
-        params.update(id=int(leaf) if leaf.isdigit() else None, slug=leaf)
+        # ASCII only: `²` and Arabic-Indic digits are digits to str but not to int(). Nine
+        # digits at most, so a long run is asked for as a slug and cannot overflow the id.
+        is_id = leaf.isascii() and leaf.isdigit() and len(leaf) <= 9
+        params.update(id=int(leaf) if is_id else None, slug=leaf)
     cur = await conn.execute(
         f"""
         select h.id, h.image_id, i.slug, h.from_book, h.from_position, h.to_book,
