@@ -270,7 +270,8 @@ def test_dehyphen_lets_a_hint_reach_inside_a_tag() -> None:
 
     tags = frozenset({"zodiac-man", "aged-paper"})
     assert rep.dehyphen(tags) == frozenset({"zodiac man", "aged paper"})
-    assert tag_overlap(tags, ["zodiac"]) == 0.0
+    # The filer splits on hyphens itself now, so both read the same.
+    assert tag_overlap(tags, ["zodiac"]) == 1.0
     assert tag_overlap(rep.dehyphen(tags), ["zodiac"]) == 1.0
 
 
