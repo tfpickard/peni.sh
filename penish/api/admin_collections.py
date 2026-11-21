@@ -179,6 +179,17 @@ async def detail(conn: Any, c: dict[str, Any], leaf: str | None = None) -> dict[
     )
     resort = await cur.fetchone()
 
+    cur = await conn.execute(
+        "select payload->>'image_id' as image_id from jobs where type = %s"
+        " and status in ('queued', 'running') and payload->>'collection_id' = %s",
+        (store.NOTE_JOB, str(c["id"])),
+    )
+    waiting = list(await cur.fetchall())
+    noting = len(waiting)
+    # By leaf, so the list can say which note is on its way; a leaf can hold two jobs (a
+    # fill and a rewrite), which `notes_queued` counts twice and this counts once.
+    noting_leaves = {r["image_id"] for r in waiting}
+
     thumbs = _thumbs([*leaves, *requests])
     by_book: dict[int, list[dict[str, Any]]] = {}
     for r in leaves:
@@ -193,14 +204,9 @@ async def detail(conn: Any, c: dict[str, Any], leaf: str | None = None) -> dict[
                 "book_pinned": r["book_pinned"],
                 "note": r["note"],
                 "note_source": r["note_source"],
+                "note_queued": str(r["id"]) in noting_leaves,
             }
         )
-    cur = await conn.execute(
-        "select count(*)::int as n from jobs where type = %s and status in ('queued', 'running')"
-        " and payload->>'collection_id' = %s",
-        (store.NOTE_JOB, str(c["id"])),
-    )
-    noting = (await cur.fetchone() or {"n": 0})["n"]
     # A live picture waiting to be filed is already listed under requests, with its retry.
     requested = {r["id"] for r in requests}
     arriving = [

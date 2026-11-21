@@ -1,8 +1,12 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { beforeNavigate } from '$app/navigation';
 	import * as cols from '../../../lib/admin-collections';
+	import * as dr from '../../../lib/collection-drafts';
+	import type { Key } from '../../../lib/collection-drafts';
 	import { roman } from '../../../lib/roman';
 	import Grow from '../../../lib/components/admin/Grow.svelte';
+	import RecordList from '../../../lib/components/RecordList.svelte';
 
 	let summaries = $state<cols.Summary[]>([]);
 	let slug = $state('');
@@ -10,39 +14,97 @@
 	let msg = $state('');
 	let loaded = $state(false);
 
-	// Drafts, so a reload after another action does not throw away what is being typed.
-	type Row = { label: string; value: string };
-	type Head = {
-		title: string;
-		abbrev: string;
-		abbrev_latin: string;
-		gloss: string;
-		preamble: string;
-		record: Row[];
-		vendor_text: string;
-	};
-	const headOf = (x: cols.Detail): Head => ({
-		title: x.title,
-		abbrev: x.abbrev,
-		abbrev_latin: x.abbrev_latin,
-		gloss: x.gloss,
-		preamble: x.preamble,
-		record: x.record.map(([label, value]) => ({ label, value })),
-		vendor_text: x.vendor_text ?? ''
-	});
-	let head = $state<Head>({
+	// Drafts. Each section (the collection's fields, its record, tuning, each book, each
+	// leaf's note) is edited, saved and lost on its own: saving one never touches another's
+	// draft, and a reload after some other action keeps what is being typed.
+	let fields = $state<dr.Fields>({
 		title: '',
 		abbrev: '',
 		abbrev_latin: '',
 		gloss: '',
 		preamble: '',
-		record: [],
 		vendor_text: ''
 	});
+	let record = $state<dr.Row[]>([]);
 	let tuning = $state<cols.Tuning | null>(null);
-	// `adding` is what is typed in the hint box and not yet a chip; a save takes it too.
-	type BookDraft = { title: string; anchor_text: string; tag_hints: string[]; adding: string };
-	let books = $state<Record<number, BookDraft>>({});
+	let books = $state<Record<number, dr.BookDraft>>({});
+	// By image id.
+	let notes = $state<Record<number, string>>({});
+	// What a section's last save or note request answered, flat, beside that section.
+	let errs = $state<Record<string, string>>({});
+	let saving = $state(false);
+	// Which books show their notes.
+	let showNotes = $state<Record<number, boolean>>({});
+
+	const leavesOf = (x: cols.Detail) => x.books.flatMap((b) => b.leaves);
+	const keysOf = (x: cols.Detail): Key[] => [
+		'fields',
+		'record',
+		'tuning',
+		...x.books.map((b) => dr.bookKey(b.number)),
+		...leavesOf(x).map((l) => dr.noteKey(l.image_id))
+	];
+	// The sections whose draft differs from `x`.
+	function dirtyIn(x: cols.Detail): Key[] {
+		const out: Key[] = [];
+		if (!dr.same(fields, dr.fieldsOf(x))) out.push('fields');
+		if (!dr.same(record, dr.recordOf(x))) out.push('record');
+		if (tuning && !dr.same(tuning, x.tuning)) out.push('tuning');
+		for (const b of x.books) {
+			if (dr.bookDirty(books[b.number], b)) out.push(dr.bookKey(b.number));
+			for (const l of b.leaves) if (dr.noteDirty(notes[l.image_id], l.note)) out.push(dr.noteKey(l.image_id));
+		}
+		return out;
+	}
+	const dirtyKeys = $derived(d ? dirtyIn(d) : []);
+	const dirty = $derived(new Set<Key>(dirtyKeys));
+	const bookNotesDirty = (b: cols.AdminBook) => b.leaves.some((l) => dirty.has(dr.noteKey(l.image_id)));
+
+	// What a section's draft is now, to tell later whether it moved while a save was out.
+	function snap(k: Key): string {
+		if (k === 'fields') return JSON.stringify(fields);
+		if (k === 'record') return JSON.stringify(record);
+		if (k === 'tuning') return JSON.stringify(tuning);
+		const n = Number(k.slice(k.indexOf(':') + 1));
+		return JSON.stringify(k.startsWith('book:') ? books[n] : notes[n]);
+	}
+	function adopt(k: Key, x: cols.Detail) {
+		if (k === 'fields') fields = dr.fieldsOf(x);
+		else if (k === 'record') record = dr.recordOf(x);
+		else if (k === 'tuning') tuning = { ...x.tuning };
+		else {
+			const n = Number(k.slice(k.indexOf(':') + 1));
+			if (k.startsWith('book:')) {
+				const b = x.books.find((bk) => bk.number === n);
+				if (b) books[n] = dr.bookOf(b);
+			} else {
+				const l = leavesOf(x).find((lf) => lf.image_id === n);
+				if (l) notes[n] = l.note ?? '';
+			}
+		}
+	}
+
+	// A section takes the server's answer when it was clean, so a model note arriving shows
+	// up; a dirty one keeps its draft, and so does the one just saved if it was typed in
+	// again while the save was out.
+	function take(x: cols.Detail, opts: { open?: boolean; saved?: { key: Key; sent: string } } = {}) {
+		const was = new Set<Key>(d ? dirtyIn(d) : []);
+		const fresh = opts.open || !d;
+		d = x;
+		if (opts.open) errs = {};
+		for (const k of keysOf(x)) {
+			const own = opts.saved?.key === k && snap(k) === opts.saved.sent;
+			if (fresh || !was.has(k) || own) adopt(k, x);
+		}
+		// Every write answers unfiltered, so a filtered history asks again.
+		if (histLeaf) void loadHist();
+		else hist = x.history;
+		if (picked) {
+			const b = x.books.find((bk) => bk.leaves.some((l) => l.image_id === picked?.leaf.image_id));
+			const l = b?.leaves.find((lf) => lf.image_id === picked?.leaf.image_id);
+			picked = b && l ? { book: b.number, leaf: l } : null;
+		}
+	}
 
 	// The filer's weights, each with the line that says what it does.
 	const WEIGHTS = [
@@ -65,38 +127,17 @@
 	let histLeaf = $state('');
 	let histInput = $state('');
 
-	const bookDraft = (b: cols.AdminBook): BookDraft => ({
-		title: b.title ?? '',
-		anchor_text: b.anchor_text,
-		tag_hints: [...b.tag_hints],
-		adding: ''
-	});
-
-	function take(x: cols.Detail, fresh = false) {
-		if (fresh || !d) {
-			head = headOf(x);
-			tuning = { ...x.tuning };
-			books = Object.fromEntries(x.books.map((b) => [b.number, bookDraft(b)]));
-		}
-		d = x;
-		// Every write answers unfiltered, so a filtered history asks again.
-		if (histLeaf) void loadHist();
-		else hist = x.history;
-		if (picked) {
-			const b = x.books.find((bk) => bk.leaves.some((l) => l.image_id === picked?.leaf.image_id));
-			const l = b?.leaves.find((lf) => lf.image_id === picked?.leaf.image_id);
-			picked = b && l ? { book: b.number, leaf: l } : null;
-		}
-	}
-
 	async function open(s: string) {
+		// Another collection's drafts would take the place of these.
+		if (dirtyKeys.length && s !== slug && !confirm('unsaved changes. leave?')) return;
 		slug = s;
 		picked = null;
 		explained = null;
 		proposed = null;
+		showNotes = {};
 		histLeaf = histInput = '';
 		try {
-			take(await cols.detail(s), true);
+			take(await cols.detail(s), { open: true });
 		} catch {
 			msg = 'failed';
 		}
@@ -112,52 +153,108 @@
 		loaded = true;
 	});
 
-	async function act(fn: () => Promise<cols.Detail>, fresh = false) {
+	const flat = (e: unknown) => (e instanceof cols.HttpError && e.detail ? e.detail : 'failed');
+
+	// Any action that is not a section's save; it leaves every draft as it is.
+	async function act(fn: () => Promise<cols.Detail>) {
 		msg = '';
 		try {
-			take(await fn(), fresh);
+			take(await fn());
 		} catch (e) {
-			msg = e instanceof cols.HttpError && e.detail ? e.detail : 'failed';
+			msg = flat(e);
 		}
 	}
 
-	const saveHead = () =>
-		act(
-			() =>
-				cols.edit(slug, {
-					title: head.title,
-					abbrev: head.abbrev,
-					abbrev_latin: head.abbrev_latin,
-					gloss: head.gloss,
-					preamble: head.preamble,
-					record: head.record.map((r) => [r.label, r.value] as [string, string]),
-					vendor_text: head.vendor_text
-				}),
-			true
-		);
-	const addRow = () => (head.record = [...head.record, { label: '', value: '' }]);
-	const dropRow = (i: number) => (head.record = head.record.filter((_, k) => k !== i));
+	function send(k: Key): Promise<cols.Detail> {
+		if (k === 'fields') return cols.edit(slug, { ...fields });
+		if (k === 'record') {
+			return cols.edit(slug, { record: record.map((r) => [r.label, r.value] as [string, string]) });
+		}
+		if (k === 'tuning') return cols.edit(slug, { tuning: { ...tuning! } });
+		const n = Number(k.slice(k.indexOf(':') + 1));
+		if (k.startsWith('book:')) {
+			const b = books[n];
+			return cols.editBook(slug, n, { title: b.title, anchor_text: b.anchor_text, tag_hints: dr.hintsOf(b) });
+		}
+		return cols.setNote(slug, n, notes[n]);
+	}
+	// A failed section stays dirty and says why beside itself; the rest are unaffected.
+	async function save(k: Key): Promise<boolean> {
+		const sent = snap(k);
+		errs[k] = '';
+		try {
+			take(await send(k), { saved: { key: k, sent } });
+			return true;
+		} catch (e) {
+			errs[k] = flat(e);
+			return false;
+		}
+	}
+	// One after another through the same endpoints; the list is fixed before the first goes.
+	async function saveAll() {
+		saving = true;
+		try {
+			for (const k of [...dirtyKeys]) await save(k);
+		} finally {
+			saving = false;
+		}
+	}
+	async function saveOne(k: Key) {
+		saving = true;
+		try {
+			await save(k);
+		} finally {
+			saving = false;
+		}
+	}
+	async function writeNote(id: number) {
+		const k = dr.noteKey(id);
+		errs[k] = '';
+		try {
+			take(await cols.writeNote(slug, id));
+		} catch (e) {
+			errs[k] = flat(e);
+		}
+	}
+
+	// A leave warning: reloads and closing by beforeunload, the admin's own links and back
+	// and forward by beforeNavigate. Code that navigates on its own, such as logout, is let
+	// through.
+	function warn(e: BeforeUnloadEvent) {
+		if (!dirtyKeys.length) return;
+		e.preventDefault();
+		// Older Safari and Chrome only ask when this is set.
+		e.returnValue = '';
+	}
+	beforeNavigate((nav) => {
+		if (!dirtyKeys.length || nav.willUnload) return;
+		if (nav.type !== 'link' && nav.type !== 'popstate') return;
+		// Against where the navigation started, not location, as the upload form's does.
+		if (nav.to?.url.pathname === nav.from?.url.pathname) return;
+		if (!confirm('unsaved changes. leave?')) nav.cancel();
+	});
+
+	const addRow = () => (record = [...record, { label: '', value: '' }]);
+	const dropRow = (i: number) => (record = record.filter((_, k) => k !== i));
 	function shift(i: number, by: -1 | 1) {
 		const j = i + by;
-		if (j < 0 || j >= head.record.length) return;
-		const next = [...head.record];
+		if (j < 0 || j >= record.length) return;
+		const next = [...record];
 		[next[i], next[j]] = [next[j], next[i]];
-		head.record = next;
+		record = next;
+	}
+	// The preview's pencil: the row's value, where the text is.
+	function editRow(i: number) {
+		const el = document.getElementById(`rec-value-${i}`);
+		el?.scrollIntoView({ block: 'center' });
+		el?.focus();
 	}
 	const writeMissing = () => act(() => cols.writeMissingNotes(slug));
 	const flipPublished = () => act(() => cols.edit(slug, { published: !d?.published }));
-	const saveTuning = () => tuning && act(() => cols.edit(slug, { tuning: { ...tuning! } }), true);
-	const tuningDirty = $derived(!!d && !!tuning && JSON.stringify(tuning) !== JSON.stringify(d.tuning));
 
-	// Hints are stored lowercased and trimmed, so the chips are too.
-	const hintsIn = (text: string) =>
-		text
-			.split(/[,\n]/)
-			.map((t) => t.trim().toLowerCase())
-			.filter(Boolean);
 	function addHints(n: number) {
 		const b = books[n];
-		b.tag_hints = [...new Set([...b.tag_hints, ...hintsIn(b.adding)])];
+		b.tag_hints = [...new Set([...b.tag_hints, ...dr.hintsIn(b.adding)])];
 		b.adding = '';
 	}
 	const dropHint = (n: number, h: string) =>
@@ -168,22 +265,6 @@
 			addHints(n);
 		}
 	}
-	function saveBook(n: number) {
-		const b = books[n];
-		const hints = [...new Set([...b.tag_hints, ...hintsIn(b.adding)])];
-		return act(() => cols.editBook(slug, n, { title: b.title, anchor_text: b.anchor_text, tag_hints: hints }), true);
-	}
-	const bookDirty = (b: cols.AdminBook) => {
-		const x = books[b.number];
-		return (
-			!!x &&
-			(x.title !== (b.title ?? '') ||
-				x.anchor_text !== b.anchor_text ||
-				x.tag_hints.join('\n') !== b.tag_hints.join('\n') ||
-				hintsIn(x.adding).length > 0)
-		);
-	};
-	const headDirty = $derived(!!d && JSON.stringify(head) !== JSON.stringify(headOf(d)));
 
 	async function explain(imageId: number) {
 		try {
@@ -324,8 +405,22 @@
 		j.error ? `judge ${j.error}` : `judge ${rom(j.book)}, runner-up ${rom(j.runner_up)}`;
 </script>
 
+<svelte:window onbeforeunload={warn} />
+
 {#snippet mark(on: 'public' | 'filing only')}
 	<span class="mark">{on}</span>
+{/snippet}
+
+<!-- Beside a section's save: that it differs from the server, and why its last save failed. -->
+{#snippet status(k: Key)}
+	{#if dirty.has(k)}<span class="unsaved">unsaved</span>{/if}
+	{#if errs[k]}<span class="hot err">{errs[k]}</span>{/if}
+{/snippet}
+
+{#snippet icon(path: string)}
+	<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+		<path d={path} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="square" />
+	</svg>
 {/snippet}
 
 {#if loaded && !summaries.length}
@@ -343,65 +438,103 @@
 {/if}
 
 {#if d}
+	<!-- Every dirty section at once; always drawn, so the page does not shift when one is edited. -->
+	<div class="bar">
+		<button class="go" disabled={!dirtyKeys.length || saving} onclick={saveAll}>save all</button>
+		{#if dirtyKeys.length}<span class="unsaved">unsaved {dirtyKeys.length}</span>{/if}
+	</div>
+
 	<!-- The collection's own text, all of it public. -->
 	<section class="head">
 		<label>
 			<span class="l">title {@render mark('public')}</span>
-			<input bind:value={head.title} />
+			<input bind:value={fields.title} />
 		</label>
 		<div class="pair">
 			<label>
 				<span class="l">abbreviation {@render mark('public')}</span>
-				<input bind:value={head.abbrev} />
+				<input bind:value={fields.abbrev} />
 			</label>
 			<label>
 				<span class="l">latin {@render mark('public')}</span>
-				<input bind:value={head.abbrev_latin} />
+				<input bind:value={fields.abbrev_latin} />
 			</label>
 		</div>
 		<label>
 			<span class="l">gloss {@render mark('public')}</span>
-			<Grow min={1} bind:value={head.gloss} />
+			<Grow min={1} bind:value={fields.gloss} />
 		</label>
 		<label>
 			<span class="l">preamble {@render mark('public')}</span>
-			<Grow min={5} bind:value={head.preamble} />
+			<Grow min={5} bind:value={fields.preamble} />
 		</label>
-
-		<div class="record">
-			<span class="l">record {@render mark('public')}</span>
-			{#each head.record as row, i (i)}
-				<div class="rec">
-					<input class="lab" bind:value={row.label} aria-label="label {i + 1}" placeholder="label" />
-					<Grow
-						min={1}
-						bind:value={row.value}
-						aria-label="value {i + 1}"
-						placeholder="value, one line per line"
-					/>
-					<div class="recacts">
-						<button class="link" disabled={i === 0} onclick={() => shift(i, -1)}>up</button>
-						<button class="link" disabled={i === head.record.length - 1} onclick={() => shift(i, 1)}
-							>down</button
-						>
-						<button class="link" onclick={() => dropRow(i)}>remove</button>
-					</div>
-				</div>
-			{/each}
-			<div class="row"><button class="link" onclick={addRow}>add row</button></div>
-		</div>
-
 		<label>
 			<span class="l">vendor's description {@render mark('public')}</span>
-			<Grow min={3} bind:value={head.vendor_text} />
+			<Grow min={3} bind:value={fields.vendor_text} />
 		</label>
 		<div class="row">
-			<button class="go" disabled={!headDirty} onclick={saveHead}>save</button>
+			<button class="go" disabled={!dirty.has('fields') || saving} onclick={() => saveOne('fields')}>save</button>
+			{@render status('fields')}
 			<button class:link={d.published} onclick={flipPublished}>
 				{d.published ? 'unpublish' : 'publish'}
 			</button>
 			<span class="dim">{d.published ? 'published' : 'not published'}</span>
 			<a href="/collections/{d.slug}" class="dim">view</a>
+		</div>
+	</section>
+
+	<!-- The record: rows to edit, and the page's own markup showing what they make. -->
+	<section class="recsec">
+		<div class="record">
+			<span class="l">record {@render mark('public')}</span>
+			{#each record as row, i (i)}
+				<div class="rec">
+					<input
+						class="lab"
+						id="rec-label-{i}"
+						bind:value={row.label}
+						aria-label="label {i + 1}"
+						placeholder="label"
+					/>
+					<Grow
+						min={1}
+						id="rec-value-{i}"
+						bind:value={row.value}
+						aria-label="value {i + 1}"
+						placeholder="value, one line per line"
+					/>
+					<div class="recacts">
+						<button class="icon" aria-label="up" title="up" disabled={i === 0} onclick={() => shift(i, -1)}>
+							{@render icon('M3 10.5 8 5.5l5 5')}
+						</button>
+						<button
+							class="icon"
+							aria-label="down"
+							title="down"
+							disabled={i === record.length - 1}
+							onclick={() => shift(i, 1)}
+						>
+							{@render icon('M3 5.5 8 10.5l5-5')}
+						</button>
+						<button class="icon" aria-label="remove" title="remove" onclick={() => dropRow(i)}>
+							{@render icon('M4 4l8 8M12 4l-8 8')}
+						</button>
+					</div>
+				</div>
+			{/each}
+			<div class="row"><button class="link" onclick={addRow}>add row</button></div>
+		</div>
+		<div class="row">
+			<button class="go" disabled={!dirty.has('record') || saving} onclick={() => saveOne('record')}>save</button>
+			{@render status('record')}
+		</div>
+		<div class="preview">
+			<span class="l dim">preview</span>
+			{#if record.some((r) => r.label.trim() || r.value.trim())}
+				<RecordList record={record.map((r) => [r.label, r.value])} onedit={editRow} />
+			{:else}
+				<p class="dim">0 rows</p>
+			{/if}
 		</div>
 	</section>
 
@@ -431,7 +564,8 @@
 			</label>
 		</div>
 		<div class="row">
-			<button disabled={!tuningDirty} onclick={saveTuning}>save</button>
+			<button disabled={!dirty.has('tuning') || saving} onclick={() => saveOne('tuning')}>save</button>
+			{@render status('tuning')}
 		</div>
 	{/if}
 
@@ -605,7 +739,10 @@
 					</div>
 				</div>
 				<div class="row">
-					<button disabled={!bookDirty(b)} onclick={() => saveBook(b.number)}>save</button>
+					<button disabled={!dirty.has(dr.bookKey(b.number)) || saving} onclick={() => saveOne(dr.bookKey(b.number))}
+						>save</button
+					>
+					{@render status(dr.bookKey(b.number))}
 				</div>
 			{/if}
 			<div class="grid" style:--n={Math.min(d.leaves_per_book, 11)}>
@@ -715,6 +852,41 @@
 					{/if}
 				</div>
 			{/if}
+			<!-- Each leaf's note, folded away: a book can hold 77. -->
+			{#if b.leaves.length}
+				{@const queued = b.leaves.filter((l) => l.note_queued).length}
+				<div class="row notesbar">
+					<button class="link" aria-expanded={!!showNotes[b.number]} onclick={() => (showNotes[b.number] = !showNotes[b.number])}
+						>notes {b.leaves.length}</button
+					>
+					{#if bookNotesDirty(b)}<span class="unsaved">unsaved</span>{/if}
+					{#if queued}<span class="dim">{queued} queued</span>{/if}
+				</div>
+				{#if showNotes[b.number]}
+					<ul class="plain notes">
+						{#each b.leaves as l (l.image_id)}
+							{@const k = dr.noteKey(l.image_id)}
+							<li>
+								<div class="row nhead">
+									<span class="dim">leaf {l.position}</span>
+									<a href="/admin/pictures/{l.image_id}">{l.slug ?? l.image_id}</a>
+									{#if l.note_source}<span class="dim">{l.note_source}</span>{/if}
+									{#if l.note_queued}<span class="dim">queued</span>{/if}
+									<button disabled={!dirty.has(k) || saving} onclick={() => saveOne(k)}>save</button>
+									<button
+										class="link"
+										disabled={l.note_source === 'owner' || l.note_queued}
+										title={l.note_source === 'owner' ? "the note is the owner's" : 'write note'}
+										onclick={() => writeNote(l.image_id)}>write note</button
+									>
+									{@render status(k)}
+								</div>
+								<Grow min={1} bind:value={notes[l.image_id]} aria-label="note for leaf {l.position}" />
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			{/if}
 		</section>
 	{/each}
 
@@ -775,6 +947,21 @@
 		flex-wrap: wrap;
 		gap: 0 1.5rem;
 	}
+	/* Every dirty section's save in one place, as high as the page's top while it scrolls. */
+	.bar {
+		position: sticky;
+		top: 0;
+		z-index: 2;
+		display: flex;
+		align-items: center;
+		gap: 1.25rem;
+		padding: 0.5rem 0;
+		background: var(--background);
+	}
+	.unsaved {
+		font-size: 0.875rem;
+		color: var(--muted-foreground);
+	}
 	.record {
 		display: flex;
 		flex-direction: column;
@@ -790,8 +977,24 @@
 	.recacts {
 		grid-column: 2;
 		display: flex;
-		gap: 1.25rem;
-		font-size: 0.875rem;
+		gap: 0.25rem;
+		margin-top: -0.25rem;
+	}
+	/* Small glyphs, but a thumb-sized place to press. */
+	.recacts .icon {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 2.75rem;
+		min-height: 2.75rem;
+		color: var(--muted-foreground);
+	}
+	.recacts .icon:disabled {
+		color: var(--ink-700);
+	}
+	.recacts .icon:hover:not(:disabled),
+	.recacts .icon:focus-visible {
+		color: var(--foreground);
 	}
 	@media (max-width: 30rem) {
 		.rec {
@@ -800,6 +1003,36 @@
 		.recacts {
 			grid-column: 1;
 		}
+	}
+	.preview {
+		margin-top: 1.5rem;
+		padding-left: 1rem;
+		border-left: 1px solid var(--ink-700);
+		max-width: 40rem;
+	}
+	.preview .l {
+		display: block;
+		font-size: 0.875rem;
+		margin-bottom: 0.5rem;
+	}
+	.preview p {
+		margin: 0;
+	}
+	.notes {
+		gap: 1rem;
+		margin-top: 0.75rem;
+		max-width: 40rem;
+	}
+	/* Its actions sit with its name, so a long list stays short; still a place to press. */
+	.nhead {
+		gap: 0 1rem;
+		font-size: 0.875rem;
+	}
+	.nhead button {
+		min-height: 2.5rem;
+	}
+	.notes li :global(textarea) {
+		width: 100%;
 	}
 	.row {
 		margin-top: 0.75rem;
@@ -999,6 +1232,12 @@
 		}
 		.wide {
 			overflow: visible;
+		}
+		/* The preview repeats the record, and the bar and pencils are for the screen. */
+		.bar,
+		.preview,
+		.recacts {
+			display: none;
 		}
 	}
 </style>

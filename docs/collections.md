@@ -431,6 +431,17 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
   number of leaves it meets, matched as `tag_overlap` matches); `history`, the newest 20
   rows with `chosen_by`, narrowed by `?leaf=` (image id or slug); and `judge_failures`,
   the failed judgements among the last 20 filings by kind (`off` is not a failure).
+- Each leaf in that answer carries `note_queued`: a `collection_note` job for it is queued or
+  running (a leaf holding a fill and a rewrite counts once; `notes_queued` still counts jobs).
+- `/admin/collections` edits in sections: the collection's fields, the record, tuning, each
+  book, each leaf's note. Each says `unsaved` while its draft differs from the server, `save
+  all` saves them one after another through the same endpoints (a refused one stays unsaved
+  with the server's reason beside it, and the rest are saved), and leaving with any unsaved
+  asks first. Saving a section, or any other action, leaves every other section's draft
+  alone; a clean section follows the server. The record has a live preview drawn by the same
+  component as the public page. Under each book's grid, `notes N` opens its leaves with
+  their notes: saving one stores it as the owner's, `write note` queues a model note and is
+  refused for an owner note, and clearing a note hands the leaf back.
 - `explain` returns `judged` (the judge chose its book), `filed.scores.judge` for a judged
   filing, and `judgement`: the kept answer for the leaf as it is now, or null.
 

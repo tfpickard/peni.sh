@@ -220,6 +220,7 @@ async def test_admin_detail(client: httpx.AsyncClient, clean_db: str) -> None:
             "book_pinned": True,
             "note": None,
             "note_source": None,
+            "note_queued": False,
         }
     ]
 
@@ -812,6 +813,9 @@ async def test_admin_notes(client: httpx.AsyncClient, clean_db: str) -> None:
     # One leaf on demand is a rewrite, in its own key space.
     r = await client.post(f"{ADM}/{SLUG}/leaves/{b}/note", headers=XHR)
     assert r.status_code == 200 and r.json()["notes_queued"] == 2
+    # The list says which leaf waits; a leaf holding two jobs is one leaf.
+    leaves = r.json()["books"][2]["leaves"]
+    assert [x["note_queued"] for x in leaves] == [False, True]
     # Clearing the owner's note gives the leaf back.
     r = await client.put(f"{ADM}/{SLUG}/leaves/{a}/note", json={"note": ""})
     got = r.json()["books"][2]["leaves"][0]

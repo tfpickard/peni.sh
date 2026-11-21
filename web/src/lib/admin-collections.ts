@@ -57,6 +57,8 @@ export type AdminLeaf = {
 	book_pinned: boolean;
 	note: string | null;
 	note_source: 'owner' | 'model' | null;
+	// A note job for this leaf waits or is running.
+	note_queued: boolean;
 };
 // `queued`: no usable vector and the worker has the embedding queued or running. `stale`:
 // no usable vector and nothing queued (a dry run queues it).
