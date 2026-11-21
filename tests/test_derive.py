@@ -3,6 +3,8 @@ import io
 import struct
 import sys
 import zlib
+from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pillow_heif
@@ -10,7 +12,9 @@ import pytest
 import pyvips
 from PIL import Image
 
-from penish.worker import derive
+from penish.config import Settings
+from penish.storage import LocalStorage
+from penish.worker import admin_jobs, derive, ingest
 from penish.worker.derive import (
     MIN_CROP,
     UndecodableImage,
@@ -19,9 +23,13 @@ from penish.worker.derive import (
     clean_original,
     load_and_validate,
     make_derivatives,
+    make_og,
     palette_of,
     rebuild_public,
 )
+from penish.worker.jobs import HardError
+from tests.test_admin_jobs import crop, job, live, row
+from tests.test_ingest import DIM, q
 
 
 def _gradient(w: int, h: int) -> pyvips.Image:
@@ -474,3 +482,234 @@ def test_clamp_rect() -> None:
     ):
         with pytest.raises(ValueError):
             clamp_rect(bad, 800, 600)
+
+
+# -- og jpeg ------------------------------------------------------------------
+
+
+def _exif_fields(data: bytes) -> list[str]:
+    img = pyvips.Image.new_from_buffer(data, "")
+    return [f for f in img.get_fields() if f.startswith(("exif", "xmp", "iptc", "icc"))]
+
+
+def _gps_jpeg_wide() -> bytes:
+    img = _gradient(2000, 1000).copy()
+    img.set_type(pyvips.GValue.gstr_type, "exif-ifd3-GPSLatitudeRef", "N")
+    img.set_type(pyvips.GValue.gstr_type, "exif-ifd3-GPSLongitudeRef", "E")
+    out = img.write_to_buffer(".jpg", keep="all")
+    assert isinstance(out, bytes)
+    return out
+
+
+def test_og_is_a_1200_progressive_jpeg_without_metadata() -> None:
+    src = _gps_jpeg_wide()
+    assert _has_gps(src), "fixture must actually carry GPS"
+    d = load_and_validate(src)
+    og = make_og(d.image, d.sha256)
+    assert og is not None
+    assert (og.key, og.fmt) == (f"pub/{d.sha256}-1200.jpg", "jpg")
+    assert (og.width, og.height) == (1200, 600)
+    img = pyvips.Image.new_from_buffer(og.data, "")
+    assert str(img.get("vips-loader")) == "jpegload_buffer"
+    assert (img.width, img.height, img.bands) == (1200, 600, 3)
+    assert img.get("interlaced") == 1
+    assert not _has_gps(og.data) and _exif_fields(og.data) == []
+
+
+def test_og_never_upscales() -> None:
+    d = load_and_validate(_png(800, 600))
+    og = make_og(d.image, d.sha256)
+    assert og is not None
+    assert og.key == f"pub/{d.sha256}-800.jpg" and (og.width, og.height) == (800, 600)
+    img = pyvips.Image.new_from_buffer(og.data, "")
+    assert (img.width, img.height) == (800, 600)
+
+
+@pytest.mark.parametrize("w,h", [(4032, 3024), (3000, 1999), (1201, 7), (1999, 3001), (1200, 1)])
+def test_og_size_is_the_file_size(w: int, h: int) -> None:
+    # The api states og_size in the head without opening the file, so they must agree.
+    og = make_og(_gradient(w, h), "a" * 64)
+    assert og is not None
+    img = pyvips.Image.new_from_buffer(og.data, "")
+    assert (img.width, img.height) == (og.width, og.height) == derive.og_size(w, h)
+    assert og.key == derive.og_key("a" * 64, w)
+
+
+def test_og_flattens_alpha_and_grey_to_rgb() -> None:
+    rgba = _gradient(300, 200).bandjoin(128).copy(interpretation="srgb")
+    grey = _gradient(300, 200).colourspace("b-w")
+    for src in (rgba, grey):
+        data = src.write_to_buffer(".png")
+        d = load_and_validate(data)
+        og = make_og(d.image, d.sha256, watermark=True)
+        assert og is not None
+        img = pyvips.Image.new_from_buffer(og.data, "")
+        assert (img.bands, img.interpretation) == (3, "srgb")
+
+
+def test_og_failure_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*a: object, **kw: object) -> bytes:
+        raise pyvips.Error("no jpeg today")
+
+    monkeypatch.setattr(derive, "_save", broken)
+    assert make_og(_gradient(300, 200), "a" * 64) is None
+
+
+def test_rebuild_public_carries_og() -> None:
+    data = _clean()
+    pub = rebuild_public(data, None, False)
+    assert pub.og is not None and pub.og.key == f"pub/{pub.pub_sha}-1200.jpg"
+    # Not in the ladder: the publish gate and the variants never see it.
+    assert all(x.fmt in ("avif", "webp") for x in pub.derivatives)
+    cropped = rebuild_public(data, {"x": 100, "y": 50, "w": 700, "h": 400}, False)
+    assert cropped.og is not None
+    assert cropped.og.key == f"pub/{cropped.pub_sha}-700.jpg"
+    assert (cropped.og.width, cropped.og.height) == (700, 400)
+
+
+# -- og jpeg through the worker -------------------------------------------------------
+# Here rather than beside the ingest and crop tests: the og JPEG's whole lifecycle in one
+# place, from the derive that makes it to the sweep that backfills it.
+
+
+@pytest.fixture
+def p(pool: object) -> Any:
+    return cast(Any, pool)
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    return Settings(data_dir=tmp_path, embed_model="test/embed", embed_dim=DIM)
+
+
+def _jpgs(settings: Settings) -> list[str]:
+    return sorted(f.name for f in settings.media_pub.iterdir() if f.name.endswith(".jpg"))
+
+
+async def _og_jobs(p: Any) -> list[dict[str, Any]]:
+    return await q(p, "select * from jobs where type = %s order by id", admin_jobs.OG_JOB)
+
+
+async def test_og_written_at_ingest(p: Any, settings: Settings) -> None:
+    image_id = await live(p, settings, w=1600, h=1000)
+    r = await row(p, image_id)
+    assert _jpgs(settings) == [f"{r['pub_sha']}-1200.jpg"]
+    img = pyvips.Image.new_from_file(str(settings.media_pub / f"{r['pub_sha']}-1200.jpg"))
+    assert (img.width, img.height) == (1200, 750)
+
+
+async def test_og_failure_never_blocks_go_live(
+    p: Any, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ingest, "make_og", lambda *a, **kw: None)
+    first = await live(p, settings, seed=1)
+    assert (await row(p, first))["status"] == "live" and _jpgs(settings) == []
+    monkeypatch.undo()
+
+    real = LocalStorage.put_bytes
+
+    def no_jpeg(self: LocalStorage, key: str, data: bytes) -> None:
+        if key.endswith(".jpg"):
+            raise OSError("disk full")
+        real(self, key, data)
+
+    monkeypatch.setattr(LocalStorage, "put_bytes", no_jpeg)
+    second = await live(p, settings, seed=2)
+    assert (await row(p, second))["status"] == "live" and _jpgs(settings) == []
+
+
+async def test_og_sweep_queues_once_and_staggers(p: Any, settings: Settings) -> None:
+    a = await live(p, settings, seed=1)
+    b = await live(p, settings, seed=2)
+    c = await live(p, settings, seed=3)
+    rows = {i: await row(p, i) for i in (a, b, c)}
+    async with p.connection() as conn:
+        # A second picture on a's pub_sha shares a's file, and a hidden one is not swept.
+        await conn.execute(
+            "insert into images (sha256, pub_sha, status, width, height)"
+            " values (%s, %s, 'live', 1200, 800)",
+            ("f" * 64, rows[a]["pub_sha"]),
+        )
+        await conn.execute("update images set status = 'unpublished' where id = %s", (c,))
+    for f in settings.media_pub.glob("*.jpg"):
+        f.unlink()
+
+    assert await admin_jobs.enqueue_missing_og(p, settings) == 2
+    assert await admin_jobs.enqueue_missing_og(p, settings) == 0
+    js = await _og_jobs(p)
+    assert [j["payload"]["image_id"] for j in js] == [a, b]
+    assert [j["dedupe_key"] for j in js] == [
+        f"og_image:{rows[a]['pub_sha']}",
+        f"og_image:{rows[b]['pub_sha']}",
+    ]
+    late = await q(p, "select now() + interval '2 minutes' as t")
+    # Behind anything an upload queues now, and one after another rather than all at once.
+    assert all(j["run_after"] > late[0]["t"] for j in js)
+    assert js[0]["run_after"] < js[1]["run_after"]
+
+    for j in js:
+        await admin_jobs.handle_og(
+            job(admin_jobs.OG_JOB, j["payload"], j["id"]), pool=p, settings=settings
+        )
+    assert _jpgs(settings) == sorted(f"{rows[i]['pub_sha']}-1200.jpg" for i in (a, b))
+    async with p.connection() as conn:
+        await conn.execute("update jobs set status = 'done'")
+    assert await admin_jobs.enqueue_missing_og(p, settings) == 0
+
+    # A failed job is not retried at every start.
+    (settings.media_pub / f"{rows[b]['pub_sha']}-1200.jpg").unlink()
+    async with p.connection() as conn:
+        await conn.execute(
+            "update jobs set status = 'failed' where dedupe_key = %s",
+            (f"og_image:{rows[b]['pub_sha']}",),
+        )
+    assert await admin_jobs.enqueue_missing_og(p, settings) == 0
+
+
+async def test_og_job_for_a_cropped_picture(p: Any, settings: Settings) -> None:
+    image_id = await live(p, settings)
+    await crop(p, settings, image_id, {"x": 100, "y": 50, "w": 600, "h": 500})
+    r = await row(p, image_id)
+    name = f"{r['pub_sha']}-600.jpg"
+    made = (settings.media_pub / name).read_bytes()
+    (settings.media_pub / name).unlink()
+    assert await admin_jobs.enqueue_missing_og(p, settings) == 1
+    (j,) = await _og_jobs(p)
+    await admin_jobs.handle_og(
+        job(admin_jobs.OG_JOB, j["payload"], j["id"]), pool=p, settings=settings
+    )
+    # From the cropped pixels, the same file the crop wrote.
+    assert (settings.media_pub / name).read_bytes() == made
+
+
+async def test_og_follows_the_crop(p: Any, settings: Settings) -> None:
+    image_id = await live(p, settings)
+    old = (await row(p, image_id))["pub_sha"]
+    assert _jpgs(settings) == [f"{old}-1200.jpg"]
+    await admin_jobs.enqueue_missing_og(p, settings)
+
+    await crop(p, settings, image_id, {"x": 100, "y": 50, "w": 600, "h": 500})
+    new = (await row(p, image_id))["pub_sha"]
+    assert _jpgs(settings) == [f"{new}-600.jpg"]
+    img = pyvips.Image.new_from_file(str(settings.media_pub / f"{new}-600.jpg"))
+    assert (img.width, img.height) == (600, 500)
+
+    # A job queued for the old framing finds the picture moved on and leaves it be.
+    stale = job(admin_jobs.OG_JOB, {"image_id": image_id, "pub_sha": old})
+    await admin_jobs.handle_og(stale, pool=p, settings=settings)
+    assert _jpgs(settings) == [f"{new}-600.jpg"]
+
+
+async def test_og_job_for_a_deleted_picture(p: Any, settings: Settings) -> None:
+    gone = job(admin_jobs.OG_JOB, {"image_id": 999, "pub_sha": "a" * 64})
+    await admin_jobs.handle_og(gone, pool=p, settings=settings)
+    with pytest.raises(HardError):
+        await admin_jobs.handle_og(job(admin_jobs.OG_JOB, {}), pool=p, settings=settings)
+
+
+def test_delete_takes_the_og(tmp_path: Path) -> None:
+    sha = "b" * 64
+    for name in (f"{sha}-480.webp", f"{sha}-480.avif", f"{sha}-1200.jpg", f"{'c' * 64}-1200.jpg"):
+        (tmp_path / name).write_bytes(b"x")
+    assert admin_jobs.remove_pub(tmp_path, sha) == 3
+    assert [f.name for f in tmp_path.iterdir()] == [f"{'c' * 64}-1200.jpg"]

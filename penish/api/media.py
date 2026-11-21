@@ -8,13 +8,16 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from penish.config import get_settings
+from penish.worker.derive import og_key, og_size
 
 router = APIRouter()
 
 _IMMUTABLE = "public, max-age=31536000, immutable"
 # Strict on purpose: the name is the only thing between a request and the filesystem.
-_NAME = re.compile(r"^[0-9a-f]{64}-\d+\.(avif|webp)$")
-_TYPES = {"avif": "image/avif", "webp": "image/webp"}
+_NAME = re.compile(r"^[0-9a-f]{64}-\d+\.(avif|webp|jpg)$")
+# The responsive ladder. The og JPEG is served but never offered as a variant.
+_LADDER = re.compile(r"^[0-9a-f]{64}-\d+\.(avif|webp)$")
+_TYPES = {"avif": "image/avif", "webp": "image/webp", "jpg": "image/jpeg"}
 _PUB_URL = "/media/pub/"
 
 
@@ -29,7 +32,7 @@ def _scan(shas: Iterable[str]) -> dict[str, dict[int, dict[str, str]]]:
     with it:
         for entry in it:
             name = entry.name
-            if not _NAME.match(name) or name[:64] not in wanted:
+            if not _LADDER.match(name) or name[:64] not in wanted:
                 continue
             width, fmt = name[65:].split(".")
             found[name[:64]][int(width)][fmt] = name
@@ -71,6 +74,31 @@ def variants_for(
     a native width. If the scan gets slow, swap this for a variants column.
     """
     return variants_for_many([(pub_sha, width, height)])[pub_sha]
+
+
+def og_image(
+    pub_sha: str | None, width: int | None, height: int | None
+) -> tuple[str, int, int] | None:
+    """The link-preview JPEG for a picture: (url, width, height), or None.
+
+    Pass the picture's images row as it stands: pub_sha, width and height of the displayed
+    pixels (crop included). The url is site-relative (`/media/pub/<pub_sha>-<w>.jpg`); the
+    caller prefixes the request's base url, as og:image must be absolute. width is
+    min(1200, the picture's width), never upscaled; height keeps the aspect ratio and is
+    exactly the file's.
+
+    None when the row lacks any of the three or the file is not in pub: not derived yet
+    (the worker-start sweep queues it), failed to encode, or held while unpublished. The
+    caller then falls back to the largest webp or leaves og:image out. One stat, no read.
+    """
+    if not pub_sha or not width or not height or len(pub_sha) != 64:
+        return None
+    key = og_key(pub_sha, width)
+    name = key.removeprefix("pub/")
+    if not _NAME.match(name) or not (get_settings().media_pub / name).is_file():
+        return None
+    w, h = og_size(width, height)
+    return _PUB_URL + name, w, h
 
 
 @router.api_route("/media/pub/{name}", methods=["GET", "HEAD"], include_in_schema=False)

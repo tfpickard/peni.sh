@@ -14,6 +14,11 @@ from blurhash import encode as _blurhash_encode
 log = logging.getLogger(__name__)
 
 WIDTHS = (480, 960, 1600)
+# Link previewers want one JPEG at about this width; many refuse webp and avif outright.
+OG_WIDTH = 1200
+OG_QUALITY = 85
+# The site's ground, so a transparent picture previews the way it looks on its page.
+_GROUND = (11, 6, 24)
 # The largest real upload seen is 6048x6048 (36.6 megapixels) and an iPhone's biggest file
 # is 48. A decode holds several full-size copies (the HEIC path alone makes a Pillow image,
 # its bytes, the vips image and the colour transform), so a gigapixel header would pass
@@ -306,6 +311,47 @@ def make_derivatives(img: pyvips.Image, sha: str, watermark: bool = False) -> li
     return out
 
 
+def og_size(width: int, height: int) -> tuple[int, int]:
+    """The og JPEG's dimensions for a picture displayed at width x height. Never upscaled.
+    Shared with the api, which states them in the page head without opening the file."""
+    w = min(OG_WIDTH, width)
+    return w, max(1, round(height * w / width))
+
+
+def og_key(sha: str, width: int) -> str:
+    # Named like the ladder, so every glob on `{pub_sha}-*` (hold, show, settle, delete)
+    # carries it along without knowing it exists.
+    return f"pub/{sha}-{min(OG_WIDTH, width)}.jpg"
+
+
+def make_og(img: pyvips.Image, sha: str, watermark: bool = False) -> Derivative | None:
+    """The link-preview JPEG, or None if it cannot be encoded. Best-effort by contract:
+    no caller may hold back a picture because this is missing."""
+    try:
+        w, h = og_size(img.width, img.height)
+        # Forced to the exact size og_size states, so the api's og:image:height is true
+        # without reading the file.
+        scaled = (
+            img
+            if (w, h) == (img.width, img.height)
+            else img.thumbnail_image(w, height=h, size="force")
+        )
+        if scaled.interpretation != "srgb" or scaled.format != "uchar" or scaled.bands < 3:
+            # Grey and 16-bit sources: previewers handle 8-bit RGB JPEG and little else.
+            scaled = scaled.colourspace("srgb")
+        if watermark:
+            scaled = _watermark(scaled)
+        if scaled.hasalpha():
+            scaled = scaled.flatten(background=list(_GROUND))
+        if scaled.format != "uchar":
+            scaled = scaled.cast("uchar")
+        data = _save(scaled, ".jpg", Q=OG_QUALITY, interlace=True, optimize_coding=True)
+    except pyvips.Error as e:
+        log.warning("og jpeg for %s failed: %s", sha[:10], str(e).strip())
+        return None
+    return Derivative(key=og_key(sha, img.width), data=data, width=w, height=h, fmt="jpg")
+
+
 def _small_rgb(img: pyvips.Image, size: int) -> pyvips.Image:
     t = img.thumbnail_image(size, size="down")
     if t.hasalpha():
@@ -358,6 +404,8 @@ class Public(NamedTuple):
     height: int
     blurhash: str
     palette: list[str]
+    # Apart from the ladder: it is never part of the publish gate.
+    og: Derivative | None = None
 
 
 def clamp_rect(rect: Mapping[str, Any], width: int, height: int) -> dict[str, int] | None:
@@ -401,7 +449,8 @@ def rebuild_public(
     """Everything public about an image, recomputed from the clean original.
 
     crop_rect is in original pixels and is clamped first (ValueError if unusable). The
-    caller writes the derivatives, then sets pub_sha, width, height, blurhash and palette.
+    caller writes the derivatives (and the og JPEG when there is one), then sets pub_sha,
+    width, height, blurhash and palette.
     """
     img = load_and_validate(original_bytes).image
     if crop_rect is not None:
@@ -416,4 +465,5 @@ def rebuild_public(
         height=img.height,
         blurhash=blurhash_of(img),
         palette=palette_of(img),
+        og=make_og(img, sha, watermark),
     )

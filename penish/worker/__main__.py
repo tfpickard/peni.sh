@@ -15,7 +15,7 @@ from penish.config import get_settings
 from penish.db import make_pool
 from penish.mycelium.tick import run_loop as run_mycelium
 from penish.worker import collection_jobs, jobs
-from penish.worker.admin_jobs import make_handlers
+from penish.worker.admin_jobs import OG_JOB, enqueue_missing_og, handle_og, make_handlers
 from penish.worker.categorize import enqueue_uncategorized, handle_categorize
 from penish.worker.embed import Embedder
 from penish.worker.embed_server import serve as serve_embed
@@ -100,6 +100,9 @@ async def main() -> None:
         async def categorize(job: Job) -> None:
             await handle_categorize(job, pool=pool, settings=settings)
 
+        async def og(job: Job) -> None:
+            await handle_og(job, pool=pool, settings=settings)
+
         n = await enqueue_uncategorized(pool)
         if n:
             log.info("enqueued %d pictures to categorize", n)
@@ -124,6 +127,9 @@ async def main() -> None:
         n = await collection_jobs.enqueue_unnoted(pool)
         if n:
             log.info("enqueued %d leaves for a conservator's note", n)
+        n = await enqueue_missing_og(pool, settings)
+        if n:
+            log.info("enqueued %d pictures for a link-preview jpeg", n)
 
         watcher = InboxWatcher(settings, enqueue, has_job=has_job)
         await watcher.recover()
@@ -136,6 +142,7 @@ async def main() -> None:
                     "ingest": ingest,
                     "haiku": haiku,
                     "categorize": categorize,
+                    OG_JOB: og,
                     **make_handlers(pool, settings, embedder),
                 },
                 stop=stop,
