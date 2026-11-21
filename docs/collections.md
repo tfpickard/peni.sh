@@ -253,8 +253,9 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   shows a leaf's whole life. The public `previous` is the latest row with a `from`, and is
   null when that equals where the leaf is now.
 - `migrations/024_leaf_history_scores.sql` gives each history row `chosen_by` (`score`,
-  `owner`; `judge` is allowed and unused) and `scores` (jsonb), set on the row where a
-  leaf's book was decided: a filing, an owner move, a re-sort that changes its book.
+  `owner`, `judge`) and `scores` (jsonb), set on the row where a leaf's book was decided:
+  a filing, an owner move, a re-sort or re-judging that changes its book.
+- `migrations/025_collection_judgements.sql` keeps the judge's answers (see "The judge").
 - `migrations/019_collection_text.sql` adds the owner text and the note's provenance;
   `020_seed_pansophicon_text.sql` seeds the Pansophicon's text, filling only what is still
   empty. Tests re-apply 018 and 020 between runs.
@@ -345,7 +346,7 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
 - A request for a picture that is down waits. Going live, republishing, and the worker
   start sweep each queue its filing.
 - Which book is decided in one place, `store.choose`: the owner's book when given, else
-  the best score among books with room. `plan.weigh` returns every open book's score in
+  the judge's (see "The judge"), else the best score among books with room. `plan.weigh` returns every open book's score in
   its parts (`cos`, `tag`, `fill`, which add up to the total `choose_book` ranks by), the
   best, the runner-up and the margin; the filing keeps them, with the tuning, on its
   history row, also when the owner gave the book.
@@ -363,6 +364,59 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
 - A dry run while any anchor has no vector answers 409 `anchors` and queues
   `collection_anchor`, instead of scoring a book blind. The weekly re-sort is still a job
   that embeds the anchors, plans and writes in one go.
+
+### The judge
+
+Vectors file by what a picture looks like, and pictures of one medium look alike whatever
+they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and names its book.
+
+- `penish/collection/judge.py`, prompt `penish/prompts/filer.md`. One text-only call: the
+  caption, description and analysis (`image_texts`), and each book the leaf may enter
+  (every book with room, and its own) with its number, title and anchor text. It answers
+  `{"book", "runner_up", "reason"}`, books as roman numerals. The prompt files by subject,
+  never by medium, technique, style or layout; what heaven does is vi, what people do is
+  vii even in heaven's name, and what people do in baths is vii.
+- An answer is a judgement only when both books are open to the leaf and differ, and the
+  reason is one line of at most 200 characters with no em dash. Anything else, a refusal,
+  an error or no answer in 60 seconds is a failure, and the filing goes by score.
+- Settings on `/admin/models`: `filer.model` (default `claude-haiku-5-5`, the
+  `FILER_MODEL` env var; Haiku did best in the trial and costs least), `filer.prompt`, and
+  `filer.judge` (on by default; off, nothing asks). Usage is recorded under `filer`.
+- `collection_judgements` keeps every answer by collection, picture and `input_hash`:
+  sha256 over the model, the prompt, the three texts and each open book's number, title and
+  anchor text. The same question is never paid for twice. A failure is kept too, so a dry
+  run can say why; a refusal is never asked again, the other failures are asked again the
+  next time the question comes up. Change a text, a title, an anchor, the model or the
+  prompt and it is a new question.
+- Filing: the worker asks the judge (through the cache) before `file_request` takes the
+  collection's lock, and hands the answer in; `store.choose` takes an answer, never a
+  client, so no model call can run under the lock. A judgement for a book still open is
+  `chosen_by='judge'`, and `scores` keeps the weighing with `judge: {model, book,
+  runner_up, reason}`. Otherwise the scores choose, and `scores.judge` says why not
+  (`{error: "off" | "no text" | "refused" | "invalid" | "timeout" | "error" | "full"}`,
+  `full` being a book that filled between the answer and the lock), with a log line. The
+  slot within the book is chosen as before. An owner's book never asks.
+- A leaf whose latest book decision in history is `judge` keeps its book in every vector
+  re-sort, the owner's and the weekly one, as a `book_pinned` leaf does; it may still move
+  within its book. It is not marked `book_pinned`, which stays the owner's alone. A leaf
+  the judge agreed with on re-judging has no new history row, so it stays a scored leaf.
+- Re-judging: `POST /api/admin/collections/<slug>/judge`. The api holds no model keys, so
+  `{"dry_run": true}` plans from kept judgements only: while any leaf not `book_pinned`
+  has none for what it is now, it answers 409 `judging` and queues `collection_judge`, and
+  the worker asks for each (four at a time). Then it answers `{plan_id, moves, held}`:
+  every leaf whose judged book is not its own, moved there with its slot chosen as the
+  filer would (other leaves in that book may shift, as on a filing), each book move with
+  the judge's `reason` and `runner_up`. `held` lists what stays: a leaf whose judged book
+  is full (`book`, `why: "full"`), and one the judge did not judge (`why` is the failure,
+  `no text` or `no vector`). 409 `anchors` as the re-sort's dry run. `{"dry_run": false,
+  plan_id, moves}` applies exactly that plan or answers 409 `changed`; the id covers the
+  collection's state and the question behind each book move. Applied book moves are
+  history rows with `chosen_by='judge'` and the judgement; `last_resort_at` is untouched.
+- `/admin/collections` has `judge` beside the dry run (it asks again every few seconds
+  while the answer is `judging`) and `apply`, which sends the shown plan back. The moves
+  list shows the reason beside a book move; held leaves follow it.
+- `explain` returns `judged` (the judge chose its book), `filed.scores.judge` for a judged
+  filing, and `judgement`: the kept answer for the leaf as it is now, or null.
 
 ### Site
 

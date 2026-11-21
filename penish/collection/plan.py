@@ -75,6 +75,9 @@ class Leaf:
     tags: frozenset[str] = frozenset()
     book_pinned: bool = False
     pinned: bool = False
+    # Its book was the judge's choice. A vector re-sort keeps it there as it keeps a
+    # book_pinned leaf, without the leaf counting as the owner's.
+    judged: bool = False
 
     @property
     def stays(self) -> bool:
@@ -353,12 +356,17 @@ def assign_books(shape: Shape, leaves: list[Leaf]) -> dict[int, int]:
     One leaf at a time against everyone else's current book, repeated until a pass moves
     nothing, so the result is a fixed point and an immediate second re-sort moves nothing
     either. A leaf changes book only when it beats its own book by the margin; without
-    that, near-ties would flap on every run.
+    that, near-ties would flap on every run. A judged leaf keeps its book: the scores are
+    what the judge was asked to overrule.
     """
     where = {leaf.image_id: leaf.book for leaf in leaves}
     tally = _Tally(shape, leaves, where)
     movers = sorted(
-        (leaf for leaf in leaves if not leaf.book_pinned and leaf.vec is not None),
+        (
+            leaf
+            for leaf in leaves
+            if not leaf.book_pinned and not leaf.judged and leaf.vec is not None
+        ),
         key=lambda x: x.image_id,
     )
     for _ in range(RESORT_PASSES):
@@ -575,6 +583,7 @@ def lay_books(
                 x.tags,
                 x.book_pinned,
                 x.pinned,
+                x.judged,
             )
             for x in leaves
             if where[x.image_id] == number

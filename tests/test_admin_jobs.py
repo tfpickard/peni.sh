@@ -510,6 +510,7 @@ async def test_make_handlers(p: Any, settings: Settings) -> None:
             "collection_file",
             "collection_anchor",
             "collection_resort",
+            "collection_judge",
             "collection_note",
         }
     )

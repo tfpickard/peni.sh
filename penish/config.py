@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     # Model ids are env vars so they can be swapped without a code change.
     describe_model: str = "claude-sonnet-5-5"
     haiku_model: str = "claude-haiku-5-5"
+    # The filer's judge reads text only, and the cheapest model did best at it.
+    filer_model: str = "claude-haiku-5-5"
     embed_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embed_dim: int = 1024
 

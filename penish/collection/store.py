@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -19,6 +20,8 @@ from psycopg import AsyncConnection
 from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
+from penish.collection import judge
+from penish.collection.judge import Failed, Judgement, OpenBook, Texts, Verdict
 from penish.collection.numerals import parse_line, roman
 from penish.collection.plan import (
     Book,
@@ -39,12 +42,15 @@ log = logging.getLogger(__name__)
 
 Conn = AsyncConnection[DictRow]
 Reason = Literal["auto", "resort", "owner"]
-# How a leaf's book was decided, kept on its history row. The schema also allows `judge`.
-ChosenBy = Literal["score", "owner"]
+# How a leaf's book was decided, kept on its history row.
+ChosenBy = Literal["score", "owner", "judge"]
+# A runtime setting by key (penish.runtime.getter).
+Get = Callable[[str], Awaitable[Any]]
 
 FILE_JOB = "collection_file"
 ANCHOR_JOB = "collection_anchor"
 RESORT_JOB = "collection_resort"
+JUDGE_JOB = "collection_judge"
 NOTE_JOB = "collection_note"
 # An owner note is shown as written; this only keeps a runaway paste out of the page.
 NOTE_MAX = 4000
@@ -61,6 +67,14 @@ class AnchorsWaiting(Refused):
 
     def __init__(self) -> None:
         super().__init__("anchors")
+
+
+class Judging(Refused):
+    """A leaf has no judgement for what it is now. The worker asks; the api never calls a
+    model, since only the worker holds the keys."""
+
+    def __init__(self) -> None:
+        super().__init__("judging")
 
 
 @dataclass(frozen=True)
@@ -175,7 +189,11 @@ async def load(conn: Conn, collection: dict[str, Any], settings: Settings) -> St
         select l.image_id, l.book, l.position, l.book_pinned, l.pinned,
                case when i.status = 'live' then e.vec::real[] end as vec,
                coalesce((select array_agg(t.tag) from tags t where t.image_id = l.image_id),
-                        '{}') as tags
+                        '{}') as tags,
+               coalesce((select h.chosen_by = 'judge' from collection_leaf_history h
+                          where h.image_id = l.image_id and h.collection_id = l.collection_id
+                            and h.chosen_by is not null
+                          order by h.id desc limit 1), false) as judged
           from collection_leaves l
           join images i on i.id = l.image_id
           left join embeddings e on e.image_id = l.image_id and e.kind = 'description'
@@ -194,6 +212,7 @@ async def load(conn: Conn, collection: dict[str, Any], settings: Settings) -> St
             frozenset(r["tags"]),
             r["book_pinned"],
             r["pinned"],
+            r["judged"],
         )
         for r in await cur.fetchall()
     ]
@@ -325,11 +344,13 @@ def choose(
     vec: np.ndarray | None,
     tags: frozenset[str],
     book: int | None,
+    verdict: Verdict | None = None,
 ) -> Choice:
-    """Which book a picture is filed into: the owner's when given, otherwise the best score
-    among books with room. Every filing decides here, so a different way of deciding goes
-    here too, with the score as its fallback. The scores are kept either way, so the
-    admin can show what the filer thought of a book the owner chose."""
+    """Which book a picture is filed into: the owner's when given, else the judge's when it
+    gave one for a book that still has room, else the best score among books with room.
+    Every filing decides here. `verdict` was asked before the lock was taken; nothing here
+    calls a model. The scores are kept either way, so the admin can show what the filer
+    thought of a book the owner or the judge chose, and why the judge did not decide."""
     others = [x for x in state.leaves if x.image_id != image_id]
     w = weigh(state.shape, others, vec, tags) if vec is not None else None
     scores = _record(w, state.shape.tuning) if w is not None else None
@@ -339,6 +360,20 @@ def choose(
         raise Refused("no vector")
     if w is None:
         raise Refused("every book is full")
+    if isinstance(verdict, Judgement) and verdict.book in w.terms:
+        return Choice(verdict.book, "judge", {**(scores or {}), "judge": verdict.to_json()})
+    if isinstance(verdict, Judgement):
+        # The book filled between the question and the lock.
+        verdict = Failed("full", verdict.model, f"book {roman(verdict.book)}")
+    if verdict is not None:
+        log.log(
+            logging.INFO if verdict.error == "off" else logging.WARNING,
+            "collection %s: image %s filed by score, judge %s",
+            state.collection["id"],
+            image_id,
+            verdict.error,
+        )
+        scores = {**(scores or {}), "judge": verdict.to_json()}
     return Choice(w.best, "score", scores)
 
 
@@ -351,6 +386,7 @@ async def _place(
     book: int | None,
     position: int | None,
     reason: Reason,
+    verdict: Verdict | None = None,
 ) -> list[Move]:
     """File or move one picture. A book given pins the book; a leaf given pins the leaf.
     With neither, the filer picks the book; then only its own book is re-laid."""
@@ -359,7 +395,7 @@ async def _place(
     pinned_book = book is not None
     if book is None and current is not None:
         return []
-    choice = choose(state, image_id, vec, tags, book)
+    choice = choose(state, image_id, vec, tags, book, verdict)
     book = choice.book
     if state.occupied(book, besides=image_id) >= state.shape.cap:
         raise Refused(f"book {roman(book)} is full")
@@ -387,6 +423,7 @@ async def _place(
         tags,
         book_pinned=pinned_book,
         pinned=position is not None,
+        judged=choice.chosen_by == "judge",
     )
     state.leaves = [x for x in state.leaves if x.image_id != image_id] + [me]
     where = {x.image_id: x.book for x in state.leaves}
@@ -538,9 +575,9 @@ class Plan:
 
 async def _digest(conn: Conn, collection: dict[str, Any]) -> dict[str, Any]:
     """What a plan was made from: the shape and tuning, each book's anchor text, hints and
-    vector, and every leaf's place and pins. A picture's own vector is left out: a plan
-    made from it is still the plan the owner was shown, and the corpus mean moves with
-    every upload."""
+    vector, and every leaf's place and pins, and whether the judge chose its book. A
+    picture's own vector is left out: a plan made from it is still the plan the owner was
+    shown, and the corpus mean moves with every upload."""
     cid = collection["id"]
     tuning = Tuning.from_json(collection["tuning"]).to_json()
     # A switch, not a weight: it changes no plan.
@@ -565,12 +602,19 @@ async def _digest(conn: Conn, collection: dict[str, Any]) -> dict[str, Any]:
         for r in await cur.fetchall()
     ]
     cur = await conn.execute(
-        "select image_id, book, position, book_pinned, pinned from collection_leaves"
-        " where collection_id = %s order by image_id",
+        """
+        select l.image_id, l.book, l.position, l.book_pinned, l.pinned,
+               coalesce((select h.chosen_by = 'judge' from collection_leaf_history h
+                          where h.image_id = l.image_id and h.collection_id = l.collection_id
+                            and h.chosen_by is not null
+                          order by h.id desc limit 1), false) as judged
+          from collection_leaves l
+         where l.collection_id = %s order by l.image_id
+        """,
         (cid,),
     )
     leaves = [
-        [r["image_id"], r["book"], r["position"], r["book_pinned"], r["pinned"]]
+        [r["image_id"], r["book"], r["position"], r["book_pinned"], r["pinned"], r["judged"]]
         for r in await cur.fetchall()
     ]
     return {
@@ -635,15 +679,16 @@ async def plan(conn: Conn, collection: dict[str, Any], settings: Settings) -> Pl
         return Plan(plan_id(before, _plan_moves(moves)), moves, leads)
 
 
-def _check_plan(state: State, placement: Placement) -> None:
+def _check_plan(state: State, placement: Placement, *, hold_judged: bool = True) -> None:
     """A plan that came back over the wire still has to keep the owner's pins and the
-    book's shape; the id alone does not prove it was ever made here."""
+    book's shape, and a vector re-sort the judge's books; the id alone does not prove it
+    was ever made here."""
     books = {b.number for b in state.shape.books}
     for x in state.leaves:
         book, pos = placement[x.image_id]
         if x.pinned and (book, pos) != (x.book, x.position):
             raise Refused("bad plan")
-        if x.book_pinned and book != x.book:
+        if (x.book_pinned or (hold_judged and x.judged)) and book != x.book:
             raise Refused("bad plan")
         if book not in books or not 1 <= pos <= state.shape.cap:
             raise Refused("bad plan")
@@ -683,18 +728,286 @@ async def enqueue_anchor_job(conn: Conn, collection_id: int) -> None:
     )
 
 
+# -- the judge: questions, and the owner's re-judging ------------------------------------
+
+
+async def book_texts(conn: Conn, collection_id: int) -> dict[int, tuple[str | None, str]]:
+    """Each book's title and anchor text, which is how the judge is shown a book."""
+    cur = await conn.execute(
+        "select number, title, anchor_text from collection_books where collection_id = %s",
+        (collection_id,),
+    )
+    return {r["number"]: (r["title"], r["anchor_text"]) for r in await cur.fetchall()}
+
+
+def open_books(
+    state: State, image_id: int, texts: Mapping[int, tuple[str | None, str]]
+) -> list[OpenBook]:
+    """The books a picture may enter, as choose_book sees them: every book with room, and
+    the one it is in already however full."""
+    own = state.leaf(image_id)
+    out = []
+    for b in state.shape.books:
+        mine = own is not None and own.book == b.number
+        if mine or state.occupied(b.number, besides=image_id) < state.shape.cap:
+            title, anchor = texts.get(b.number, (None, ""))
+            out.append(OpenBook(b.number, title, anchor))
+    return out
+
+
+async def filing_inputs(
+    conn: Conn, image_id: int, collection_id: int, settings: Settings
+) -> tuple[Texts, list[OpenBook]] | None:
+    """What the judge is asked before a filing, read without the lock so the call never
+    holds it. None when there is nothing to ask: no request, an owner's book, a picture
+    already filed, or no book with room."""
+    cur = await conn.execute(
+        "select book from collection_requests where image_id = %s and collection_id = %s",
+        (image_id, collection_id),
+    )
+    req = await cur.fetchone()
+    collection = await collection_by_id(conn, collection_id)
+    if req is None or req["book"] is not None or collection is None:
+        return None
+    state = await load(conn, collection, settings)
+    if state.leaf(image_id) is not None:
+        return None
+    books = open_books(state, image_id, await book_texts(conn, collection_id))
+    if not books:
+        return None
+    texts = (await judge.texts_of(conn, [image_id])).get(image_id, Texts())
+    return texts, books
+
+
+@dataclass(frozen=True)
+class Question:
+    image_id: int
+    texts: Texts
+    books: list[OpenBook]
+
+
+async def questions(conn: Conn, state: State) -> tuple[list[Question], dict[int, str]]:
+    """What re-judging asks of each leaf the owner did not hold to a book, and the leaves
+    it cannot ask about, with why. A leaf with no vector stays put, as in a re-sort."""
+    meta = await book_texts(conn, state.collection["id"])
+    held = [x for x in state.leaves if not x.book_pinned]
+    texts = await judge.texts_of(conn, [x.image_id for x in held])
+    asks: list[Question] = []
+    skipped: dict[int, str] = {}
+    for x in sorted(held, key=lambda y: y.image_id):
+        t = texts.get(x.image_id, Texts())
+        if x.vec is None:
+            skipped[x.image_id] = "no vector"
+        elif not t.any():
+            skipped[x.image_id] = "no text"
+        else:
+            asks.append(Question(x.image_id, t, open_books(state, x.image_id, meta)))
+    return asks, skipped
+
+
+async def enqueue_judge_job(conn: Conn, collection_id: int) -> None:
+    await conn.execute(
+        "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s) on conflict do nothing",
+        (JUDGE_JOB, Jsonb({"collection_id": collection_id}), f"{JUDGE_JOB}:{collection_id}"),
+    )
+
+
+@dataclass(frozen=True)
+class Held:
+    """A leaf re-judging leaves where it is, and why: the book it was judged into is
+    full, or there is no judgement for it."""
+
+    image_id: int
+    before: tuple[int, int]
+    book: int | None
+    why: str
+
+
+@dataclass(frozen=True)
+class JudgePlan:
+    id: str
+    moves: list[Move]
+    leads: dict[int, float | None]
+    held: list[Held]
+    verdicts: dict[int, Verdict]
+    # Some answer is a failure that is asked again; the caller queues the asking.
+    retry: bool
+
+
+async def _kept(
+    conn: Conn, state: State, asks: list[Question], get: Get
+) -> tuple[dict[int, Verdict | None], dict[int, str]]:
+    """The kept answer to each question (None when it was never asked), and each one's
+    input hash. Reads only: the worker asks."""
+    model = str(await get(judge.MODEL_KEY))
+    prompt = str(await get(judge.PROMPT_KEY))
+    found: dict[int, Verdict | None] = {}
+    hashes: dict[int, str] = {}
+    for a in asks:
+        h = judge.input_hash(model, prompt, a.texts, a.books)
+        hashes[a.image_id] = h
+        found[a.image_id] = await judge.lookup(conn, state.collection["id"], a.image_id, h)
+    return found, hashes
+
+
+def _judged_moves(moves: list[Move], verdicts: Mapping[int, Verdict]) -> list[Move]:
+    """A move to another book is the judge's: its scores keep the weighing beside the
+    judgement. A leaf only shifted within its book decides nothing."""
+    out = []
+    for m in moves:
+        v = verdicts.get(m.image_id)
+        if m.before and m.after and m.before[0] != m.after[0] and isinstance(v, Judgement):
+            m = Move(
+                m.image_id,
+                m.before,
+                m.after,
+                "resort",
+                "judge",
+                {**(m.scores or {}), "judge": v.to_json()},
+            )
+        out.append(m)
+    return out
+
+
+def judge_plan_id(digest: dict[str, Any], moves: list[PlanMove], judged: Mapping[int, str]) -> str:
+    """As plan_id, with the question behind each move to another book: a picture whose
+    text changed, a retitled book or another model is not what the owner was shown."""
+    body = {
+        "v": 1,
+        "kind": "judge",
+        "state": digest,
+        "moves": sorted([i, list(b), list(a)] for i, b, a in moves),
+        "judged": sorted([i, h] for i, h in judged.items()),
+    }
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def judge_plan(
+    conn: Conn, collection: dict[str, Any], settings: Settings, get: Get
+) -> JudgePlan:
+    """Every leaf not held to its book by the owner, in the book the judge names for it,
+    planned from kept judgements only. Refuses `judging` while a leaf has none (the caller
+    queues the worker's asking) and `anchors` as the re-sort's dry run does. Writes
+    nothing."""
+    async with conn.transaction():
+        await lock(conn, collection["id"])
+        fresh = await _fresh(conn, collection)
+        digest = await _digest(conn, fresh)
+        if _stale(digest, settings):
+            raise AnchorsWaiting()
+        state = await load(conn, fresh, settings)
+        if await _digest(conn, await _fresh(conn, fresh)) != digest:
+            raise Refused("changed")
+        asks, skipped = await questions(conn, state)
+        found, hashes = await _kept(conn, state, asks, get)
+        if any(v is None for v in found.values()):
+            raise Judging()
+        verdicts: dict[int, Verdict] = {i: v for i, v in found.items() if v is not None}
+
+        here = {x.image_id: x for x in state.leaves}
+        where = {x.image_id: x.book for x in state.leaves}
+        room = Counter(where.values())
+        want = {
+            i: v.book
+            for i, v in sorted(verdicts.items())
+            if isinstance(v, Judgement) and v.book != where[i]
+        }
+        # Room a leaf leaves behind can let another in, so go round until nothing fits.
+        moved = True
+        while moved:
+            moved = False
+            for i, book in list(want.items()):
+                if room[book] < state.shape.cap:
+                    room[where[i]] -= 1
+                    room[book] += 1
+                    where[i] = book
+                    del want[i]
+                    moved = True
+        held = [Held(i, (here[i].book, here[i].position), book, "full") for i, book in want.items()]
+        held += [
+            Held(i, (here[i].book, here[i].position), None, v.error)
+            for i, v in sorted(verdicts.items())
+            if isinstance(v, Failed)
+        ]
+        held += [Held(i, (here[i].book, here[i].position), None, why) for i, why in skipped.items()]
+        placement = lay_books(state.shape, state.leaves, where, [])
+        diff, leads = _diff(state, placement)
+        moves = _judged_moves(diff, verdicts)
+        judged = {m.image_id: hashes[m.image_id] for m in moves if m.chosen_by == "judge"}
+        return JudgePlan(
+            judge_plan_id(digest, _plan_moves(moves), judged),
+            moves,
+            leads,
+            held,
+            verdicts,
+            retry=not all(judge.settled(v) for v in verdicts.values()),
+        )
+
+
+async def apply_judged(
+    conn: Conn,
+    collection: dict[str, Any],
+    settings: Settings,
+    get: Get,
+    given_id: str,
+    moves: list[PlanMove],
+) -> list[Move]:
+    """Exactly the re-judging the owner was shown, or `changed`. Each leaf it moves to
+    another book is the judge's from then on, so a vector re-sort leaves it there."""
+    async with conn.transaction():
+        await lock(conn, collection["id"])
+        fresh = await _fresh(conn, collection)
+        digest = await _digest(conn, fresh)
+        state = await load(conn, fresh, settings)
+        crossing = {i for i, b, a in moves if int(b[0]) != int(a[0])}
+        asks, _ = await questions(conn, state)
+        found, hashes = await _kept(conn, state, [a for a in asks if a.image_id in crossing], get)
+        if crossing - set(hashes):
+            raise Refused("changed")
+        if judge_plan_id(digest, moves, hashes) != given_id:
+            raise Refused("changed")
+        placement: Placement = {x.image_id: (x.book, x.position) for x in state.leaves}
+        for image_id, before, after in moves:
+            if placement.get(image_id) != tuple(before):
+                raise Refused("changed")
+            placement[image_id] = (int(after[0]), int(after[1]))
+        for i in crossing:
+            v = found.get(i)
+            if not isinstance(v, Judgement) or v.book != placement[i][0]:
+                raise Refused("changed")
+        _check_plan(state, placement, hold_judged=False)
+        diff, _ = _diff(state, placement)
+        verdicts: dict[int, Verdict] = {i: v for i, v in found.items() if v is not None}
+        judged = _judged_moves(diff, verdicts)
+        # A re-judging is not a re-sort: last_resort_at, which the weekly one runs by, stays.
+        return await _write(conn, state, placement, "resort", basis=_basis(judged))
+
+
 # -- why a leaf is where it is ------------------------------------------------------
 
 
 async def explain(
-    conn: Conn, collection: dict[str, Any], image_id: int, settings: Settings
+    conn: Conn,
+    collection: dict[str, Any],
+    image_id: int,
+    settings: Settings,
+    get: Get | None = None,
 ) -> dict[str, Any] | None:
     """One leaf's scores by book as a re-sort would see them now, and what they were when
-    it was filed. None when the picture is not a leaf here."""
+    it was filed; whether the judge chose its book, and the judgement kept for what the
+    leaf and the books are now (with `get`). None when the picture is not a leaf here."""
     state = await load(conn, collection, settings)
     leaf = state.leaf(image_id)
     if leaf is None:
         return None
+    judgement: dict[str, Any] | None = None
+    if get is not None:
+        texts = (await judge.texts_of(conn, [image_id])).get(image_id, Texts())
+        books = open_books(state, image_id, await book_texts(conn, collection["id"]))
+        found, _ = await _kept(conn, state, [Question(image_id, texts, books)], get)
+        v = found.get(image_id)
+        judgement = v.to_json() if v is not None else None
     w = weigh_leaf(state.shape, state.leaves, image_id)
     cur = await conn.execute(
         """
@@ -712,6 +1025,8 @@ async def explain(
         "position": leaf.position,
         "pinned": leaf.pinned,
         "book_pinned": leaf.book_pinned,
+        "judged": leaf.judged,
+        "judgement": judgement,
         "now": None if w is None else {**w.to_json(), "lead": w.lead(leaf.book)},
         "filed": None
         if filed is None
@@ -813,11 +1128,16 @@ async def request_from_line(conn: Conn, image_id: int, line: str, note: str | No
 
 
 async def file_request(
-    conn: Conn, image_id: int, collection_id: int, settings: Settings
+    conn: Conn,
+    image_id: int,
+    collection_id: int,
+    settings: Settings,
+    verdict: Verdict | None = None,
 ) -> Literal["filed", "waiting", "gone"] | str:
     """Carry out a waiting request. Returns `filed`, `waiting` (not live or not embedded
     yet), `gone` (no request, or no picture), or the reason it was refused, which is also
-    kept on the request for the admin."""
+    kept on the request for the admin. `verdict` is the judge's, asked before this took
+    the lock (filing_inputs says what to ask); an owner's book ignores it."""
     async with conn.transaction():
         await lock(conn, collection_id)
         cur = await conn.execute(
@@ -839,7 +1159,7 @@ async def file_request(
         reason: Reason = "owner" if req["book"] is not None else "auto"
         try:
             moves = await _place(
-                conn, state, image_id, vec, tags, req["book"], req["position"], reason
+                conn, state, image_id, vec, tags, req["book"], req["position"], reason, verdict
             )
         except Refused as e:
             await conn.execute(

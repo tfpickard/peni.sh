@@ -1,8 +1,12 @@
-"""Collection jobs: filing a requested picture, embedding book anchors, re-sorting, and the
-weekly re-sort for a collection that asks for one.
+"""Collection jobs: filing a requested picture, embedding book anchors, re-sorting, judging
+the leaves for the owner's re-judging, and the weekly re-sort for a collection that asks
+for one.
 
 Filing waits on publish rather than a timer: the go-live transaction enqueues it, and the
 worker start sweep re-enqueues any request a crash left without a job.
+
+The judge is asked before the filing takes the collection's lock, and its answer handed in:
+a model call can take a minute, and every owner action on the collection waits on the lock.
 """
 
 from __future__ import annotations
@@ -11,11 +15,13 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import numpy as np
 from psycopg.types.json import Jsonb
 
-from penish.collection import store
+from penish import runtime
+from penish.collection import judge, store
 from penish.collection.numerals import parse_line
 from penish.collection.plan import Tuning
 from penish.config import Settings
@@ -26,6 +32,9 @@ log = logging.getLogger(__name__)
 
 WEEK = timedelta(days=7)
 WEEKLY_CHECK = 3600.0
+# Calls in flight at once while judging a whole collection: the owner is waiting on the
+# page, and a few at a time stays well inside any rate limit.
+JUDGE_AT_ONCE = 4
 
 
 def _int(job: Job, key: str) -> int:
@@ -60,8 +69,50 @@ async def ensure_anchors(
     return n
 
 
+async def judge_filing(
+    pool: Pool,
+    image_id: int,
+    collection_id: int,
+    settings: Settings,
+    client: Any = None,
+    within: float = judge.TIMEOUT,
+) -> judge.Verdict | None:
+    """The judge's book for a picture about to be filed, asked with no lock held. None when
+    there is nothing to ask (an owner's book, a picture already filed); a Failed when the
+    judge is off or could not answer, which the filing records beside the scores. Never
+    raises: filing does not depend on the judge."""
+    try:
+        async with pool.connection() as conn:
+            inputs = await store.filing_inputs(conn, image_id, collection_id, settings)
+        if inputs is None:
+            return None
+        if not await runtime.get(pool, runtime.JUDGE_KEY, settings=settings):
+            return judge.Failed("off")
+        texts, books = inputs
+        if not texts.any():
+            return judge.Failed("no text")
+        return await judge.judged(
+            pool,
+            collection_id,
+            image_id,
+            texts,
+            books,
+            settings=settings,
+            client=client,
+            within=within,
+        )
+    except Exception as e:
+        log.exception("collection %s: judging image %s failed", collection_id, image_id)
+        return judge.Failed("error", detail=str(e)[:200])
+
+
 async def handle_file(
-    job: Job, *, pool: Pool, settings: Settings, embedder: DocumentEmbedder
+    job: Job,
+    *,
+    pool: Pool,
+    settings: Settings,
+    embedder: DocumentEmbedder,
+    client: Any = None,
 ) -> None:
     image_id = _int(job, "image_id")
     if "line" in job.payload:
@@ -85,8 +136,9 @@ async def handle_file(
 
     collection_id = _int(job, "collection_id")
     await ensure_anchors(pool, collection_id, settings, embedder)
+    verdict = await judge_filing(pool, image_id, collection_id, settings, client)
     async with pool.connection() as conn:
-        result = await store.file_request(conn, image_id, collection_id, settings)
+        result = await store.file_request(conn, image_id, collection_id, settings, verdict)
     if result == "waiting":
         # Publish enqueues this again, but an embedding still on its way is not a publish.
         raise SoftError(f"image {image_id} is not live and embedded yet")
@@ -113,6 +165,36 @@ async def handle_resort(
             return
         moves = await store.resort(conn, collection, settings, dry_run=False)
     log.info("collection %s re-sorted: %d moves", collection_id, len(moves))
+
+
+async def handle_judge(
+    job: Job,
+    *,
+    pool: Pool,
+    settings: Settings,
+    embedder: DocumentEmbedder,
+    client: Any = None,
+) -> None:
+    """A judgement for every leaf the owner's re-judging will ask about, so its dry run can
+    plan from kept answers alone. A kept judgement or refusal is not asked again."""
+    collection_id = _int(job, "collection_id")
+    async with pool.connection() as conn:
+        collection = await store.collection_by_id(conn, collection_id)
+        if collection is None:
+            return
+        state = await store.load(conn, collection, settings)
+        asks, _ = await store.questions(conn, state)
+    gate = asyncio.Semaphore(JUDGE_AT_ONCE)
+
+    async def one(a: store.Question) -> judge.Verdict:
+        async with gate:
+            return await judge.judged(
+                pool, collection_id, a.image_id, a.texts, a.books, settings=settings, client=client
+            )
+
+    got = await asyncio.gather(*(one(a) for a in asks))
+    failed = sum(1 for v in got if isinstance(v, judge.Failed))
+    log.info("collection %s judged: %d leaves, %d failed", collection_id, len(got), failed)
 
 
 async def enqueue_unfiled(pool: Pool) -> int:

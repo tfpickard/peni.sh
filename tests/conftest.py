@@ -37,6 +37,24 @@ def _apply_migrations(dsn: str) -> None:
                 conn.execute(m.group(1).encode())
 
 
+class _NoModel:
+    """The filer's judge as tests meet it unless they hand it a fake: the environment may
+    hold a real key, and a filing must not spend it."""
+
+    def __init__(self) -> None:
+        self.messages = self
+
+    async def create(self, **kw: object) -> object:
+        raise AssertionError("a real model call in a test")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    from penish.collection import judge
+
+    monkeypatch.setattr(judge, "default_client", lambda settings: _NoModel())
+
+
 @pytest.fixture(scope="session")
 def database_url() -> Iterator[str]:
     env = os.environ.get("TEST_DATABASE_URL")

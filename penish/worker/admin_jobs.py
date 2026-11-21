@@ -745,6 +745,7 @@ HANDLERS: dict[str, HandlerFactory] = {
     collection.FILE_JOB: _collection_handler(collection_jobs.handle_file),
     collection.ANCHOR_JOB: _collection_handler(collection_jobs.handle_anchor),
     collection.RESORT_JOB: _collection_handler(collection_jobs.handle_resort),
+    collection.JUDGE_JOB: _collection_handler(collection_jobs.handle_judge),
     collection.NOTE_JOB: _note_handler,
 }
 

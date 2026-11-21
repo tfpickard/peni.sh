@@ -74,9 +74,9 @@ export const growHaikus = (n: number) => post('/haikus/grow', { n });
 
 export type Models = {
 	// Strings for models and prompts, null for an unset effort, a number for mycelium.daily_calls,
-	// a list of `provider:model` ids for haiku.fallback.
-	current: Record<string, string | number | string[] | null>;
-	default: Record<string, string | number | string[] | null>;
+	// a list of `provider:model` ids for haiku.fallback, a boolean for filer.judge.
+	current: Record<string, string | number | boolean | string[] | null>;
+	default: Record<string, string | number | boolean | string[] | null>;
 	efforts: string[];
 	known_models: string[];
 	purposes: string[];
