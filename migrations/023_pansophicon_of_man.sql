@@ -81,8 +81,7 @@ update collection_books b
    -- new
    'The changing of one thing into another. Flasks and furnaces with whole scenes sealed'
    ' inside them, a crowned king and queen, lions, serpents, suns and moons, sequences of'
-   ' small stages, laboratory work. Baths and fountains that alter whoever enters them,'
-   ' or fail to.',
+   ' small stages, laboratory work.',
    array['alchemy', 'flask', 'furnace', 'transformation', 'serpent', 'sun', 'moon',
          'laboratory']),
   (6,
@@ -205,8 +204,7 @@ update collection_books b
    -- new
    'The changing of one thing into another. Flasks and furnaces with whole scenes sealed'
    ' inside them, a crowned king and queen, lions, serpents, suns and moons, sequences of'
-   ' small stages, laboratory work. Baths and fountains that alter whoever enters them,'
-   ' or fail to.',
+   ' small stages, laboratory work.',
    array['alchemy', 'flask', 'furnace', 'transformation', 'serpent', 'sun', 'moon',
          'laboratory']),
   (6,

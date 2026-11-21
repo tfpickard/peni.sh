@@ -151,6 +151,12 @@ def test_tag_overlap() -> None:
     assert tag_overlap(["coiled serpent", "brass"], ["serpent", "sun"]) == 0.5
     assert tag_overlap([], ["serpent"]) == 0.0
     assert tag_overlap(["x"], []) == 0.0
+
+
+def test_tag_overlap_reads_hyphens_as_spaces() -> None:
+    # Live tags are hyphenated; none has a space.
+    assert tag_overlap(["zodiac-man", "woodcut"], ["zodiac", "dream"]) == 0.5
+    assert tag_overlap(["zodiac-man"], ["zodiac-man"]) == 1.0
     assert tag_overlap(["Moon"], ["moon"]) == 1.0
     # One tag meeting two hints is a full match, not a double one.
     assert tag_overlap(["alchemy lab"], ["alchemy", "lab", "flask"]) == 1.0

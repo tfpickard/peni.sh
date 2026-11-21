@@ -112,12 +112,13 @@ def _unit(v: np.ndarray) -> np.ndarray | None:
 
 def _words(tags: Iterable[str]) -> set[str]:
     # A hint matches a whole tag or any word of one, so `serpent` finds `coiled serpent`.
+    # Tags are written with hyphens (`zodiac-man`), so a hyphen separates words as well.
     out: set[str] = set()
     for t in tags:
         t = t.lower().strip()
         if t:
             out.add(t)
-            out.update(t.split())
+            out.update(t.replace("-", " ").split())
     return out
 
 
