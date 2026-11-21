@@ -153,6 +153,7 @@ async def test_feed_level_is_the_title_only(client: httpx.AsyncClient, clean_db:
     _pic(clean_db, 1, caption="one")
     root = await feed(client)
     assert sorted(c.tag.removeprefix(AT) for c in root if c.tag != f"{AT}entry") == [
+        "author",
         "id",
         "link",
         "link",
@@ -160,6 +161,8 @@ async def test_feed_level_is_the_title_only(client: httpx.AsyncClient, clean_db:
         "updated",
     ]
     assert root.findtext(f"{AT}title") == "peni.sh"
+    # RFC 4287 4.1.1: a feed needs an author when its entries have none.
+    assert root.findtext(f"{AT}author/{AT}name") == "peni.sh"
     assert root.findtext(f"{AT}id")
     (self_link,) = links(root, "self")
     assert self_link.get("href") == "http://t/feed.xml"
@@ -277,3 +280,19 @@ async def test_feed_and_sitemap_answer_head(client: httpx.AsyncClient, clean_db:
     _pic(clean_db, 1, caption="one")
     assert (await client.head("/feed.xml")).status_code == 200
     assert (await client.head("/sitemap.xml")).status_code == 200
+
+
+async def test_control_characters_do_not_break_the_feed(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    # Not allowed in XML 1.0 even as a character reference, so one bad caption would
+    # otherwise make every reader refuse the whole feed.
+    _pic(clean_db, 1, caption="a\x0bb\x08c\ud7ffd\ufffe", description="de\x1bf\tg\nh")
+    sql(
+        clean_db,
+        "insert into tags (image_id, tag, source) select id, 'x\x0by', 'model' from images",
+    )
+    got = entries(await feed(client))
+    assert got[0].findtext(f"{AT}title") == "abc\ud7ffd"
+    assert got[0].findtext(f"{AT}summary") == "def g h"
+    assert len(await sitemap(client)) == 3

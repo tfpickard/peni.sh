@@ -152,8 +152,10 @@ async def _collection_query(
     """What the query asks of a published collection: (collection, leaf rows, exact).
 
     A name alone gives the collection and its live leaves in book and leaf order. A leaf
-    reference gives that one leaf, and exact is True: nothing else is looked for. Neither
-    gives (None, [], False). Unpublished collections are never read.
+    reference with the collection's name in front (`ptp iii 44`) gives that one leaf, and
+    exact is True: nothing else is looked for. A bare reference (`v 8`) gives the leaf too,
+    but exact is False, since `i 1` is as likely to be words as a place: the usual search
+    follows it. Neither gives (None, [], False). Unpublished collections are never read.
     """
     folded = _fold(q)
     if not folded:
@@ -200,7 +202,7 @@ async def _collection_query(
         (candidates, *ref),
     )
     row = await cur.fetchone()
-    return None, [row] if row else [], row is not None
+    return None, [row] if row else [], row is not None and named
 
 
 @router.get("/api/search")
@@ -221,7 +223,8 @@ async def search(
     async with pool.connection() as conn:
         collection, held, exact = await _collection_query(conn, q, limit)
         if exact:
-            # A leaf asked for by its place is the answer; the rest of search would be noise.
+            # A leaf asked for by its place, collection named, is the answer; the rest of
+            # search would be noise.
             og = await overgrowth_by_id(conn, [r["id"] for r in held])
             return {"q": q, "tags": [], "items": grid_items(held, og)}
         cur = await conn.execute(
@@ -273,7 +276,8 @@ async def search(
     async with pool.connection() as conn:
         cur = await conn.execute(sql.encode(), params)
         rows = await cur.fetchall()
-        # The collection asked for by name comes first: its leaves, then the usual matches.
+        # The collection asked for by name, or a leaf by its place, comes first: then the
+        # usual matches.
         if held:
             first = {r["id"] for r in held}
             rows = (held + [r for r in rows if r["id"] not in first])[:limit]

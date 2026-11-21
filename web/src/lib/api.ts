@@ -151,15 +151,22 @@ export const postComment = (
 	c: { name: string | null; body: string; turnstile: string | null }
 ) => post<{ ok: true }>(`/api/images/${encodeURIComponent(slug)}/comments`, c);
 
+// document.referrer keeps its value through in-app navigation, so every later picture of a
+// visit would claim the same arrival. Only the first view after a full page load sends it.
+let refSent = false;
+
 // Fire and forget: keepalive lets the view land even when the visitor has just left.
-export const postView = (slug: string, from: string | null) =>
-	fetch(`/api/images/${encodeURIComponent(slug)}/view`, {
+export const postView = (slug: string, from: string | null) => {
+	const ref = refSent ? null : refHost();
+	refSent = true;
+	return fetch(`/api/images/${encodeURIComponent(slug)}/view`, {
 		method: 'POST',
 		keepalive: true,
 		headers: { 'x-requested-with': 'penish', 'content-type': 'application/json' },
 		// Host only; the server keeps a bare hostname or nothing, and drops its own.
-		body: JSON.stringify({ from, ref: refHost() })
+		body: JSON.stringify({ from, ref })
 	}).then((r) => r.ok);
+};
 
 function refHost(): string | null {
 	try {

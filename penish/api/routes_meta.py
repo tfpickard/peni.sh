@@ -6,13 +6,21 @@ from penish.config import get_settings
 
 router = APIRouter()
 
+# A haiku grown from a picture that has been taken down would speak for something nobody can
+# see, so it is out of the deck for as long as the picture is. Haikus of no picture stay.
+SHOWN_HAIKU = (
+    "h.active and h.colony_id is null and (h.image_id is null or exists ("
+    "select 1 from images i where i.id = h.image_id"
+    " and i.status = 'live' and i.published_at is not null))"
+)
+
 
 async def random_haiku(request: Request) -> dict[str, Any] | None:
     # random() over a full scan is fine while the deck is a few hundred rows. A gallery's
     # haiku is shown on its gallery and nowhere else.
     async with request.app.state.pool.connection() as conn:
         cur = await conn.execute(
-            "select id, l1, l2, l3 from haikus where active and colony_id is null"
+            f"select h.id, h.l1, h.l2, h.l3 from haikus h where {SHOWN_HAIKU}"
             " order by random() limit 1"
         )
         row = await cur.fetchone()

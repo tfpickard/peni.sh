@@ -499,3 +499,41 @@ def test_title_is_added_when_the_shell_has_none() -> None:
 def test_robots_names_the_sitemap() -> None:
     robots = Path(__file__).resolve().parent.parent / "web" / "static" / "robots.txt"
     assert "Sitemap: https://peni.sh/sitemap.xml" in robots.read_text().splitlines()
+
+
+def _own_haiku(dsn: str, image_id: int, line: str) -> None:
+    with psycopg.connect(dsn) as conn:
+        conn.execute("update haikus set active = false")
+        conn.execute(
+            "insert into haikus (l1, l2, l3, source, image_id) values (%s, 'b', 'c', 'model', %s)",
+            (line, image_id),
+        )
+
+
+async def test_a_taken_down_pictures_haiku_is_not_shown(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    down = _pic(clean_db, 1, caption="gone")
+    live = _pic(clean_db, 2, caption="here")
+    _own_haiku(clean_db, down, "from the gone one")
+    with psycopg.connect(clean_db) as conn:
+        conn.execute(
+            "update images set status = 'unpublished', published_at = null where id = %s", (down,)
+        )
+        conn.execute(
+            "insert into haikus (l1, l2, l3, source, image_id) values ('from the live one',"
+            " 'b', 'c', 'model', %s)",
+            (live,),
+        )
+    for _ in range(8):
+        assert (await client.get("/api/haiku")).json()["lines"][0] == "from the live one"
+    assert _metas((await client.get("/")).text)["og:description"] == "from the live one / b / c"
+
+    # Back up, and it is in the deck again; a haiku of no picture was never out of it.
+    with psycopg.connect(clean_db) as conn:
+        conn.execute(
+            "update images set status = 'live', published_at = now() where id = %s", (down,)
+        )
+        conn.execute("update haikus set image_id = null where l1 = 'from the gone one'")
+    seen = {(await client.get("/api/haiku")).json()["lines"][0] for _ in range(30)}
+    assert "from the gone one" in seen

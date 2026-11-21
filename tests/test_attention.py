@@ -609,3 +609,19 @@ async def test_view_counts_per_picture_and_referrer(
     finally:
         with psycopg.connect(clean_db, autocommit=True) as conn:
             conn.execute("truncate picture_views, view_referrers")
+
+
+async def test_a_bad_ref_costs_the_referrer_not_the_view(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+) -> None:
+    i = add_image(clean_db, 1)
+    try:
+        for ref in ("a" * 300 + ".example.com", 5, ["x.example"], "not a host"):
+            unseen_for(clean_db, i, 1)
+            assert (await view(client, json={"ref": ref})).status_code == 204, ref
+        assert rows(clean_db, "select image_id, n from picture_views") == [(i, 4)]
+        assert rows(clean_db, "select host, n from view_referrers") == []
+    finally:
+        with psycopg.connect(clean_db, autocommit=True) as conn:
+            conn.execute("truncate picture_views, view_referrers")

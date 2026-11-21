@@ -546,6 +546,15 @@ async def test_gallery_page_og_tags(
     head = await client.head("/g/12")
     assert head.status_code == 200
 
+    # The preview JPEG, once the worker has made it, replaces the webp.
+    (get_settings().media_pub / f"{sha(2)}-1200.jpg").write_bytes(b"x")
+    r = await client.get("/g/12")
+    assert f'<meta property="og:image" content="http://t/media/pub/{sha(2)}-1200.jpg">' in r.text
+    assert 'property="og:image:width" content="1200"' in r.text
+    assert 'property="og:image:height" content="900"' in r.text
+    assert 'property="og:image:type" content="image/jpeg"' in r.text
+    assert ".webp" not in r.text.split("</head>")[0]
+
 
 @pytest.mark.parametrize(
     ("ago", "line"),

@@ -3,6 +3,7 @@ published collections and public galleries are named; nothing here says what the
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
 from typing import Any
@@ -26,7 +27,15 @@ _TAG = "tag:peni.sh,2026:"
 # A description is not cut in the feed; the limit only has to be larger than any of them.
 _WHOLE = 1_000_000
 
+# XML 1.0 has no place for most control characters, and a caption with one in it would make
+# the whole document unparseable.
+_FORBIDDEN = re.compile("[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
 _LIVE = "i.status = 'live' and i.published_at is not null"
+
+
+def _clean(text: str) -> str:
+    return _FORBIDDEN.sub("", text)
 
 
 def _w3c(at: datetime) -> str:
@@ -105,7 +114,7 @@ async def sitemap(request: Request) -> Response:
     root = ET.Element(f"{{{_SITEMAP_NS}}}urlset")
     for path, at in urls:
         url = ET.SubElement(root, f"{{{_SITEMAP_NS}}}url")
-        ET.SubElement(url, f"{{{_SITEMAP_NS}}}loc").text = base + path
+        ET.SubElement(url, f"{{{_SITEMAP_NS}}}loc").text = _clean(base + path)
         if at is not None:
             ET.SubElement(url, f"{{{_SITEMAP_NS}}}lastmod").text = _w3c(at)
     return _xml(root, "application/xml")
@@ -181,9 +190,9 @@ async def feed(request: Request) -> Response:
     ET.register_namespace("", _ATOM_NS)
 
     def el(parent: ET.Element, name: str, text: str | None = None, **attrs: str) -> ET.Element:
-        e = ET.SubElement(parent, f"{{{_ATOM_NS}}}{name}", attrs)
+        e = ET.SubElement(parent, f"{{{_ATOM_NS}}}{name}", {k: _clean(v) for k, v in attrs.items()})
         if text is not None:
-            e.text = text
+            e.text = _clean(text)
         return e
 
     root = ET.Element(f"{{{_ATOM_NS}}}feed")
@@ -192,6 +201,8 @@ async def feed(request: Request) -> Response:
     el(root, "updated", _w3c(entries[0]["at"] if entries else datetime.now(UTC)))
     el(root, "link", rel="self", type="application/atom+xml", href=f"{base}/feed.xml")
     el(root, "link", rel="alternate", href=f"{base}/")
+    # Required of a feed whose entries name none (RFC 4287, 4.1.1): the site, as everywhere.
+    el(el(root, "author"), "name", SITE)
     for e in entries:
         item = el(root, "entry")
         el(item, "title", e["title"])

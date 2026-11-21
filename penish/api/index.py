@@ -17,7 +17,7 @@ from penish.api.media import preview_image
 from penish.api.routes_collections import published
 from penish.api.routes_galleries import gallery_card, parse_serial
 from penish.api.routes_images import resolve_live
-from penish.api.routes_meta import random_haiku
+from penish.api.routes_meta import SHOWN_HAIKU, random_haiku
 from penish.categories import SLUGS as CATEGORY_SLUGS
 from penish.collection.numerals import roman
 from penish.collection.store import leaf_for_image
@@ -186,18 +186,6 @@ async def _image_page(request: Request, slug: str) -> Response:
     return await render_index(request, "".join(tags), title=caption)
 
 
-def _og_image(request: Request, variants: list[dict[str, Any]]) -> list[str]:
-    webps = [v for v in variants if v["webp"]]
-    if not webps:
-        return []
-    big = webps[-1]
-    base = str(request.base_url).rstrip("/")
-    out = [_meta("og:image", base + big["webp"]), _meta("og:image:width", big["w"])]
-    if "h" in big:
-        out.append(_meta("og:image:height", big["h"]))
-    return out
-
-
 def _meta(prop: str, value: object, attr: str = "property") -> str:
     return f'<meta {attr}="{prop}" content="{html.escape(str(value))}">'
 
@@ -221,9 +209,10 @@ async def _gallery_page(request: Request, raw: str) -> HTMLResponse:
     if card is None:
         return await render_index(request, status_code=404)
     tags = [_meta("og:type", "website"), _meta("og:description", _gallery_line(card))]
-    if card["cover"] is not None:
+    if card["cover"] is not None and card["cover_file"] is not None:
         tags.append(_meta("twitter:card", "summary_large_image", "name"))
-        tags.extend(_og_image(request, card["cover"]["variants"]))
+        base = str(request.base_url).rstrip("/")
+        tags.extend(_preview_tags(base, *card["cover_file"]))
     return await render_index(request, "".join(tags), title=card["title"])
 
 
@@ -236,8 +225,8 @@ async def _haiku_of_the_day(conn: Any) -> dict[str, Any] | None:
     # Home draws a random haiku on every load; a preview must not change under a shared link,
     # so the choice is fixed per UTC day.
     cur = await conn.execute(
-        "select l1, l2, l3 from haikus where active and colony_id is null"
-        " order by md5(id::text || %s) limit 1",
+        f"select h.l1, h.l2, h.l3 from haikus h where {SHOWN_HAIKU}"
+        " order by md5(h.id::text || %s) limit 1",
         (datetime.now(UTC).date().isoformat(),),
     )
     row = await cur.fetchone()

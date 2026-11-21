@@ -6,7 +6,7 @@ import re
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from penish.api.routes_images import resolve_live
 from penish.api.social import RateLimit, _gate, ip_hash
@@ -51,7 +51,13 @@ class ViewIn(BaseModel):
         default=None, alias="from", max_length=SLUG_MAX, pattern=r"^[a-z0-9-]+$"
     )
     # Host of document.referrer when the reader arrived from another site.
-    ref: str | None = Field(default=None, max_length=253)
+    ref: str | None = None
+
+    @field_validator("ref", mode="before")
+    @classmethod
+    def _bad_ref_is_no_ref(cls, v: Any) -> str | None:
+        # A referrer is a courtesy: one too long or not text must not cost the view itself.
+        return v if isinstance(v, str) and len(v) <= 253 else None
 
 
 @router.post("/api/images/{slug}/view", status_code=204, dependencies=[Depends(_gate)])

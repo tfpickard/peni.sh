@@ -41,6 +41,51 @@ async def test_concurrent_claimers_one_winner(p: Any) -> None:
     assert sum(r is not None for r in results) == 1
 
 
+async def test_a_due_job_goes_before_an_overdue_bulk_job(p: Any) -> None:
+    from penish.worker.admin_jobs import OG_JOB
+
+    assert OG_JOB in jobs.BULK_TYPES
+    long_ago = datetime.now(UTC) - timedelta(days=1)
+    og = await jobs.enqueue(p, OG_JOB, {}, run_after=long_ago)
+    ingest = await jobs.enqueue(p, "ingest", {})
+    first = await jobs.claim(p, None)
+    assert first is not None and first.id == ingest
+    # Nothing else due: the sweep is claimed after all.
+    second = await jobs.claim(p, None)
+    assert second is not None and second.id == og
+
+
+async def test_bulk_jobs_run_one_at_a_time(p: Any) -> None:
+    from penish.worker.admin_jobs import OG_JOB
+
+    for i in range(3):
+        await jobs.enqueue(p, OG_JOB, {"i": i})
+    await jobs.enqueue(p, "ingest", {})
+    stop = asyncio.Event()
+    running = {"og": 0}
+    peak = 0
+    done = 0
+
+    async def og(job: Job) -> None:
+        nonlocal peak, done
+        running["og"] += 1
+        peak = max(peak, running["og"])
+        await asyncio.sleep(0.15)
+        running["og"] -= 1
+        done += 1
+        if done == 3:
+            stop.set()
+
+    async def ingest(job: Job) -> None:
+        return None
+
+    await asyncio.wait_for(
+        jobs.run_loop(p, {OG_JOB: og, "ingest": ingest}, stop=stop, idle_sleep=0.02, concurrency=2),
+        timeout=15,
+    )
+    assert (done, peak) == (3, 1)
+
+
 async def test_future_run_after_not_claimed(p: Any) -> None:
     await jobs.enqueue(p, "ingest", {}, run_after=datetime.now(UTC) + timedelta(hours=1))
     assert await jobs.claim(p, None) is None

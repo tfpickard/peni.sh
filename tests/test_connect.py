@@ -183,8 +183,8 @@ async def test_search_by_name_brings_the_collection_first(
     assert [i["slug"] for i in body["items"]][:3] == ["img-2", "img-1", "img-4"]
 
 
-@pytest.mark.parametrize("q", ["iii 44", "ptp iii 44", "iii.44", "ΠΤΠ iii, leaf 44", "PTP 3 44"])
-async def test_search_by_leaf_reference(
+@pytest.mark.parametrize("q", ["ptp iii 44", "ΠΤΠ iii, leaf 44", "PTP 3 44"])
+async def test_search_by_named_leaf_reference(
     client: httpx.AsyncClient,  # noqa: F811
     clean_db: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -205,6 +205,36 @@ async def test_search_by_leaf_reference(
     body = (await client.get("/api/search", params={"q": q})).json()
     assert [i["slug"] for i in body["items"]] == ["img-1"]
     assert body["tags"] == [] and asked == []
+
+
+@pytest.mark.parametrize(
+    ("q", "book", "place"), [("iii 44", 3, 44), ("iii.44", 3, 44), ("v 8", 5, 8), ("i 1", 1, 1)]
+)
+async def test_search_by_bare_leaf_reference_keeps_the_usual_search(
+    client: httpx.AsyncClient,  # noqa: F811
+    clean_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+    q: str,
+    book: int,
+    place: int,
+) -> None:
+    """Without the collection's name a reference is also just words: the leaf comes first
+    and the ordinary tag and embedding search follows it."""
+    a = add_image(clean_db, 1, vec=unit(0))
+    add_image(clean_db, 2, vec=unit(1))
+    c = add_image(clean_db, 3, vec=unit(2))
+    sql(clean_db, "insert into tags (image_id, tag, source) values (%s, %s, 'model')", c, q)
+    leaf(clean_db, a, book, place)
+    publish(clean_db)
+    asked = fake_embed(monkeypatch, unit(1))
+
+    body = (await client.get("/api/search", params={"q": q})).json()
+    slugs = [i["slug"] for i in body["items"]]
+    assert slugs[0] == "img-1"
+    assert sorted(slugs) == ["img-1", "img-2", "img-3"]
+    assert slugs.index("img-3") < slugs.index("img-2")  # the tagged one, as ever
+    assert [t["tag"] for t in body["tags"]] == [q]
+    assert asked == [q]
 
 
 async def test_search_leaf_reference_that_resolves_to_nothing(

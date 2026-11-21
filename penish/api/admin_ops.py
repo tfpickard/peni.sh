@@ -14,7 +14,7 @@ import secrets
 import shutil
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -714,6 +714,7 @@ async def _viewed(conn: Any, days: int) -> list[dict[str, Any]]:
     """Most viewed live pictures over the last `days` days, with a count for each of them."""
     cur = await conn.execute(
         "select i.id, i.slug, i.pub_sha, i.width, i.height, sum(v.n)::int as n,"
+        " current_date as today,"
         " array_agg(v.day::text || ':' || v.n order by v.day) as per_day"
         " from picture_views v join images i on i.id = v.image_id"
         " where i.status = 'live' and i.slug is not null"
@@ -724,10 +725,10 @@ async def _viewed(conn: Any, days: int) -> list[dict[str, Any]]:
     return list(await cur.fetchall())
 
 
-def _series(per_day: list[str], days: int) -> list[int]:
-    """Oldest to newest, a zero for each quiet day, so sparklines share a clock."""
+def _series(per_day: list[str], days: int, today: date) -> list[int]:
+    """Oldest to newest, a zero for each quiet day, so sparklines share a clock. `today` is
+    the database's: the days were keyed and filtered by its current_date, not by ours."""
     got = {d: int(n) for d, n in (e.split(":") for e in per_day)}
-    today = datetime.now(UTC).date()
     return [got.get((today - timedelta(days=k)).isoformat(), 0) for k in range(days - 1, -1, -1)]
 
 
@@ -780,7 +781,7 @@ async def stats(request: Request) -> dict[str, Any]:
                 "slug": r["slug"],
                 "thumb": thumbs[r["pub_sha"]],
                 "n": r["n"],
-                "days": _series(r["per_day"], d),
+                "days": _series(r["per_day"], d, r["today"]),
             }
             for r in viewed[d]
         ]

@@ -1005,3 +1005,14 @@ def test_restore_drill_without_a_dump_fails_and_says_so(
     monkeypatch.setenv("BACKUP_DIR", str(backups))
     drill = admin_ops._restore_drill()
     assert drill is not None and drill["ok"] is False and drill["reason"] == result["reason"]
+
+
+def test_series_counts_back_from_the_databases_today() -> None:
+    from datetime import date
+
+    from penish.api.admin_ops import _series
+
+    # The caller's clock is not consulted: the rows were keyed by the database's date.
+    assert _series(["2026-03-01:5", "2026-03-02:2"], 3, date(2026, 3, 2)) == [0, 5, 2]
+    assert _series(["2026-03-01:5"], 3, date(2026, 3, 3)) == [5, 0, 0]
+    assert _series([], 2, date(2026, 3, 3)) == [0, 0]
