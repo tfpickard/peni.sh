@@ -440,6 +440,83 @@ async def test_a_lost_upload_row_never_fails_the_picture(
     assert (settings.failed / "bad" / "bad.err").is_file()
 
 
+async def test_refused_group_keeps_its_picture_and_collection(p: Any, settings: Settings) -> None:
+    data = png(30)
+    job = drop(settings, "x", data, collection="pansophicon iii", embedding="{not json")
+    with pytest.raises(HardError):
+        await run(job, p, settings)
+    assert (settings.failed / "x" / "x.png").is_file()
+    [row] = await q(p, "select * from uploads")
+    assert (row["stem"], row["sha256"], row["source"]) == (
+        "x",
+        hashlib.sha256(data).hexdigest(),
+        "rsync",
+    )
+    assert (row["filename"], row["bytes"], row["collection_line"]) == (
+        "x.png",
+        len(data),
+        "pansophicon iii",
+    )
+    assert "x_embedding.json" in row["error"]
+    assert row["error"] == (settings.failed / "x" / "x.err").read_text().splitlines()[0]
+
+
+async def test_refused_group_with_an_undecodable_caption(p: Any, settings: Settings) -> None:
+    data = png(31)
+    job = drop(settings, "x", data, collection="pansophicon iii")
+    (Path(job.payload["dir"]) / "x_caption.txt").write_bytes(b"\xff\xfe bad")
+    with pytest.raises(HardError):
+        await run(job, p, settings)
+    [row] = await q(p, "select * from uploads")
+    assert row["sha256"] == hashlib.sha256(data).hexdigest()
+    assert (row["source"], row["bytes"], row["collection_line"]) == (
+        "rsync",
+        len(data),
+        "pansophicon iii",
+    )
+    assert "x_caption.txt" in row["error"]
+
+
+async def test_refused_form_upload_keeps_its_source_and_filename(
+    p: Any, settings: Settings
+) -> None:
+    data = png(32)
+    sha = hashlib.sha256(data).hexdigest()
+    async with p.connection() as conn:
+        await uploads.record(
+            conn,
+            stem="x",
+            sha256=sha,
+            filename="IMG 1.PNG",
+            size=len(data),
+            collection_line=None,
+            source="form",
+        )
+    with pytest.raises(HardError):
+        await run(drop(settings, "x", data, embedding="{not json"), p, settings)
+    [row] = await q(p, "select * from uploads")
+    assert (row["source"], row["filename"]) == ("form", "IMG 1.PNG")
+    assert "x_embedding.json" in row["error"]
+
+
+async def test_refused_group_without_an_image_records_nothing(p: Any, settings: Settings) -> None:
+    job = drop(settings, "x", b"", collection="pansophicon")
+    (Path(job.payload["dir"]) / "x.png").unlink()
+    with pytest.raises(HardError, match="no image"):
+        await run(job, p, settings)
+    assert await q(p, "select 1 from uploads") == []
+
+
+async def test_two_images_refused_are_both_recorded(p: Any, settings: Settings) -> None:
+    job = drop(settings, "x", png(33))
+    (Path(job.payload["dir"]) / "x.jpg").write_bytes(png(34))
+    with pytest.raises(HardError):
+        await run(job, p, settings)
+    rows = await q(p, "select filename, error from uploads order by filename")
+    assert [r["filename"] for r in rows] == ["x.jpg", "x.png"]
+    assert all("more than one image" in r["error"] for r in rows)
+
+
 async def test_bad_group_goes_to_failed(p: Any, settings: Settings) -> None:
     job = drop(settings, "two", png(6))
     d = Path(job.payload["dir"])

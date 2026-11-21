@@ -5,7 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from penish.worker.sidecars import SIDECARS, Embedding, GroupError, parse_group, stem_of
+from penish.worker.sidecars import (
+    SIDECARS,
+    Arrival,
+    Embedding,
+    GroupError,
+    arrivals,
+    parse_group,
+    stem_of,
+)
 
 
 @pytest.mark.parametrize(
@@ -154,3 +162,46 @@ def test_parse_group_bad_embedding(tmp_path: Path, body: str) -> None:
     _write(tmp_path, {"x.png": "a", "x_embedding.json": body})
     with pytest.raises(GroupError, match="x_embedding.json"):
         parse_group(tmp_path)
+
+
+def test_arrivals_ignores_a_bad_embedding(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {"x.png": "a", "x_collection.txt": "pansophicon iii\n", "x_embedding.json": "not json"},
+    )
+    assert arrivals(tmp_path) == [Arrival("x", tmp_path / "x.png", "pansophicon iii")]
+
+
+def test_arrivals_lists_every_image(tmp_path: Path) -> None:
+    _write(tmp_path, {"a.png": "a", "b.jpg": "b", "b_collection.txt": "c"})
+    assert arrivals(tmp_path) == [
+        Arrival("a", tmp_path / "a.png", None),
+        Arrival("b", tmp_path / "b.jpg", "c"),
+    ]
+
+
+def test_arrivals_without_an_image(tmp_path: Path) -> None:
+    _write(tmp_path, {"x_collection.txt": "c"})
+    assert arrivals(tmp_path) == []
+
+
+def test_arrivals_skips_another_stems_collection(tmp_path: Path) -> None:
+    _write(tmp_path, {"x.png": "a", "y_collection.txt": "c"})
+    assert arrivals(tmp_path) == [Arrival("x", tmp_path / "x.png", None)]
+
+
+def test_arrivals_reads_a_collection_that_is_not_utf8(tmp_path: Path) -> None:
+    _write(tmp_path, {"x.png": "a"})
+    (tmp_path / "x_collection.txt").write_bytes(b"pans\xffphicon")
+    [got] = arrivals(tmp_path)
+    assert got.collection == "pans\ufffdphicon"
+
+
+def test_arrivals_of_a_missing_folder(tmp_path: Path) -> None:
+    assert arrivals(tmp_path / "gone") == []
+
+
+def test_arrivals_reads_an_empty_collection_as_no_line(tmp_path: Path) -> None:
+    (tmp_path / "x.png").write_bytes(b"x")
+    (tmp_path / "x_collection.txt").write_text("  \n")
+    assert arrivals(tmp_path) == [Arrival("x", tmp_path / "x.png", None)]

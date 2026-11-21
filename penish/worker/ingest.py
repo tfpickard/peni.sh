@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -46,7 +47,7 @@ from penish.worker.haiku import haiku_from
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 from penish.worker.metrics import refresh_corpus_stats, surprise_at_arrival
 from penish.worker.nudity import Detector, detect
-from penish.worker.sidecars import Group, GroupError, parse_group
+from penish.worker.sidecars import Arrival, Group, GroupError, arrivals, parse_group
 
 log = logging.getLogger(__name__)
 
@@ -502,6 +503,46 @@ async def _upload(
         log.exception("ingest %s: could not %s the upload row", stem, what)
 
 
+def _hash_file(path: Path) -> tuple[str, int]:
+    # Chunked: a large original must not be held whole just to be hashed.
+    h = hashlib.sha256()
+    size = 0
+    with path.open("rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+async def _record_refused(pool: Pool, directory: Path, reason: str) -> None:
+    # Unlike a form upload, an rsync drop has no earlier row, so without this a group
+    # refused for a bad sidecar would keep its files and vanish from the admin's list.
+    for a in await asyncio.to_thread(arrivals, directory):
+        try:
+            sha, size = await asyncio.to_thread(_hash_file, a.image)
+        except OSError:
+            log.warning("ingest %s: could not read %s to record it", a.stem, a.image.name)
+            continue
+        await _upload(pool, "record", a.stem, partial(_record_arrival, a, sha, size))
+        await _upload(pool, "fail", a.stem, partial(_fail_arrival, a.stem, sha, reason))
+
+
+async def _record_arrival(a: Arrival, sha: str, size: int, conn: Conn) -> None:
+    await uploads.record(
+        conn,
+        stem=a.stem,
+        sha256=sha,
+        filename=a.image.name,
+        size=size,
+        collection_line=a.collection,
+        source="rsync",
+    )
+
+
+async def _fail_arrival(stem: str, sha: str, reason: str, conn: Conn) -> None:
+    await uploads.fail(conn, stem=stem, sha256=sha, error=reason)
+
+
 # -- handlers -------------------------------------------------------------
 
 
@@ -556,6 +597,7 @@ async def handle_ingest(
     try:
         group = parse_group(directory)
     except GroupError as e:
+        await _record_refused(pool, directory, e.reason)
         _move_to_failed(directory, stem, settings, e.reason, e.unknown)
         raise HardError(e.reason) from e
     if group.unknown:
