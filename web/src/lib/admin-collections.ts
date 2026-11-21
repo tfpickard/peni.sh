@@ -58,13 +58,21 @@ export type AdminLeaf = {
 	note: string | null;
 	note_source: 'owner' | 'model' | null;
 };
+// `queued`: no usable vector and the worker has the embedding queued or running. `stale`:
+// no usable vector and nothing queued (a dry run queues it).
+export type AnchorState = 'embedded' | 'queued' | 'stale';
 export type AdminBook = {
 	number: number;
 	title: string | null;
 	anchor_text: string;
 	tag_hints: string[];
-	// Embedded under today's model; false while the worker has it queued.
+	// Embedded under today's model.
 	anchored: boolean;
+	anchor_state: AnchorState;
+	// Null with a vector: embedded before the time was kept.
+	anchor_embedded_at: string | null;
+	// Each hint with how many of the collection's leaves carry a tag it matches.
+	hint_leaves: Record<string, number>;
 	leaves: AdminLeaf[];
 };
 export type FilingRequest = {
@@ -97,6 +105,8 @@ export type HistoryRow = {
 	to_book: number | null;
 	to_position: number | null;
 	reason: 'auto' | 'resort' | 'owner';
+	// How the book was decided, on rows that decided one.
+	chosen_by: 'score' | 'owner' | 'judge' | null;
 	at: string;
 };
 export type Detail = Summary & {
@@ -109,13 +119,17 @@ export type Detail = Summary & {
 	notes_queued: number;
 	tuning: Tuning;
 	tuning_default: Tuning;
+	tuning_limits: Record<'anchor_k' | 'tag_alpha' | 'fill_beta' | 'book_margin', [number, number]>;
 	last_resort_at: string | null;
 	resort: { status: string; last_error: string | null } | null;
 	books: AdminBook[];
 	requests: FilingRequest[];
 	// Uploads for this collection that are not leaves yet; the server omits any already in `requests`.
 	uploads: Upload[];
+	// The newest 20, or one leaf's newest 20 when asked with `leaf`.
 	history: HistoryRow[];
+	// Failed judgements among the last 20 filings, by kind (`refused`, `timeout`, ...).
+	judge_failures: Record<string, number>;
 };
 export type ProposedMove = {
 	image_id: number;
@@ -143,10 +157,54 @@ export type HeldLeaf = {
 };
 export type JudgePlan = Plan & { held: HeldLeaf[] };
 
+// One book's score for a picture in its parts; they add up to `total`.
+export type Terms = { number: number; cos: number; tag: number; fill: number; total: number };
+export type Weighing = {
+	best: number;
+	runner_up: number | null;
+	margin: number | null;
+	books: Terms[];
+};
+// A judgement (book, runner_up, reason) or a failure (error).
+export type JudgeSaid = {
+	model?: string;
+	book?: number;
+	runner_up?: number;
+	reason?: string;
+	error?: string;
+	detail?: string;
+};
+export type Explain = {
+	image_id: number;
+	slug: string | null;
+	book: number;
+	position: number;
+	pinned: boolean;
+	book_pinned: boolean;
+	// The judge chose its book (the latest decision).
+	judged: boolean;
+	// The kept answer for the leaf and books as they are now.
+	judgement: JudgeSaid | null;
+	// Every book now, the leaf left out of its own; `lead` is its own book over the best other.
+	now: (Weighing & { lead: number | null }) | null;
+	filed: {
+		at: string;
+		book: number;
+		position: number;
+		reason: string;
+		chosen_by: 'score' | 'owner' | 'judge' | null;
+		scores: (Partial<Weighing> & { judge?: JudgeSaid }) | null;
+	} | null;
+};
+
 const at = (slug: string) => `/${encodeURIComponent(slug)}`;
 
 export const list = () => call<{ collections: Summary[] }>('GET', '');
-export const detail = (slug: string) => call<Detail>('GET', at(slug));
+// `leaf` (image id or slug) narrows the history to one leaf.
+export const detail = (slug: string, leaf?: string) =>
+	call<Detail>('GET', leaf ? `${at(slug)}?leaf=${encodeURIComponent(leaf)}` : at(slug));
+export const explain = (slug: string, imageId: number) =>
+	call<Explain>('GET', `${at(slug)}/explain?image_id=${imageId}`);
 export const edit = (
 	slug: string,
 	body: Partial<
