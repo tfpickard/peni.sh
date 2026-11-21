@@ -96,7 +96,7 @@ def test_prompt_holds_the_rules() -> None:
         "a mosaic may belong to any book",
         "What heaven does is vi.",
         "What people do is vii, even when they do it in heaven's name.",
-        "What people do in baths is vii.",
+        "What people do in baths is vii, unless the point of the picture is religious; then it is vi.",
         "runner-up",
         "names the subject",
         "never the medium",
