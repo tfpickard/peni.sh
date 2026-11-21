@@ -186,6 +186,33 @@ async def test_rejudge_plans_and_applies(
     assert (await apply(client, plan)).json() == {"detail": "changed"}
 
 
+async def test_rejudge_keeps_every_slot_a_leaf_already_holds(
+    client: httpx.AsyncClient, clean_db: str, pool: Any
+) -> None:
+    anchored(clean_db)
+    ids = {}
+    for n, (caption, book, pos) in enumerate(
+        [("held", 7, 1), ("stays", 7, 22), ("bath", 3, 1), ("left", 3, 5)], start=1
+    ):
+        ids[caption] = pictured(clean_db, n, caption, [0.0, 0.0, 1.0, 0.0])
+        leaf(clean_db, ids[caption], book, pos)
+    # The owner put this one in vii by hand, at leaf 1, without pinning the slot.
+    sql(
+        clean_db, "update collection_leaves set book_pinned = true where image_id = %s", ids["held"]
+    )
+    assert (await dry(client)).status_code == 409
+    await judging(pool, clean_db, {"stays": "vii iii", "bath": "vii iii", "left": "iii vii"})
+
+    plan = (await dry(client)).json()
+    assert [m["image_id"] for m in plan["moves"]] == [ids["bath"]]
+    after = tuple(plan["moves"][0]["after"])
+    assert after[0] == 7 and after[1] not in (1, 22)
+    assert (await apply(client, plan)).status_code == 200
+    got = places(clean_db)
+    assert got[ids["held"]] == (7, 1) and got[ids["stays"]] == (7, 22)
+    assert got[ids["left"]] == (3, 5) and got[ids["bath"]] == after
+
+
 async def test_rejudge_apply_refuses_a_changed_collection(
     client: httpx.AsyncClient, clean_db: str, pool: Any
 ) -> None:

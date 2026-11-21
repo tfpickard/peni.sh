@@ -564,10 +564,17 @@ Placement = dict[int, tuple[int, int]]
 
 
 def lay_books(
-    shape: Shape, leaves: list[Leaf], where: Mapping[int, int], books: Iterable[int]
+    shape: Shape,
+    leaves: list[Leaf],
+    where: Mapping[int, int],
+    books: Iterable[int],
+    *,
+    settled: bool = False,
 ) -> Placement:
     """Positions for the named books, and for any book a leaf moves into, given each
-    leaf's book. Every other leaf keeps its place; a book a leaf left keeps its gap."""
+    leaf's book. Every other leaf keeps its place; a book a leaf left keeps its gap.
+    `settled`: a leaf already in the book keeps its slot too, and an arrival takes a free
+    one, chosen among the free slots as the filer would choose."""
     redo = set(books) | {where[x.image_id] for x in leaves if where[x.image_id] != x.book}
     out: Placement = {
         x.image_id: (x.book, x.position) for x in leaves if where[x.image_id] not in redo
@@ -582,7 +589,9 @@ def lay_books(
                 x.vec,
                 x.tags,
                 x.book_pinned,
-                x.pinned,
+                # Held as a pin holds it: a fixed point the arrivals are laid around. A slot
+                # past a shrunken book is no slot to keep, and goes free as before.
+                x.pinned or (settled and x.book == number and 1 <= x.position <= shape.cap),
                 x.judged,
             )
             for x in leaves

@@ -926,7 +926,9 @@ async def judge_plan(
             if isinstance(v, Failed)
         ]
         held += [Held(i, (here[i].book, here[i].position), None, why) for i, why in skipped.items()]
-        placement = lay_books(state.shape, state.leaves, where, [])
+        # A leaf the judge leaves in its book keeps its number, which the owner may have
+        # chosen and the public page shows as `formerly` once it changes.
+        placement = lay_books(state.shape, state.leaves, where, [], settled=True)
         diff, leads = _diff(state, placement)
         moves = _judged_moves(diff, verdicts)
         judged = {m.image_id: hashes[m.image_id] for m in moves if m.chosen_by == "judge"}

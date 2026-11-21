@@ -413,8 +413,9 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
   `{"dry_run": true}` plans from kept judgements only: while any leaf not `book_pinned`
   has none for what it is now, it answers 409 `judging` and queues `collection_judge`, and
   the worker asks for each (four at a time). Then it answers `{plan_id, moves, held}`:
-  every leaf whose judged book is not its own, moved there with its slot chosen as the
-  filer would (other leaves in that book may shift, as on a filing), each book move with
+  every leaf whose judged book is not its own, moved into a free slot of that book, chosen
+  among the free slots as the filer would. No leaf that keeps its book changes its slot,
+  so a number the owner gave stands. Each book move comes with
   the judge's `reason` and `runner_up`. `held` lists what stays: a leaf whose judged book
   is full (`book`, `why: "full"`), and one the judge did not judge (`why` is the failure,
   `no text` or `no vector`). 409 `anchors` as the re-sort's dry run. `{"dry_run": false,
