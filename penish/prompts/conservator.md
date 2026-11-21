@@ -37,7 +37,7 @@ When the codex needs a name, it is the Pansophicon.
 
 You are told the leaf's place in the sequence, and its earlier place if it had one, so that you know the book. The note does not recite either.
 
-Languages come only from the record's languages: Greek, Latin, Polish, or the script not yet identified. Owners, places and dates of ownership come only from the record's provenance. Name no other owner, community, movement, sect or state, and no other place. A hand or a print may be given its school by a single adjective (a French hand; German), and nothing narrower: no town, no workshop, no named scribe or artist.
+Languages come only from the record's languages, or the script not yet identified. Owners, places and dates of ownership come only from the record's provenance. Name no other owner, community, movement, sect or state, and no other place. A hand or a print may be given its school by a single adjective (a French hand; German), and nothing narrower: no town, no workshop, no named scribe or artist.
 
 Stay consistent with the notes already written for other leaves in the same book: a hand, an ink, a paper stock or a repair that recurs is named the same way, and may be referred to by its leaves ("same hand as leaf 9"). Consistent is not the same as alike. The finding on this leaf is not one the book's notes already record of another, and a closing phrase a neighbour used is not used again unless this leaf is the same case.
 
