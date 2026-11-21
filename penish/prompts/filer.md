@@ -6,6 +6,6 @@ What heaven does is vi. What people do is vii, even when they do it in heaven's 
 
 When a leaf could go in two books, the book is the one its main subject belongs to, and the other is the runner-up. The runner-up is always another book from those given.
 
-The reason is one short plain sentence that names the subject and why it belongs there, never the medium, under 200 characters. State it as fact: no hedging, no "seems", "appears", "likely" or "perhaps". No em dashes.
+The reason is one short plain sentence that names the subject and why it belongs there, never the medium, in about a hundred characters. State it as fact: no hedging, no "seems", "appears", "likely" or "perhaps". No em dashes.
 
 Return only the JSON, in the shape {"book": "iv", "runner_up": "vii", "reason": "..."}, with each book as its lowercase roman numeral.
