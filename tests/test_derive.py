@@ -547,6 +547,55 @@ def test_og_flattens_alpha_and_grey_to_rgb() -> None:
         assert (img.bands, img.interpretation) == (3, "srgb")
 
 
+def _noise(w: int, h: int) -> pyvips.Image:
+    # Busy on purpose: noise is the worst case for a JPEG encoder.
+    arr = np.random.default_rng(7).integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+    return pyvips.Image.new_from_memory(arr.tobytes(), w, h, 3, "uchar").copy(interpretation="srgb")
+
+
+def test_og_over_the_cap_is_re_encoded_at_lower_quality() -> None:
+    img = _noise(1200, 1600)
+    q85 = len(derive._save(img, ".jpg", Q=85, interlace=True, optimize_coding=True))
+    assert q85 > derive.OG_MAX_BYTES, "fixture must exceed the cap at Q85"
+    og = make_og(img, "a" * 64)
+    assert og is not None
+    # Stepped down the ladder, never past it: the first encode under the cap, else the last.
+    sizes = [
+        len(derive._save(img, ".jpg", Q=q, interlace=True, optimize_coding=True))
+        for q in (85, *derive.OG_FALLBACK_QUALITIES)
+    ]
+    first_under = next((n for n in sizes if n <= derive.OG_MAX_BYTES), sizes[-1])
+    assert len(og.data) == first_under
+    assert len(og.data) < q85
+
+
+def test_og_under_the_cap_stays_at_q85(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+    real = derive._save
+
+    def spy(img: pyvips.Image, suffix: str, **opts: object) -> bytes:
+        seen.append(opts.get("Q"))
+        return real(img, suffix, **opts)
+
+    monkeypatch.setattr(derive, "_save", spy)
+    assert make_og(_gradient(300, 200), "a" * 64) is not None
+    assert seen == [derive.OG_QUALITY]
+
+
+def test_og_keeps_the_last_encode_when_none_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(derive, "OG_MAX_BYTES", 10)
+    og = make_og(_gradient(300, 200), "a" * 64)
+    assert og is not None
+    expected = derive._save(
+        _gradient(300, 200).colourspace("srgb"),
+        ".jpg",
+        Q=derive.OG_FALLBACK_QUALITIES[-1],
+        interlace=True,
+        optimize_coding=True,
+    )
+    assert og.data == expected
+
+
 def test_og_failure_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
     def broken(*a: object, **kw: object) -> bytes:
         raise pyvips.Error("no jpeg today")

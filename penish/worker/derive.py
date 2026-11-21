@@ -17,6 +17,10 @@ WIDTHS = (480, 960, 1600)
 # Link previewers want one JPEG at about this width; many refuse webp and avif outright.
 OG_WIDTH = 1200
 OG_QUALITY = 85
+# Some previewers drop an image over about 300 KB, and a tall photo at Q85 runs to 600 KB.
+OG_MAX_BYTES = 300_000
+# Tried in turn when the first encode is over the cap; the last stands if none fits.
+OG_FALLBACK_QUALITIES = (75, 65)
 # The site's ground, so a transparent picture previews the way it looks on its page.
 _GROUND = (11, 6, 24)
 # The largest real upload seen is 6048x6048 (36.6 megapixels) and an iPhone's biggest file
@@ -345,7 +349,11 @@ def make_og(img: pyvips.Image, sha: str, watermark: bool = False) -> Derivative 
             scaled = scaled.flatten(background=list(_GROUND))
         if scaled.format != "uchar":
             scaled = scaled.cast("uchar")
-        data = _save(scaled, ".jpg", Q=OG_QUALITY, interlace=True, optimize_coding=True)
+        data = b""
+        for q in (OG_QUALITY, *OG_FALLBACK_QUALITIES):
+            data = _save(scaled, ".jpg", Q=q, interlace=True, optimize_coding=True)
+            if len(data) <= OG_MAX_BYTES:
+                break
     except pyvips.Error as e:
         log.warning("og jpeg for %s failed: %s", sha[:10], str(e).strip())
         return None

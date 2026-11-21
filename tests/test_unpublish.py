@@ -609,6 +609,8 @@ async def test_admin_list_detail_and_purge(
         "https://t/i/older",
         f"{pub}.avif",
         f"{pub}.webp",
+        # The link-preview JPEG is cached under the same year-long header.
+        f"{pub}.jpg",
     ]
 
     # Cropped while down: the new files were never served, the old ones are still cached.
@@ -629,6 +631,7 @@ async def test_admin_list_detail_and_purge(
         *body["purge"],
         f"{old}-400.avif",
         f"{old}-400.webp",
+        f"{old}-400.jpg",
     ]
 
     # Files another shown picture still serves are not this picture's to purge.
