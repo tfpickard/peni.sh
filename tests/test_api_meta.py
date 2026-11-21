@@ -126,3 +126,87 @@ async def test_gen_param_and_window_seed(client: httpx.AsyncClient) -> None:
 async def test_image_page_has_no_server_haiku(client: httpx.AsyncClient) -> None:
     r = await client.get("/i/whatever")
     assert '<h1 class="haiku"' not in r.text
+
+
+def _insert_image(dsn: str, slug: str, *, live: bool = True, tags: tuple[str, ...] = ()) -> int:
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            "insert into images (sha256, slug, status, published_at)"
+            " values (%s, %s, %s, case when %s then now() end) returning id",
+            (slug.ljust(64, "0"), slug, "live" if live else "processing", live),
+        ).fetchone()
+        assert row
+        for t in tags:
+            conn.execute(
+                "insert into tags (image_id, tag, source) values (%s, %s, 'model')", (row[0], t)
+            )
+        return int(row[0])
+
+
+def _static_routes() -> list[str]:
+    root = Path(__file__).resolve().parent.parent / "web" / "src" / "routes"
+    out = []
+    for f in root.rglob("+page.svelte"):
+        parts = f.parent.relative_to(root).parts
+        if not any(p.startswith("[") for p in parts):
+            out.append("/" + "/".join(parts))
+    return sorted(out)
+
+
+@pytest.mark.parametrize("path", ["/nope", "/sitemap.xml", "/feed.xml", "/a/b/c/d", "/tags/"])
+async def test_unknown_path_is_404_with_shell(client: httpx.AsyncClient, path: str) -> None:
+    r = await client.get(path)
+    assert r.status_code == 404
+    assert "window.__HAIKU__" in r.text
+    assert r.headers["cache-control"] == "no-store"
+
+
+async def test_head_unknown_path_is_404(client: httpx.AsyncClient) -> None:
+    assert (await client.head("/nope")).status_code == 404
+
+
+async def test_every_static_route_in_the_tree_answers_200(client: httpx.AsyncClient) -> None:
+    paths = _static_routes()
+    assert "/" in paths and "/admin" in paths  # the walk found the tree
+    for p in paths:
+        assert (await client.get(p)).status_code == 200, p
+
+
+async def test_admin_pages_are_200(client: httpx.AsyncClient) -> None:
+    for p in ("/admin", "/admin/comments", "/admin/stats", "/admin/pictures", "/admin/pictures/12"):
+        assert (await client.get(p)).status_code == 200, p
+    assert (await client.get("/admin/pictures/abc")).status_code == 404
+    assert (await client.get("/admin/nope")).status_code == 404
+
+
+async def test_category_pages(client: httpx.AsyncClient) -> None:
+    from penish.categories import SLUGS
+
+    assert (await client.get(f"/c/{SLUGS[0]}")).status_code == 200
+    assert (await client.get("/c/nope")).status_code == 404
+
+
+async def test_tag_pages(client: httpx.AsyncClient, clean_db: str) -> None:
+    _insert_image(clean_db, "live-one", tags=("moss", "wet moss"))
+    _insert_image(clean_db, "hidden-one", live=False, tags=("unseen",))
+    assert (await client.get("/t/moss")).status_code == 200
+    assert (await client.get("/t/wet moss")).status_code == 200
+    assert (await client.get("/t/wet%20moss")).status_code == 200
+    assert (await client.get("/t/nope")).status_code == 404
+    assert (await client.get("/t/unseen")).status_code == 404
+    assert (await client.get("/t/")).status_code == 404
+
+
+async def test_old_slug_redirects(client: httpx.AsyncClient, clean_db: str) -> None:
+    img = _insert_image(clean_db, "new-name")
+    with psycopg.connect(clean_db) as conn:
+        conn.execute("insert into slug_aliases (slug, image_id) values ('old-name', %s)", (img,))
+    for method in (client.get, client.head):
+        r = await method("/i/old-name")
+        assert r.status_code == 301
+        assert r.headers["location"] == "/i/new-name"
+    r = await client.get("/i/old-name?gen=ou")
+    assert r.status_code == 301
+    assert r.headers["location"] == "/i/new-name?gen=ou"
+    assert (await client.get("/i/new-name")).status_code == 200
+    assert (await client.get("/i/neither")).status_code == 404

@@ -1,8 +1,16 @@
+import hashlib
 import io
+import struct
+import sys
+import zlib
 
+import numpy as np
+import pillow_heif
 import pytest
 import pyvips
+from PIL import Image
 
+from penish.worker import derive
 from penish.worker.derive import (
     MIN_CROP,
     UndecodableImage,
@@ -79,6 +87,267 @@ def test_unsupported_format_raises() -> None:
     assert isinstance(gif_like, bytes)
     with pytest.raises(UndecodableImage):
         load_and_validate(gif_like)
+
+
+def test_unsupported_format_names_what_is_accepted() -> None:
+    tif = _gradient(32, 32).write_to_buffer(".tif")
+    assert isinstance(tif, bytes)
+    with pytest.raises(UndecodableImage, match=r"need png, jpeg, webp or heic$"):
+        load_and_validate(tif)
+
+
+# -- the pixel cap ------------------------------------------------------------------
+
+
+def _png_claiming(width: int, height: int) -> bytes:
+    """A 1-bit grey PNG of the stated size. Blank rows deflate to almost nothing, so the
+    file is a few kilobytes while the header claims any number of pixels."""
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        crc = zlib.crc32(kind + body)
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", crc)
+
+    packer = zlib.compressobj(9)
+    row = bytes((width + 7) // 8 + 1)
+    idat = b"".join(packer.compress(row) for _ in range(height)) + packer.flush()
+    ihdr = struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0)
+    sig = b"\x89PNG\r\n\x1a\n"
+    return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def test_cap_is_above_every_real_upload() -> None:
+    # The largest seen is 6048x6048; iPhones make 48 megapixel files.
+    derive._check_size(6048, 6048)
+    derive._check_size(8064, 6048)
+    derive._check_size(derive.MAX_PIXELS, 1)
+    with pytest.raises(UndecodableImage):
+        derive._check_size(derive.MAX_PIXELS, 2)
+
+
+def test_oversized_header_is_refused_before_decode_in_libvips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def decoded(*_: object) -> None:
+        raise AssertionError("decode reached")
+
+    monkeypatch.setattr(pyvips.Image, "copy_memory", decoded)
+    data = _png_claiming(20000, 6000)
+    assert len(data) < 100_000
+    with pytest.raises(UndecodableImage, match=r"picture is 120\.0 megapixels; the limit is 100$"):
+        load_and_validate(data)
+
+
+def test_a_48_megapixel_picture_is_decoded() -> None:
+    d = load_and_validate(_png_claiming(8064, 6048))
+    assert (d.width, d.height) == (8064, 6048)
+
+
+def test_oversized_heic_is_refused_before_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = _heic(Image.new("RGB", (64, 48), (200, 30, 90)))
+
+    def decoded(*_: object, **__: object) -> None:
+        raise AssertionError("decode reached")
+
+    # A real 100 megapixel HEIC is too much to build in a test, so the cap comes down to
+    # 3071 pixels instead of the picture going up; the check is the same comparison.
+    monkeypatch.setattr(derive, "MAX_PIXELS", 64 * 48 - 1)
+    monkeypatch.setattr(pillow_heif.HeifFile, "to_pillow", decoded)
+    with pytest.raises(UndecodableImage, match=r"picture is 0\.0 megapixels"):
+        derive._heif_via_pillow(data)
+    # And the whole way in, whichever loader reads the header first.
+    monkeypatch.setattr(pyvips.Image, "copy_memory", decoded)
+    with pytest.raises(UndecodableImage, match="megapixels"):
+        load_and_validate(data)
+
+
+# -- iPhone and iPad formats --------------------------------------------------
+
+# Registered once for the fixtures only; derive itself goes through open_heif.
+pillow_heif.register_heif_opener()
+
+
+def _loader(data: bytes) -> str:
+    return str(pyvips.Image.new_from_buffer(data, "").get("vips-loader"))
+
+
+def _uhdr() -> bytes:
+    xy = pyvips.Image.xyz(256, 256)
+    hdr = (
+        (xy[0] / 255.0)
+        .bandjoin([xy[1] / 255.0 * 2.0, (xy[0] + xy[1]) / 510.0])
+        .copy(interpretation="scrgb")
+    )
+    out = hdr.uhdrsave_buffer()
+    assert isinstance(out, bytes)
+    return out
+
+
+def _heic(im: Image.Image, **opts: object) -> bytes:
+    b = io.BytesIO()
+    im.save(b, "HEIF", quality=95, **opts)
+    return b.getvalue()
+
+
+def _px(img: pyvips.Image, x: int, y: int) -> list[float]:
+    return list(img.getpoint(x, y))
+
+
+def _near(got: list[float], want: list[float], tol: float = 8) -> bool:
+    return len(got) == len(want) and all(abs(g - w) <= tol for g, w in zip(got, want, strict=True))
+
+
+def _p3_to_srgb(rgb: tuple[int, int, int]) -> list[float]:
+    one = (pyvips.Image.black(1, 1, bands=3) + list(rgb)).cast("uchar")
+    return _px(one.copy(interpretation="srgb").icc_transform("srgb", input_profile="p3"), 0, 0)
+
+
+def test_ultra_hdr_decodes_as_its_jpeg_base() -> None:
+    data = _uhdr()
+    assert _loader(data) == "uhdrload_buffer", "fixture must be an Ultra HDR jpeg"
+    d = load_and_validate(data)
+    assert (d.width, d.height, d.mime) == (256, 256, "image/jpeg")
+    assert d.sha256 == hashlib.sha256(data).hexdigest()
+    assert (d.image.bands, d.image.format) == (3, "uchar")
+    out = clean_original(d.image, d.mime)
+    assert pyvips.Image.new_from_buffer(out, "").get("vips-loader") == "jpegload_buffer"
+
+
+def test_heic_decodes_to_png() -> None:
+    data = _heic(Image.new("RGB", (64, 48), (200, 30, 90)))
+    assert data[4:12] == b"ftypheic"
+    d = load_and_validate(data)
+    assert (d.width, d.height, d.mime) == (64, 48, "image/png")
+    assert d.sha256 == hashlib.sha256(data).hexdigest()
+    assert (d.image.bands, d.image.format) == (3, "uchar")
+    assert _near(_px(d.image, 10, 10), [200, 30, 90])
+    out = clean_original(d.image, d.mime)
+    assert out[:4] == b"\x89PNG"
+    kept = pyvips.Image.new_from_buffer(out, "")
+    assert (kept.width, kept.height) == (64, 48)
+    ders = make_derivatives(d.image, d.sha256)
+    assert {x.width for x in ders} == {64} and {x.fmt for x in ders} >= {"webp"}
+    # The kept PNG goes back through load_and_validate on every crop.
+    assert rebuild_public(out, None, False).width == 64
+
+
+def test_heic_rotation_applied_once() -> None:
+    # 80x40, red in the top-left corner, stored with EXIF orientation 6 which the
+    # encoder turns into an irot box. Shown, it is 40x80 with the red at the top right.
+    im = Image.new("RGB", (80, 40), (10, 200, 30))
+    im.paste((255, 0, 0), (0, 0, 16, 16))
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    d = load_and_validate(_heic(im, exif=exif.tobytes()))
+    assert (d.width, d.height) == (40, 80)
+    assert _near(_px(d.image, 36, 4), [255, 0, 0], tol=30)
+    assert _near(_px(d.image, 4, 4), [10, 200, 30], tol=30)
+    assert _near(_px(d.image, 36, 76), [10, 200, 30], tol=30)
+
+
+def test_heic_icc_profile_is_baked_in() -> None:
+    p3 = pyvips.Image.black(1, 1, bands=3).cast("uchar").copy(interpretation="srgb")
+    p3_icc = p3.icc_transform("p3").get("icc-profile-data")
+    rgb = (200, 30, 90)
+    want = _p3_to_srgb(rgb)
+    assert not _near(want, list(map(float, rgb))), "p3 and srgb must differ for this colour"
+    d = load_and_validate(_heic(Image.new("RGB", (64, 48), rgb), icc_profile=p3_icc))
+    assert _near(_px(d.image, 10, 10), want)
+
+
+def test_heic_nclx_p3_is_baked_in() -> None:
+    rgb = (200, 30, 90)
+    nclx = {
+        "color_primaries": 12,
+        "transfer_characteristics": 13,
+        "matrix_coefficients": 6,
+        "full_range_flag": 1,
+    }
+    d = load_and_validate(_heic(Image.new("RGB", (64, 48), rgb), nclx_profile=nclx))
+    assert _near(_px(d.image, 10, 10), _p3_to_srgb(rgb))
+
+
+@pytest.mark.parametrize("transfer", [16, 18, 2])  # PQ, HLG, unspecified
+def test_heic_nclx_p3_other_curve_left_as_decoded(transfer: int) -> None:
+    rgb = (200, 30, 90)
+    nclx = {
+        "color_primaries": 12,
+        "transfer_characteristics": transfer,
+        "matrix_coefficients": 6,
+        "full_range_flag": 1,
+    }
+    data = _heic(Image.new("RGB", (64, 48), rgb), nclx_profile=nclx)
+    info = pillow_heif.open_heif(io.BytesIO(data)).info
+    assert info["nclx_profile"]["transfer_characteristics"] == transfer
+    assert not info.get("icc_profile")
+    d = load_and_validate(data)
+    # The P3 bake would move red by about 18; untouched it stays near the source.
+    assert not _near(_p3_to_srgb(rgb), list(map(float, rgb)))
+    assert _near(_px(d.image, 10, 10), [200, 30, 90])
+
+
+def test_heic_alpha_survives() -> None:
+    d = load_and_validate(_heic(Image.new("RGBA", (64, 48), (200, 30, 90, 128))))
+    assert (d.image.bands, d.image.format, d.mime) == (4, "uchar", "image/png")
+    assert _near(_px(d.image, 10, 10), [200, 30, 90, 128])
+    kept = pyvips.Image.new_from_buffer(clean_original(d.image, d.mime), "")
+    assert kept.bands == 4
+
+
+def test_heic_10_bit_comes_out_8_bit() -> None:
+    px = np.zeros((48, 64, 3), np.uint16)
+    px[...] = (200 * 257, 30 * 257, 90 * 257)
+    b = io.BytesIO()
+    pillow_heif.from_bytes(mode="RGB;16", size=(64, 48), data=px.tobytes()).save(b, quality=95)
+    assert pillow_heif.open_heif(io.BytesIO(b.getvalue())).info["bit_depth"] == 10
+    d = load_and_validate(b.getvalue())
+    assert (d.image.bands, d.image.format) == (3, "uchar")
+    assert _near(_px(d.image, 10, 10), [200, 30, 90])
+
+
+def test_heic_10_bit_grey_comes_out_8_bit() -> None:
+    px = np.full((40, 64), 120 * 257, np.uint16)
+    b = io.BytesIO()
+    pillow_heif.from_bytes(mode="L;16", size=(64, 40), data=px.tobytes()).save(b, quality=95)
+    d = load_and_validate(b.getvalue())
+    assert (d.image.bands, d.image.format) == (1, "uchar")
+    assert _near(_px(d.image, 5, 5), [120])
+
+
+def test_avif_input_decodes() -> None:
+    data = _gradient(64, 32).write_to_buffer(".avif")
+    assert isinstance(data, bytes)
+    assert _loader(data) == "heifload_buffer"
+    d = load_and_validate(data)
+    assert (d.width, d.height, d.mime) == (64, 32, "image/png")
+    assert d.image.format == "uchar"
+
+
+def test_avif_10_bit_comes_out_8_bit() -> None:
+    src = (pyvips.Image.black(64, 32, bands=3) + [200 * 257, 30 * 257, 90 * 257]).cast("ushort")
+    data = src.copy(interpretation="rgb16").write_to_buffer(".avif", bitdepth=10, lossless=True)
+    assert isinstance(data, bytes)
+    d = load_and_validate(data)
+    assert (d.image.bands, d.image.format) == (3, "uchar")
+    assert _near(_px(d.image, 5, 5), [200, 30, 90])
+
+
+def test_truncated_heic_raises() -> None:
+    data = _heic(Image.new("RGB", (64, 48), (200, 30, 90)))
+    with pytest.raises(UndecodableImage, match="heif"):
+        load_and_validate(data[: len(data) // 2])
+
+
+def test_heic_without_pillow_heif_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = _heic(Image.new("RGB", (64, 48), (200, 30, 90)))
+    monkeypatch.setitem(sys.modules, "pillow_heif", None)
+    derive._open_heif.cache_clear()
+    try:
+        with pytest.raises(UndecodableImage, match="heic decoder not installed"):
+            load_and_validate(data)
+    finally:
+        monkeypatch.undo()
+        derive._open_heif.cache_clear()
+    assert load_and_validate(data).mime == "image/png"
 
 
 def test_derivative_widths_and_no_upscale() -> None:

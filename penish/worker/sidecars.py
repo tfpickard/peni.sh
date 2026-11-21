@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+# Compared lowercased, so iOS names like IMG_0938.HEIC count too.
+IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"})
 
 # Editors and partial transfers leave these next to real files. Dotfiles are
 # handled separately and also cover rsync temp names like `.x.png.AbC123`.
@@ -176,3 +177,41 @@ def parse_group(directory: Path) -> Group:
             raise GroupError(f"{p.name}: {e}", group.unknown) from e
         group.sidecars[spec.field] = p
     return group
+
+
+@dataclass(frozen=True)
+class Arrival:
+    stem: str
+    image: Path
+    collection: str | None
+
+
+def arrivals(directory: Path) -> list[Arrival]:
+    """Every image in a claimed dir with its collection line, read without judging the
+    rest. A group refused for one bad sidecar still holds a picture and an intent worth
+    recording, so this looks at nothing parse_group could reject and never raises."""
+    try:
+        files = sorted(p for p in directory.iterdir() if p.is_file())
+    except OSError:
+        return []
+    images: list[tuple[str, Path]] = []
+    lines: dict[str, Path] = {}
+    for p in files:
+        stem, kind = stem_of(p.name)
+        if stem is None:
+            continue
+        if kind == "image":
+            images.append((stem, p))
+        elif kind == "_collection":
+            lines.setdefault(stem, p)
+    out: list[Arrival] = []
+    for stem, image in images:
+        line: str | None = None
+        if stem in lines:
+            try:
+                # An empty file is no line: stored as one, it would outlast a real one.
+                line = _raw(lines[stem]) or None
+            except OSError:
+                line = None
+        out.append(Arrival(stem=stem, image=image, collection=line))
+    return out

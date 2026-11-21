@@ -78,6 +78,16 @@ export type FilingRequest = {
 	job: string | null;
 	created_at: string;
 };
+export type Upload = {
+	stem: string;
+	sha256: string;
+	filename: string | null;
+	stage: 'received' | 'inbox' | 'ingesting' | 'failed' | 'down' | 'live' | 'unfiled' | 'lost';
+	error: string | null;
+	slug: string | null;
+	image_id: number | null;
+	created_at: string;
+};
 export type HistoryRow = {
 	id: number;
 	image_id: number;
@@ -103,6 +113,8 @@ export type Detail = Summary & {
 	resort: { status: string; last_error: string | null } | null;
 	books: AdminBook[];
 	requests: FilingRequest[];
+	// Uploads for this collection that are not leaves yet; the server omits any already in `requests`.
+	uploads: Upload[];
 	history: HistoryRow[];
 };
 export type ProposedMove = {

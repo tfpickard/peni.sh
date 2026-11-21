@@ -21,7 +21,7 @@ from penish.worker.embed import Embedder
 from penish.worker.embed_server import serve as serve_embed
 from penish.worker.facet_jobs import enqueue_unsplit
 from penish.worker.heartbeat import run_heartbeat
-from penish.worker.ingest import handle_haiku, handle_ingest
+from penish.worker.ingest import enqueue_unwritten, handle_haiku, handle_ingest
 from penish.worker.jobs import Job
 from penish.worker.name_jobs import run_loop as run_naming
 from penish.worker.nudity import enqueue_unchecked
@@ -112,6 +112,9 @@ async def main() -> None:
         n = await enqueue_unphrased(pool, settings)
         if n:
             log.info("enqueued %d pictures to embed offers and needs", n)
+        n = await enqueue_unwritten(pool)
+        if n:
+            log.info("enqueued %d pictures to write a haiku for", n)
         n = await collection_jobs.enqueue_unfiled(pool)
         if n:
             log.info("enqueued %d pictures to file into collections", n)

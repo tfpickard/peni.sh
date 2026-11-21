@@ -220,6 +220,56 @@ def test_corrupt_file_lands_in_failed(env: Env) -> None:
         assert env.q("select 1 from images") == []
 
 
+def test_corrupt_file_keeps_its_upload_and_collection(env: Env) -> None:
+    data = b"\xff\xd8\xff\xe1 an ultra hdr jpeg the decoder will not read"
+    with worker(env):
+        env.drop("u_collection.txt", "pansophicon\n")
+        env.drop("u.jpg", data)
+        err = env.data / "failed" / "u" / "u.err"
+        wait_for(err.is_file, "u.err to appear")
+
+        def failed() -> bool:
+            return bool(env.q("select 1 from uploads where error is not null"))
+
+        wait_for(failed, "the upload row to say why")
+        [row] = env.q("select * from uploads")
+        assert row["error"] == err.read_text().strip()
+        assert (row["stem"], row["sha256"], row["source"]) == (
+            "u",
+            hashlib.sha256(data).hexdigest(),
+            "rsync",
+        )
+        assert (row["filename"], row["bytes"], row["collection_line"]) == (
+            "u.jpg",
+            len(data),
+            "pansophicon",
+        )
+        assert env.q("select 1 from images") == []
+
+
+def test_refused_group_keeps_its_upload_and_collection(env: Env) -> None:
+    data = png(40)
+    with worker(env):
+        env.drop("g_collection.txt", "pansophicon\n")
+        env.drop("g_embedding.json", "{not json")
+        env.drop("g.png", data)
+        err = env.data / "failed" / "g" / "g.err"
+        wait_for(err.is_file, "g.err to appear")
+
+        def failed() -> bool:
+            return bool(env.q("select 1 from uploads where error is not null"))
+
+        wait_for(failed, "the upload row to say why")
+        [row] = env.q("select * from uploads")
+        assert "g_embedding.json" in row["error"]
+        assert (row["sha256"], row["source"], row["collection_line"]) == (
+            hashlib.sha256(data).hexdigest(),
+            "rsync",
+            "pansophicon",
+        )
+        assert env.q("select 1 from images") == []
+
+
 def test_sigkill_mid_job_then_restart_completes_once(env: Env) -> None:
     with worker(env, FAKE_DESCRIBE_SLEEP="5") as slow:
         env.drop("w.png", png(3))

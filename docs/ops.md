@@ -14,7 +14,7 @@ sudo UPLOAD_PUBKEY="$(cat ~/.ssh/id_ed25519.pub)" ./scripts/bootstrap_vps.sh
 
 Re-runnable. Existing users and directories are kept. `upload` defaults to uid/gid 1002 (`UPLOAD_UID`); the worker container runs as the same uid. Firewall and sshd belong to `ops/harden.sh` (see `docs/hardening.md`); bootstrap does not touch them, nor Docker or Tailscale when already installed, nor cloudflared.
 
-Re-run it after changing `scripts/penish-deploy`, `scripts/penish-backup` or `ops/systemd/*`; it copies them into `/usr/local/bin` and `/etc/systemd/system`.
+Re-run it after changing `scripts/penish-deploy`, `scripts/penish-backup`, `scripts/penish-restore-drill` or `ops/systemd/*`; it copies them into `/usr/local/bin` and `/etc/systemd/system`.
 
 ## uploads
 
@@ -33,11 +33,40 @@ Files with the same stem form one post. A group is picked up after 10 s without 
 | `x.png` | image |
 | `x_caption.txt` | caption |
 | `x_description.txt` | description |
+| `x_analysis.txt` | analysis |
 | `x_tags.txt` | tags, one per line |
 | `x_prompt.txt` | prompt |
-| `x_embedding.json` / `.npy` | embedding, only if it names our model and dim |
+| `x_embedding.json` | embedding, JSON only, and only if it names our model and dim |
+| `x_collection.txt` | collection, one line: `pansophicon`, `pansophicon iii` or `pansophicon iii 14` |
+| `x_note.txt` | conservator's note, kept with the collection line |
 
-Missing fields are generated. Failures land in `data/failed/<stem>/` with `x.err`.
+Accepted pictures are `.png`, `.jpg`, `.jpeg`, `.webp`, `.heic` and `.heif`, in any case. Ultra HDR JPEGs are read as plain JPEG and the gain map is dropped. HEIC is decoded and its stored original is a PNG.
+
+Missing fields are generated. Failures land in `data/failed/<stem>/` with `x.err`. The admin queue page retries one: the api moves the files back to `data/inbox` and removes the folder (not the `.err`). `inbox` and `failed` are separate mounts in the api container, so the move is a copy into a dotfile in the inbox, an fsync, a rename, sidecars first and the picture last, and only then the delete of the source; the `failed` mount is therefore writable for the api. The api runs as uid/gid 1002, the same as `upload`, which owns both folders, so owner write on `failed/<stem>/` is all it needs (group write is not).
+
+Every arrival is recorded in the `uploads` table before it is decoded, so an upload that fails to decode still shows on `/admin/collections` under `unfiled`, with its stage and reason. The stages, in the order they are checked, are `filed`, `unfiled`, `live`, `down`, `ingesting`, `inbox`, `failed`, `received` and `lost`. A `lost` upload is a record whose files never landed or are gone; the status check answers `waiting` for it, so the form sends it again. The stage is worked out from the images row, the collection leaves and the data folders on each request, and is not stored.
+
+### bulk push
+
+`scripts/ptp_push.py` sends a folder of pictures for one collection over the same rsync path as above. It skips any file whose sha256 the site already holds. It takes its sha list from `GET /api/admin/shas` with a read token (see admin), or from `--shas-file`.
+
+It is a dry run unless `--send` is given. The dry run prints each file and whether the site holds it. `--send` needs `--files-from`, a file of names, one per line, that must be files in the folder (`#` starts a comment). The script never chooses the files. Each picture goes with a `<stem>_collection.txt` sidecar, sent first.
+
+- `folder`: default `~/src/claude-share`
+- `--glob`: file pattern, repeatable (default `ptp-*.png` and `zm*.png`)
+- `--base`: site to ask for the sha list (default `https://peni.sh`)
+- `--shas-file`: json or one sha256 per line, instead of the api
+- `--json`: print json instead of text
+- `--files-from`: the files to send
+- `--send`: rsync the files named by `--files-from`
+- `--dest`: rsync destination (default `upload@100.80.26.40:`)
+- `--collection`: collection written into the sidecars (default `pansophicon`)
+- `--limit N`: send at most N files; files already on the site do not count
+
+```
+uv run python scripts/ptp_push.py
+uv run python scripts/ptp_push.py --send --files-from finals.txt --limit 5
+```
 
 ## cloudflare
 
@@ -57,7 +86,7 @@ The three packages `penish-api`, `penish-worker` and `penish-migrate` must be ma
 
 ## deploy
 
-`penish-deploy.timer` runs every 60 s. It reads the head sha of the latest successful `ci.yml` push run on `main` and compares it to `/var/lib/penish-deploy/deployed_sha`. On a difference: fetch `compose.yaml` for that sha from raw.githubusercontent.com, validate it with `docker compose config -q` and overwrite the local copy (previous one kept as `/var/lib/penish-deploy/compose.yaml.prev`, restored on rollback; a fetch or validation failure aborts the attempt), set `IMAGE_TAG` in `.env`, `docker compose pull`, `up -d --remove-orphans`, then wait up to 120 s for `api` to be healthy. `deployed_sha` is written only on success. On failure the journal gets an error, `IMAGE_TAG` goes back to the previous sha, and the same sha is not retried for 10 minutes.
+`penish-deploy.timer` runs every 60 s. It reads the head sha of the latest successful `ci.yml` push run on `main` and compares it to `/var/lib/penish-deploy/deployed_sha`. On a difference: fetch `compose.yaml` for that sha from raw.githubusercontent.com, validate it with `docker compose config -q` (YAML, interpolation and the required `.env` variables, run against the real `.env`; bind-mount sources, modes and ownership are not checked) and overwrite the local copy (previous one kept as `/var/lib/penish-deploy/compose.yaml.prev`, restored on rollback; a fetch or validation failure aborts the attempt), set `IMAGE_TAG` in `.env`, `docker compose pull`, `up -d --remove-orphans`, then wait up to 120 s for `api` to be healthy. `deployed_sha` is written only on success. On failure the journal gets an error, `IMAGE_TAG` goes back to the previous sha, and the same sha is not retried for 10 minutes.
 
 `GH_READ_TOKEN` in `.env`: GitHub, Settings, Developer settings, Fine-grained tokens. Repository access: only `tfpickard/peni.sh`. Permission: Actions, read-only. Until it is set the script does nothing, unless `/var/lib/penish-deploy/pinned_sha` exists.
 
@@ -100,13 +129,50 @@ The poller deploys that sha and nothing newer. Remove the file to resume followi
 
 ## backups
 
-`penish-backup.timer` runs at 03:30. It writes `backups/<date>.dump` (`pg_dump -Fc`), keeps 14, then ships off-box:
+`penish-backup.timer` runs at 03:30 as `deploy`. It writes `backups/<date>.dump` (`pg_dump -Fc`), keeps 14, then ships off-box:
 
 1. `RESTIC_REPOSITORY` set in `.env`: `restic backup backups data/media/orig`, then `restic forget --keep-daily 14 --prune`. Put the repo password and backend credentials (`RESTIC_PASSWORD`, `AWS_*`, `B2_*`, ...) in `.env` too. Run `restic init` once as `deploy` with the same environment.
 2. Otherwise `BACKUP_TARGET=user@host:/path`: rsync of `backups/` and `data/media/orig/`, no `--delete`. `deploy` needs an ssh key for that host.
 3. Otherwise a warning, local dump only.
 
-Restore: `docker compose exec -T db pg_restore -U <user> -d <db> --clean < backups/<date>.dump`.
+**Backups are local only unless `RESTIC_REPOSITORY` or `BACKUP_TARGET` is set.** The dumps and the originals then sit on the same disk as the database; losing the box loses them. The script warns about it every night.
+
+`/admin/system` reads `backups/` through a read-only mount (`BACKUP_DIR=/backups` in the api container): `backup` is the time of the newest `*.dump` (and `local` when the last drill found no off-box target configured), `restore drill` is the last drill's result. The api runs as gid 1002 (group `upload`), so `backups/` is `deploy:upload`, mode 0750; `bootstrap_vps.sh` sets that.
+
+Restore by hand: `docker compose exec -T db pg_restore -U <user> -d <db> --clean < backups/<date>.dump`.
+
+### restore drill
+
+`penish-restore-drill.timer` runs on Sundays at 05:00 as `deploy`. It restores the newest dump into a throwaway container of the db image (no network, no published port, 1 GB memory, removed on every exit path), counts `images`, `image_texts`, `embeddings`, `tags`, `haikus`, `collection_leaves`, `comments` and `votes` (a table missing from the dump is skipped) and writes `backups/restore-drill.json` by temp file and rename:
+
+```
+{"dump":"2026-11-20.dump","ran_at":"2026-11-20T05:00:03Z","ok":true,"seconds":4,
+ "counts":{"images":187,"votes":3},"reason":null,"local_only":true}
+```
+
+No dump, a container that will not start, a failed `pg_restore` or zero pictures is `"ok":false` with a one-line `reason`, and a non-zero exit. `local_only` is `null` when the script cannot read `.env`. `APP_ROOT`, `BACKUP_DIR`, `DRILL_IMAGE` (default: the db image in `compose.yaml`) and `DRILL_TIMEOUT` (seconds for the restore, default 900) override the defaults.
+
+Install it once on the box, which has no sudo for `deploy`; as root, from a checkout of this branch or `main` (or re-run `scripts/bootstrap_vps.sh`, which does all of this):
+
+```
+scp scripts/penish-restore-drill ops/systemd/penish-restore-drill.service ops/systemd/penish-restore-drill.timer root@100.80.26.40:/tmp/
+ssh root@100.80.26.40
+install -m 0755 /tmp/penish-restore-drill /usr/local/bin/penish-restore-drill
+install -m 0644 /tmp/penish-restore-drill.service /tmp/penish-restore-drill.timer /etc/systemd/system/
+chgrp upload /srv/peni.sh/backups && chmod 0750 /srv/peni.sh/backups
+systemctl daemon-reload
+systemctl enable --now penish-restore-drill.timer
+systemctl start penish-restore-drill.service
+journalctl -u penish-restore-drill.service -n 20 --no-pager
+```
+
+By hand, any time (as `deploy`, or `sudo -u deploy` from another user; it takes the same lock as the timer):
+
+```
+/usr/local/bin/penish-restore-drill; echo $?
+cat /srv/peni.sh/backups/restore-drill.json
+systemctl list-timers penish-restore-drill.timer
+```
 
 ## admin
 
@@ -117,3 +183,18 @@ ssh root@100.80.26.40 grep ADMIN_PASSWORD /srv/peni.sh/.env
 ```
 
 Changing it ends every session. Uploads go to `data/inbox` and take the same path as an rsync drop, including the 10 s settle.
+
+### read token
+
+`ADMIN_READ_TOKEN` in `.env` lets scripts read `/api/admin` with `Authorization: Bearer <token>`. It works for `GET` only and can never write. It must be at least 32 characters or it is ignored, and it does nothing unless `ADMIN_PASSWORD` is set. Wrong tokens are limited per address like wrong passwords, in a bucket of their own, so a stale token in a script does not lock the password login; both buckets count toward the same global budget.
+
+On the owner's Mac the token lives in `~/.config/penish/read-token`, or in the `PENISH_READ_TOKEN` env var.
+
+```
+curl -H "Authorization: Bearer $(cat ~/.config/penish/read-token)" https://peni.sh/api/admin/queue
+```
+
+Two endpoints exist for scripts:
+
+- `GET /api/admin/shas`: `{"images": [...], "uploads": [...]}`. Each image has `sha256`, `status` and `slug`. Each upload has `sha256`, `stem`, `stage` and `error`.
+- `GET /api/admin/uploads`: `{"uploads": [...]}`, every upload with its `stage`, `error`, `filename`, `collection_line` and `created_at`. `?collection=<slug>` limits it to one collection.

@@ -338,7 +338,7 @@
 	{#if msg}<p class="hot">{msg}</p>{/if}
 
 	<h2>unfiled</h2>
-	{#if d.requests.length}
+	{#if d.requests.length || d.uploads.length}
 		<ul class="plain">
 			{#each d.requests as r (r.image_id)}
 				<li class="row">
@@ -350,6 +350,19 @@
 					{#if r.error}<span class="hot">{r.error}</span>{/if}
 					<button onclick={() => act(() => cols.retry(slug, r.image_id))}>retry</button>
 					<button class="link" onclick={() => unfile(r.image_id)}>drop</button>
+				</li>
+			{/each}
+			{#each d.uploads as u (u.sha256)}
+				<li class="row">
+					{#if u.image_id !== null}
+						<a href="/admin/pictures/{u.image_id}">{u.filename ?? u.stem}</a>
+					{:else}
+						<span>{u.filename ?? u.stem}</span>
+					{/if}
+					<span class="dim" class:hot={u.stage === 'failed' || u.stage === 'lost'}>{u.stage}</span>
+					{#if u.error}<span class="hot">{u.error}</span>{/if}
+					<span class="dim">{when(u.created_at)}</span>
+					{#if u.stage === 'failed'}<a href="/admin/queue">queue</a>{/if}
 				</li>
 			{/each}
 		</ul>

@@ -1,6 +1,6 @@
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import jsonschema
@@ -9,6 +9,7 @@ from penish import runtime
 from penish.config import Settings
 from penish.runtime import Getter, Pool
 from penish.text import no_em_dash
+from penish.worker import providers
 from penish.worker.describe import (
     DescribeError,
     LazyAnthropic,
@@ -82,38 +83,25 @@ def _validate(text: str) -> Haiku:
     return lines[0], lines[1], lines[2]
 
 
-async def haiku_from(
-    description: str,
-    *,
-    settings: Settings,
-    pool: Pool | None = None,
-    get: Getter | None = None,
-    client: Any = None,
-    examples: list[Haiku] | None = None,
-    nudity: Sequence[str] | None = None,
-) -> Haiku:
-    """`get` overrides the runtime lookup (tests); `pool` supplies it, the examples and
-    usage recording otherwise. `nudity` is the detector's kinds, which the prompt writes
-    for differently."""
-    if client is None:
-        client = LazyAnthropic(settings.anthropic_api_key)
-    get = get or runtime.getter(pool, settings)
-    model = await get("haiku.model")
-    template = await get("haiku.prompt")
-    if examples is None:
-        examples = await load_examples(pool) if pool is not None else []
-    content = description
-    if nudity:
-        content = f"{description}\n\nNudity in this picture: {', '.join(nudity)}."
-    kwargs: dict[str, Any] = {
-        # The budget covers thinking too: haiku-5-5 thinks by default, and at 300 it spent
-        # every token there and returned no text. The drafts share it as well.
-        "max_tokens": 4096,
-        "system": build_prompt(template, examples),
-        "output_config": output_config(_SCHEMA, None),
-        "messages": [{"role": "user", "content": content}],
-    }
-    record = runtime.usage_recorder(pool, "haiku")
+class Written(tuple[str, str, str]):
+    """A haiku and the model that wrote it, provider prefix and all. A tuple, as Reply is a
+    str, so every caller that unpacks three lines and every test writer that returns a
+    plain tuple keeps working; a caller reads `getattr(h, "model", None)`."""
+
+    model: str
+
+    def __new__(cls, lines: Haiku, model: str) -> "Written":
+        out = super().__new__(cls, lines)
+        out.model = model
+        return out
+
+
+ClientFor = Callable[[str], Any]
+
+
+async def _write(
+    client: Any, model: str, kwargs: dict[str, Any], record: runtime.UsageRecorder | None
+) -> Written:
     last: Exception | None = None
     text: str | None = None
     drafting = True
@@ -134,8 +122,109 @@ async def haiku_from(
             }
             continue
         try:
-            return _validate(text)
+            return Written(_validate(text), getattr(text, "served", None) or model)
         except (ValueError, json.JSONDecodeError, jsonschema.ValidationError) as exc:
             last = exc
             rejected(text, exc, attempt=attempt, purpose="haiku", model=model)
     raise invalid("invalid haiku output", text, last)
+
+
+async def _fall_back(
+    refusal: DescribeError,
+    *,
+    model: str,
+    get: Getter,
+    settings: Settings,
+    client_for: ClientFor,
+    kwargs: dict[str, Any],
+    record: runtime.UsageRecorder | None,
+) -> Written:
+    """haiku.fallback in order, after `model` refused. A transient error is raised as it is,
+    so the queue backs off and the next attempt starts over; moving on would hand the
+    picture to a model further down the list for a reason that clears up by itself."""
+    keyed = set(providers.keyed(settings))
+    failed = [(model, refusal)]
+    for entry in await get(runtime.FALLBACK_KEY) or []:
+        if entry == model:
+            log.info("haiku: fallback %s is haiku.model; skipping", entry)
+            continue
+        try:
+            provider, _ = runtime.split_model(entry)
+        except ValueError as e:
+            log.warning("haiku: fallback %s skipped: %s", entry, e)
+            continue
+        if provider is None:
+            log.warning("haiku: fallback %s is not another provider; skipping", entry)
+            continue
+        if provider not in keyed:
+            log.warning("haiku: no key for %s; skipping fallback %s", provider, entry)
+            continue
+        log.warning("haiku: asking fallback %s after %s", entry, failed[-1][0])
+        try:
+            return await _write(client_for(entry), entry, kwargs, record)
+        except DescribeError as e:
+            if e.retryable:
+                raise
+            # A refusal, or a request this entry can never serve (an id the provider does
+            # not know): the same on every attempt, so the next entry gets its turn.
+            log.warning("haiku: fallback %s did not write it: %s", entry, e)
+            failed.append((entry, e))
+    if len(failed) == 1:
+        raise refusal
+    # Every model by name, so the queue page says what was tried.
+    raise DescribeError(
+        "; ".join(str(e) if m in str(e) else f"{m}: {e}" for m, e in failed),
+        retryable=False,
+        category=refusal.category,
+        refused=all(e.refused for _, e in failed),
+    )
+
+
+async def haiku_from(
+    description: str,
+    *,
+    settings: Settings,
+    pool: Pool | None = None,
+    get: Getter | None = None,
+    client: Any = None,
+    client_for: ClientFor | None = None,
+    examples: list[Haiku] | None = None,
+    nudity: Sequence[str] | None = None,
+) -> Written:
+    """`get` overrides the runtime lookup (tests); `pool` supplies it, the examples and
+    usage recording otherwise. `nudity` is the detector's kinds, which the prompt writes
+    for differently. `client` serves haiku.model; `client_for` gives the client for a
+    haiku.fallback entry (tests), the provider's own adapter otherwise."""
+    if client is None:
+        client = LazyAnthropic(settings.anthropic_api_key)
+    get = get or runtime.getter(pool, settings)
+    model = await get("haiku.model")
+    template = await get("haiku.prompt")
+    if examples is None:
+        examples = await load_examples(pool) if pool is not None else []
+    content = description
+    if nudity:
+        content = f"{description}\n\nNudity in this picture: {', '.join(nudity)}."
+    kwargs: dict[str, Any] = {
+        # The budget covers thinking too: haiku-5-5 thinks by default, and at 300 it spent
+        # every token there and returned no text. The drafts share it as well.
+        "max_tokens": 4096,
+        "system": build_prompt(template, examples),
+        "output_config": output_config(_SCHEMA, None),
+        "messages": [{"role": "user", "content": content}],
+    }
+    record = runtime.usage_recorder(pool, "haiku")
+    try:
+        return await _write(client, model, kwargs, record)
+    except DescribeError as e:
+        if not e.refused:
+            raise
+        return await _fall_back(
+            e,
+            model=model,
+            get=get,
+            settings=settings,
+            client_for=client_for or (lambda m: providers.client_for(m, settings)),
+            kwargs=kwargs,
+            record=record,
+        )

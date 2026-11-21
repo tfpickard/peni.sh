@@ -6,6 +6,7 @@ worker needs no knowledge that this exists.
 
 import hashlib
 import hmac
+import logging
 import os
 import re
 import secrets
@@ -21,6 +22,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
+from penish import uploads
 from penish.api.media import variants_for_many
 from penish.collection.numerals import Request as Filing
 from penish.collection.numerals import format_line, parse_line, parse_number
@@ -39,7 +41,23 @@ CHUNK = 1024 * 1024
 # Slack over MAX_BYTES for the multipart framing and the text fields.
 _BODY_SLACK = 1024 * 1024
 
+# A token shorter than this would make the rate limit the only defense, as with passwords.
+MIN_READ_TOKEN_LEN = 32
+# GET only: these routes are registered for GET, and the catch-all answers HEAD before the
+# token is ever looked at.
+_READ_METHODS = frozenset({"GET"})
+# Major brands of HEIF holding HEVC. AVIF shares the container and is refused here on
+# purpose: no door claims `.avif` (the inbox does not group it), so an upload of one could
+# never be grouped with its sidecars.
+_HEIC_BRANDS = frozenset({b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis"})
+_HEIF_GENERIC = frozenset({b"mif1", b"msf1"})
+
+log = logging.getLogger(__name__)
+
 _failures: dict[str, deque[float]] = defaultdict(deque)
+# Bearer misses are kept apart: a script on the owner's own machine with a stale token
+# must not use up the attempts the owner's password login needs from the same address.
+_token_failures: dict[str, deque[float]] = defaultdict(deque)
 
 
 def _settings_or_404() -> Settings:
@@ -89,11 +107,39 @@ def _valid_cookie(value: str | None, password: str) -> bool:
     return int(exp) > time.time()
 
 
+def _bearer(request: Request) -> str | None:
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not value.strip():
+        return None
+    return value.strip()
+
+
 def require_admin(request: Request) -> None:
-    password = _settings_or_404().admin_password
+    settings = _settings_or_404()
+    password = settings.admin_password
     assert password
-    if not _valid_cookie(request.cookies.get(COOKIE), password):
+    if _valid_cookie(request.cookies.get(COOKIE), password):
+        return
+    token = settings.admin_read_token
+    given = _bearer(request)
+    # Reading only: on any other method the header is as good as absent.
+    if (
+        given is None
+        or not token
+        or len(token) < MIN_READ_TOKEN_LEN
+        or request.method not in _READ_METHODS
+    ):
         raise HTTPException(status_code=401, detail="no")
+    # Its own per-address bucket with the login's limits, and the same global budget, so
+    # the token cannot be guessed faster than the password.
+    q = _recent_failures(_client_ip(request), _token_failures)
+    if len(q) >= LOGIN_FAILURES:
+        raise HTTPException(status_code=429, detail="wait")
+    if hmac.compare_digest(given.encode(), token.encode()):
+        return
+    exhausted = _global_failures() >= GLOBAL_LOGIN_FAILURES
+    q.append(time.time())
+    raise HTTPException(status_code=429 if exhausted else 401, detail="wait" if exhausted else "no")
 
 
 def _client_ip(request: Request) -> str:
@@ -103,20 +149,27 @@ def _client_ip(request: Request) -> str:
     )
 
 
-def _recent_failures(ip: str) -> deque[float]:
+def _prune(bucket: dict[str, deque[float]], keep: str) -> None:
     cutoff = time.time() - LOGIN_WINDOW
     # Prune every key so the map cannot grow without bound across many IPs.
-    for key in list(_failures):
-        q = _failures[key]
+    for key in list(bucket):
+        q = bucket[key]
         while q and q[0] < cutoff:
             q.popleft()
-        if not q and key != ip:
-            del _failures[key]
-    return _failures[ip]
+        if not q and key != keep:
+            del bucket[key]
+
+
+def _recent_failures(ip: str, bucket: dict[str, deque[float]] | None = None) -> deque[float]:
+    bucket = _failures if bucket is None else bucket
+    # Both buckets, because the global budget sums them and must not count expired misses.
+    _prune(_failures, ip if bucket is _failures else "")
+    _prune(_token_failures, ip if bucket is _token_failures else "")
+    return bucket[ip]
 
 
 def _global_failures() -> int:
-    return sum(len(q) for q in _failures.values())
+    return sum(len(q) for q in _failures.values()) + sum(len(q) for q in _token_failures.values())
 
 
 class Login(BaseModel):
@@ -174,7 +227,23 @@ def _sniff(head: bytes) -> str | None:
         return "jpg"
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "webp"
+    if _heic(head):
+        return "heic"
     return None
+
+
+def _heic(head: bytes) -> bool:
+    """An ISO BMFF `ftyp` box naming HEVC-coded HEIF, as a major brand or, under a generic
+    major brand, among the compatible ones."""
+    if len(head) < 12 or head[4:8] != b"ftyp":
+        return False
+    major = head[8:12]
+    if major in _HEIC_BRANDS:
+        return True
+    if major not in _HEIF_GENERIC:
+        return False
+    end = min(int.from_bytes(head[:4], "big"), len(head))
+    return any(head[i : i + 4] in _HEIC_BRANDS for i in range(16, end - 3, 4))
 
 
 def _stem(filename: str | None) -> str:
@@ -222,8 +291,8 @@ def _write_tmp(inbox: Path, name: str, data: bytes) -> Path:
     return tmp
 
 
-def _stream(dest: Path, head: bytes, src: BinaryIO) -> str:
-    """Copy the upload to dest under the size cap; returns the sha256 hex."""
+def _stream(dest: Path, head: bytes, src: BinaryIO) -> tuple[str, int]:
+    """Copy the upload to dest under the size cap; returns the sha256 hex and the size."""
     digest = hashlib.sha256()
     size = 0
     with open(dest, "wb") as f:
@@ -237,7 +306,7 @@ def _stream(dest: Path, head: bytes, src: BinaryIO) -> str:
             chunk = src.read(CHUNK)
         f.flush()
         os.fsync(f.fileno())
-    return digest.hexdigest()
+    return digest.hexdigest(), size
 
 
 @router.post("/upload", dependencies=[Depends(require_admin)])
@@ -263,7 +332,8 @@ async def upload(request: Request) -> dict[str, str]:
             stem = _stem(image.filename)
             img_tmp = inbox / f".{stem}.{ext}.{uuid.uuid4().hex[:8]}"
             temps.append(img_tmp)
-            sha = await run_in_threadpool(_stream, img_tmp, head, image.file)
+            sha, size = await run_in_threadpool(_stream, img_tmp, head, image.file)
+            filename = image.filename
 
             sidecars: list[tuple[str, str]] = []
             for field in ("caption", "description", "prompt"):
@@ -282,21 +352,46 @@ async def upload(request: Request) -> dict[str, str]:
                 if isinstance(note, str) and note.strip():
                     sidecars.append((f"{stem}_note.txt", note.strip() + "\n"))
 
-        # Sidecars land before the image: the settle timer is keyed by stem, and an image
-        # arriving first could be claimed without them.
         finals: list[tuple[Path, Path]] = []
         for name, text in sidecars:
             tmp = _write_tmp(inbox, name, text.encode())
             temps.append(tmp)
             finals.append((tmp, inbox / name))
-        finals.append((img_tmp, inbox / f"{stem}.{ext}"))
+        # The one await before the files land, so a cancelled request leaves only temps for
+        # the finally to remove. Still before the image, so the row is there by the time
+        # the watcher can claim it.
+        await _record(request, stem, sha, filename, size, line)
+        # Nothing below awaits: sidecars land before the image (the settle timer is keyed
+        # by stem, and an image arriving first could be claimed without them) and a
+        # cancellation cannot fall between them.
         for tmp, final in finals:
             os.rename(tmp, final)
             temps.remove(tmp)
+        os.rename(img_tmp, inbox / f"{stem}.{ext}")
+        temps.remove(img_tmp)
     finally:
         for tmp in temps:
             tmp.unlink(missing_ok=True)
     return {"stem": stem, "sha256": sha}
+
+
+async def _record(
+    request: Request, stem: str, sha: str, filename: str | None, size: int, line: str | None
+) -> None:
+    try:
+        async with request.app.state.pool.connection() as conn:
+            await uploads.record(
+                conn,
+                stem=stem,
+                sha256=sha,
+                filename=filename,
+                size=size,
+                collection_line=line,
+                source="form",
+            )
+    except Exception:
+        # The picture still arrives; the worker writes the row itself when it claims it.
+        log.warning("upload %s: could not record it", stem, exc_info=True)
 
 
 @router.get("/status", dependencies=[Depends(require_admin)])
@@ -315,6 +410,21 @@ async def status(request: Request, sha256: str, stem: str = "") -> dict[str, str
             err = next(iter(sorted(d.glob("*.err"))), None)
             text = err.read_text(errors="replace")[:500] if err else ""
             return {"state": "failed", "error": text}
+    # Only reached while no images row exists yet. The row is written before the files land,
+    # so on its own it cannot say the bytes arrived: a crash between the two leaves a record
+    # with nothing behind it, and answering received would stop the form resending.
+    async with request.app.state.pool.connection() as conn:
+        cur = await conn.execute(
+            "select stem, error from uploads where sha256 = %s order by created_at desc, id desc",
+            (sha256,),
+        )
+        ups = await cur.fetchall()
+    settings = get_settings()
+    for up in ups:
+        if up["error"]:
+            return {"state": "failed", "error": up["error"], "stem": up["stem"]}
+        if await run_in_threadpool(uploads.held, settings, up["stem"]):
+            return {"state": "received", "stem": up["stem"]}
     return {"state": "waiting"}
 
 
@@ -342,3 +452,28 @@ async def recent(request: Request) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+@router.get("/shas", dependencies=[Depends(require_admin)])
+async def shas(request: Request) -> dict[str, list[dict[str, Any]]]:
+    """Every file the site holds or was handed, so a script can skip what is already here."""
+    async with request.app.state.pool.connection() as conn:
+        cur = await conn.execute(
+            "select sha256, status::text as status, slug from images order by id"
+        )
+        images = [dict(r) for r in await cur.fetchall()]
+        staged = await uploads.stages(conn, get_settings())
+    return {
+        "images": images,
+        "uploads": [
+            {"sha256": u["sha256"], "stem": u["stem"], "stage": u["stage"], "error": u["error"]}
+            for u in staged
+        ],
+    }
+
+
+@router.get("/uploads", dependencies=[Depends(require_admin)])
+async def list_uploads(request: Request, collection: str | None = None) -> dict[str, Any]:
+    async with request.app.state.pool.connection() as conn:
+        staged = await uploads.stages(conn, get_settings(), collection=collection)
+    return {"uploads": [{**u, "created_at": u["created_at"].isoformat()} for u in staged]}

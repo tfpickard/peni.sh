@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import re
 import shutil
 from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -22,6 +24,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
+from penish import uploads
 from penish.collection import store as collection
 from penish.config import Settings
 from penish.mycelium import store as mycelium
@@ -44,7 +47,7 @@ from penish.worker.haiku import haiku_from
 from penish.worker.jobs import HardError, Job, Pool, SoftError
 from penish.worker.metrics import refresh_corpus_stats, surprise_at_arrival
 from penish.worker.nudity import Detector, detect
-from penish.worker.sidecars import Group, GroupError, parse_group
+from penish.worker.sidecars import Arrival, Group, GroupError, arrivals, parse_group
 
 log = logging.getLogger(__name__)
 
@@ -476,6 +479,70 @@ async def _reslug(conn: Conn, image_id: int, old: str | None, base: str) -> None
     raise SoftError(f"could not find a free slug for {base!r}")
 
 
+# -- uploads --------------------------------------------------------------
+
+
+async def _upload_on(conn: Conn, what: str, stem: str, write: Awaitable[None]) -> None:
+    # The uploads row is a record of the ingest, not part of it: losing one is logged,
+    # never the reason a picture fails.
+    try:
+        await write
+    except Exception:
+        log.exception("ingest %s: could not %s the upload row", stem, what)
+
+
+async def _upload(
+    pool: Pool, what: str, stem: str, write: Callable[[Conn], Awaitable[None]]
+) -> None:
+    # Its own pool connection, committed on its own: written before the picture is
+    # decoded, it has to outlive whatever happens to the ingest after it.
+    try:
+        async with pool.connection() as conn:
+            await write(conn)
+    except Exception:
+        log.exception("ingest %s: could not %s the upload row", stem, what)
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    # Chunked: a large original must not be held whole just to be hashed.
+    h = hashlib.sha256()
+    size = 0
+    with path.open("rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+async def _record_refused(pool: Pool, directory: Path, reason: str) -> None:
+    # Unlike a form upload, an rsync drop has no earlier row, so without this a group
+    # refused for a bad sidecar would keep its files and vanish from the admin's list.
+    for a in await asyncio.to_thread(arrivals, directory):
+        try:
+            sha, size = await asyncio.to_thread(_hash_file, a.image)
+        except OSError:
+            log.warning("ingest %s: could not read %s to record it", a.stem, a.image.name)
+            continue
+        await _upload(pool, "record", a.stem, partial(_record_arrival, a, sha, size))
+        await _upload(pool, "fail", a.stem, partial(_fail_arrival, a.stem, sha, reason))
+
+
+async def _record_arrival(a: Arrival, sha: str, size: int, conn: Conn) -> None:
+    await uploads.record(
+        conn,
+        stem=a.stem,
+        sha256=sha,
+        filename=a.image.name,
+        size=size,
+        collection_line=a.collection,
+        source="rsync",
+    )
+
+
+async def _fail_arrival(stem: str, sha: str, reason: str, conn: Conn) -> None:
+    await uploads.fail(conn, stem=stem, sha256=sha, error=reason)
+
+
 # -- handlers -------------------------------------------------------------
 
 
@@ -530,16 +597,41 @@ async def handle_ingest(
     try:
         group = parse_group(directory)
     except GroupError as e:
+        await _record_refused(pool, directory, e.reason)
         _move_to_failed(directory, stem, settings, e.reason, e.unknown)
         raise HardError(e.reason) from e
     if group.unknown:
         log.warning("ingest %s: ignoring unknown files %s", stem, group.unknown)
 
     data = await asyncio.to_thread(group.image.read_bytes)
+    # Before the decode, so a file that never becomes a picture still leaves its hash and
+    # the collection it was meant for. The decoder hashes the same bytes again later.
+    upload_sha = hashlib.sha256(data).hexdigest()
+    await _upload(
+        pool,
+        "record",
+        group.stem,
+        lambda c: uploads.record(
+            c,
+            stem=group.stem,
+            sha256=upload_sha,
+            filename=group.image.name,
+            size=len(data),
+            collection_line=group.values.get("collection"),
+            source="rsync",
+        ),
+    )
     try:
         decoded = await asyncio.to_thread(load_and_validate, data)
     except UndecodableImage as e:
-        _move_to_failed(directory, group.stem, settings, f"{group.image.name}: {e}", group.unknown)
+        reason = f"{group.image.name}: {e}"
+        _move_to_failed(directory, group.stem, settings, reason, group.unknown)
+        await _upload(
+            pool,
+            "fail",
+            group.stem,
+            lambda c: uploads.fail(c, stem=group.stem, sha256=upload_sha, error=reason),
+        )
         raise HardError(str(e)) from e
     sha = decoded.sha256
 
@@ -663,9 +755,16 @@ async def _ingest_locked(
                 await _set_status(conn, image_id, "pending_enrichment")
                 raise SoftError(f"describe: {e}") from e
             await _set_status(conn, image_id, "failed")
+            reason = f"describe: {e}"
             # Left in processing/ it would be re-enqueued and re-described on every restart.
-            _move_to_failed(directory, group.stem, settings, f"describe: {e}", group.unknown)
-            raise HardError(f"describe: {e}") from e
+            _move_to_failed(directory, group.stem, settings, reason, group.unknown)
+            await _upload_on(
+                conn,
+                "fail",
+                group.stem,
+                uploads.fail(conn, stem=group.stem, sha256=sha, error=reason),
+            )
+            raise HardError(reason) from e
         await _apply_model(conn, image_id, described)
 
     await _ensure_embedding(conn, image_id, group, settings, embedder)
@@ -702,6 +801,8 @@ async def _ingest_locked(
         # the caption write and the rename. Model captions never rename a live image.
         await _reslug(conn, image_id, row["slug"], base)
 
+    # Through the publish gate: whatever stopped this upload before no longer stands.
+    await _upload_on(conn, "clear", group.stem, uploads.clear(conn, stem=group.stem, sha256=sha))
     await refresh_corpus_stats(pool, kind=KIND, model=settings.embed_model)
     await asyncio.to_thread(shutil.rmtree, directory)
 
@@ -725,14 +826,85 @@ async def handle_haiku(
         log.info("haiku: image %s has no description (deleted?); skipping", image_id)
         return
     try:
-        l1, l2, l3 = await writer(row["body"], settings=settings, pool=pool, nudity=kinds or ())
+        h = await writer(row["body"], settings=settings, pool=pool, nudity=kinds or ())
     except DescribeError as e:
         if e.retryable:
             raise SoftError(f"haiku: {e}") from e
         raise HardError(f"haiku: {e}") from e
+    await insert_haiku(pool, image_id, h)
+
+
+# A first deploy on a site with many haiku-less pictures must not launch an unbounded batch
+# of paid calls; the rest wait for the next worker start.
+SWEEP_HAIKU_CAP = 25
+
+
+async def enqueue_unwritten(pool: Pool, cap: int = SWEEP_HAIKU_CAP) -> int:
+    """Live pictures that never had their haiku written get the job going live would have
+    queued. Run at worker start, so a picture whose haiku job was lost is made good. At
+    most `cap` per call, oldest first.
+
+    Any haiku job on record in any status keeps a picture out, done included. A job can
+    finish with no row behind it (the text was already in the deck, or the owner deleted
+    the haiku), and queueing it again would pay for the same answer at every restart. A
+    failed job is a picture every model refused, and it waits for the owner's retry on
+    the queue page."""
     async with pool.connection() as conn:
-        await conn.execute(
-            "insert into haikus (l1, l2, l3, source, image_id) values (%s, %s, %s, 'model', %s)"
-            " on conflict do nothing",
-            (l1, l2, l3, image_id),
+        cur = await conn.execute(
+            """
+            insert into jobs (type, payload, dedupe_key)
+            select 'haiku', jsonb_build_object('image_id', i.id), 'haiku:' || i.id
+              from images i
+             where i.status = 'live'
+               and exists (select 1 from image_texts t
+                            where t.image_id = i.id and t.field = 'description')
+               and not exists (select 1 from haikus h where h.image_id = i.id)
+               and not exists (select 1 from jobs j
+                                where j.type = 'haiku' and j.dedupe_key = 'haiku:' || i.id)
+               and not exists (select 1 from jobs j
+                                where j.type = 'haiku' and j.payload->>'image_id' = i.id::text)
+             order by i.id
+             limit %s
+            on conflict do nothing
+            """,
+            (cap,),
         )
+        queued = cur.rowcount
+        cur = await conn.execute(
+            """
+            select count(*)::int as n from images i
+             where i.status = 'live'
+               and exists (select 1 from image_texts t
+                            where t.image_id = i.id and t.field = 'description')
+               and not exists (select 1 from haikus h where h.image_id = i.id)
+               and not exists (select 1 from jobs j
+                                where j.type = 'haiku' and j.dedupe_key = 'haiku:' || i.id)
+               and not exists (select 1 from jobs j
+                                where j.type = 'haiku' and j.payload->>'image_id' = i.id::text)
+            """
+        )
+        row = await cur.fetchone()
+    remaining = int(row["n"]) if row else 0
+    if queued or remaining:
+        log.info("haiku sweep: queued %d, %d remain for the next start", queued, remaining)
+    return queued
+
+
+async def insert_haiku(pool: Pool, image_id: int, h: tuple[str, str, str]) -> None:
+    """A model haiku for a picture, with the model that wrote it when the writer says."""
+    model = getattr(h, "model", None)
+    l1, l2, l3 = h
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "insert into haikus (l1, l2, l3, source, image_id, model)"
+            " values (%s, %s, %s, 'model', %s, %s) on conflict do nothing",
+            (l1, l2, l3, image_id, model),
+        )
+    if cur.rowcount == 0:
+        # The deck already holds these three lines, so the job ends done with no haiku for
+        # this picture. Said here so a picture without one is explainable from the log.
+        log.warning(
+            "haiku for image %s written by %s was already in the deck; none stored", image_id, model
+        )
+        return
+    log.info("haiku for image %s written by %s", image_id, model)

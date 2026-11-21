@@ -5,10 +5,15 @@ Mounted under /api/admin next to admin.router, so the no_store middleware covers
 
 from __future__ import annotations
 
+import errno
+import json
+import logging
 import os
 import re
 import secrets
 import shutil
+import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -18,13 +23,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from penish import runtime
+from penish import runtime, uploads
 from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for_many
 from penish.config import get_settings
 from penish.text import no_em_dash
 from penish.worker.jobs import enqueue
 from penish.worker.sidecars import stem_of
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -164,7 +171,7 @@ def _clean_lines(lines: list[str]) -> list[str]:
 # A gallery's haiku sits in the same table as the deck but is shown only on its gallery,
 # so the list labels it with the gallery's serial (null for the deck).
 _HAIKU_COLS = (
-    "id, l1, l2, l3, source::text as source, active, image_id, created_at,"
+    "id, l1, l2, l3, source::text as source, model, active, image_id, created_at,"
     " (select c.serial from colonies c where c.id = haikus.colony_id) as gallery"
 )
 
@@ -174,6 +181,8 @@ def _haiku(r: dict[str, Any]) -> dict[str, Any]:
         "id": r["id"],
         "lines": [r["l1"], r["l2"], r["l3"]],
         "source": r["source"],
+        # The model that wrote it; null for owner and seed haikus and older model ones.
+        "model": r["model"],
         "active": r["active"],
         "image_id": r["image_id"],
         "gallery": r["gallery"],
@@ -431,8 +440,33 @@ async def get_queue(request: Request) -> dict[str, Any]:
     return {"jobs": jobs, "failed": await run_in_threadpool(_list_failed)}
 
 
+def _ingest_gone(payload: Any) -> str | None:
+    """The stem of an ingest whose processing folder no longer exists, else None. Named
+    under this container's processing dir, which need not be the worker's path."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("dir"), str):
+        return None
+    directory = Path(payload["dir"])
+    if (get_settings().processing / directory.name).is_dir():
+        return None
+    return str(payload.get("stem") or directory.name)
+
+
 @router.post("/queue/{job_id}/retry")
-async def retry_job(job_id: int, request: Request) -> dict[str, bool]:
+async def retry_job(job_id: int, request: Request) -> dict[str, Any]:
+    async with _pool(request).connection() as conn:
+        cur = await conn.execute(
+            "select type, payload, status::text as status,"
+            " extract(epoch from updated_at) as failed_at from jobs where id = %s",
+            (job_id,),
+        )
+        job = await cur.fetchone()
+    if job is None:
+        raise HTTPException(status_code=404, detail="not here")
+    if job["type"] == "ingest":
+        stem = await run_in_threadpool(_ingest_gone, job["payload"])
+        if stem is not None:
+            job = {**job, "id": job_id, "failed_at": float(job["failed_at"])}
+            return await _retry_ingest(request, job, stem)
     try:
         async with _pool(request).connection() as conn:
             cur = await conn.execute(
@@ -457,6 +491,65 @@ async def delete_job(job_id: int, request: Request) -> dict[str, bool]:
     return {"ok": True}
 
 
+async def _retry_ingest(request: Request, job: dict[str, Any], stem: str) -> dict[str, Any]:
+    """Re-running an ingest whose files were moved to failed/ would find nothing and call
+    itself done; the files go back to the inbox instead, as the folder retry does."""
+    if job["status"] != "failed":
+        # Already closed by an earlier click or by a folder retry; its folder, if one is
+        # left for the stem, belongs to another failure.
+        raise HTTPException(status_code=409, detail="gone")
+    settings = get_settings()
+    folders = await run_in_threadpool(uploads.failed_folders, settings, stem)
+    if not folders:
+        raise HTTPException(status_code=409, detail="gone")
+    # The same stem can fail more than once (`x`, `x-2`), and the newest folder is not
+    # necessarily this row's: the one that failed when this row did is.
+    folder = await run_in_threadpool(_nearest_failure, folders, job["failed_at"])
+    moved = await run_in_threadpool(_move_back, _failed_dir(folder.name), settings.inbox)
+    # The watcher queues a fresh ingest for the files; this row has nothing left to do, and
+    # left failed it would offer a retry that leads nowhere. Its error stays for the logs.
+    await _close_ingests(request, [job["id"]])
+    return {"ok": True, "files": moved}
+
+
+def _nearest_failure(folders: list[Path], at: float) -> Path:
+    return min(folders, key=lambda f: abs(uploads.failed_at(f) - at))
+
+
+async def _close_ingests(request: Request, ids: list[int]) -> None:
+    if not ids:
+        return
+    async with _pool(request).connection() as conn:
+        await conn.execute(
+            "update jobs set status = 'done', locked_at = null, updated_at = now()"
+            " where id = any(%s) and type = 'ingest' and status = 'failed'",
+            (ids,),
+        )
+
+
+async def _close_after_folder_retry(request: Request, stems: set[str], failed_at: float) -> None:
+    """The failed ingest rows a folder retry has answered. Where another failed folder is
+    still held for the stem, only the row that failed with this one is closed; where none
+    is, no retry can lead anywhere and every failed row for the stem goes."""
+    async with _pool(request).connection() as conn:
+        cur = await conn.execute(
+            "select id, payload->>'stem' as stem, extract(epoch from updated_at) as at"
+            " from jobs where type = 'ingest' and status = 'failed'"
+            " and payload->>'stem' = any(%s)",
+            (sorted(stems),),
+        )
+        rows = await cur.fetchall()
+    settings = get_settings()
+    ids: list[int] = []
+    for stem in stems:
+        mine = [r for r in rows if r["stem"] == stem]
+        if await run_in_threadpool(uploads.failed_folder, settings, stem) is None:
+            ids += [r["id"] for r in mine]
+        elif mine:
+            ids.append(min(mine, key=lambda r: abs(float(r["at"]) - failed_at))["id"])
+    await _close_ingests(request, ids)
+
+
 def _suffixed(name: str, suffix: str) -> str:
     stem, _kind = stem_of(name)
     if stem is not None:
@@ -465,12 +558,69 @@ def _suffixed(name: str, suffix: str) -> str:
     return p.stem + suffix + p.suffix
 
 
+@dataclass
+class _Staged:
+    src: Path
+    at: Path
+    # False: `at` is a copy and `src` is still in place, because failed/ and the inbox are
+    # separate mounts in production and a rename between them is EXDEV.
+    renamed: bool
+
+
+def _stage(src: Path, inbox: Path, name: str) -> _Staged:
+    """Bring one file into the inbox under a dotfile name, which the watcher ignores."""
+    tmp = inbox / f".{name}.{uuid.uuid4().hex[:8]}"
+    try:
+        os.rename(src, tmp)
+        return _Staged(src, tmp, True)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    try:
+        with open(src, "rb") as r, open(tmp, "wb") as w:
+            shutil.copyfileobj(r, w)
+            w.flush()
+            os.fsync(w.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return _Staged(src, tmp, False)
+
+
+def _put_back(staged: list[_Staged]) -> None:
+    """Undo a half-done move so the owner can retry from the same state: renamed files go
+    home, copies are dropped (their source never left)."""
+    for s in reversed(staged):
+        try:
+            if s.renamed:
+                os.rename(s.at, s.src)
+            else:
+                s.at.unlink(missing_ok=True)
+        except OSError:
+            log.exception("retry: could not undo %s", s.at)
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _move_back(directory: Path, inbox: Path) -> list[str]:
     # The .err is a diagnostic for the admin, not input; the watcher would treat it as noise.
-    files = sorted(f for f in directory.iterdir() if f.is_file() and f.suffix != ".err")
+    files = [f for f in directory.iterdir() if f.is_file() and f.suffix != ".err"]
     if not files:
         raise HTTPException(status_code=422, detail="nothing to retry")
+    # Sidecars first and the image last, as the upload endpoint does: the watcher keys its
+    # settle timer by stem and could claim an image that arrived without its sidecars.
+    files.sort(key=lambda f: (stem_of(f.name)[1] == "image", f.name))
     inbox.mkdir(parents=True, exist_ok=True)
+    # Checked up front: a source that cannot be removed would leave the picture in both places.
+    if not all(os.access(d, os.W_OK | os.X_OK) for d in (directory, directory.parent, inbox)):
+        log.error("retry: %s or the inbox is not writable by this process", directory)
+        raise HTTPException(status_code=409, detail="cannot move")
     names = {f: f.name for f in files}
     if any((inbox / n).exists() for n in names.values()):
         # One suffix for the whole group, or the sidecars would stop pairing with the image.
@@ -479,23 +629,70 @@ def _move_back(directory: Path, inbox: Path) -> list[str]:
             names = {f: _suffixed(f.name, suffix) for f in files}
             if not any((inbox / n).exists() for n in names.values()):
                 break
-    for f in files:
-        os.rename(f, inbox / names[f])
-    shutil.rmtree(directory)
+    staged: list[_Staged] = []
+    try:
+        for f in files:
+            staged.append(_stage(f, inbox, names[f]))
+        for s, f in zip(staged, files, strict=True):
+            final = inbox / names[f]
+            os.rename(s.at, final)
+            s.at = final
+    except OSError:
+        log.exception("retry: moving %s to the inbox failed; nothing was moved", directory)
+        _put_back(staged)
+        raise HTTPException(status_code=409, detail="cannot move") from None
+    # Everything is in the inbox from here on and the watcher may already have claimed it, so
+    # nothing below may fail the request: that would invite a retry and a second copy.
+    try:
+        _fsync_dir(inbox)
+    except OSError:
+        log.warning("retry: could not sync the inbox", exc_info=True)
+    for s in staged:
+        if not s.renamed:
+            try:
+                s.src.unlink()
+            except OSError:
+                log.warning("retry: could not remove %s", s.src, exc_info=True)
+    try:
+        shutil.rmtree(directory)
+    except OSError:
+        log.warning("retry: could not remove %s", directory, exc_info=True)
     return sorted(names.values())
 
 
 @router.post("/queue/failed/{name}/retry")
-async def retry_failed(name: str) -> dict[str, Any]:
+async def retry_failed(name: str, request: Request) -> dict[str, Any]:
     directory = _failed_dir(name)
+    # Read before the move, which takes the files and then the folder away.
+    stems = await run_in_threadpool(uploads.folder_stems, directory)
+    failed_at = await run_in_threadpool(uploads.failed_at, directory)
     moved = await run_in_threadpool(_move_back, directory, get_settings().inbox)
+    # Only now that the files are in the inbox: a failed move leaves the row to retry from.
+    await _close_after_folder_retry(request, stems, failed_at)
     return {"ok": True, "files": moved}
 
 
 @router.delete("/queue/failed/{name}")
-async def delete_failed(name: str) -> dict[str, bool]:
+async def delete_failed(name: str, request: Request) -> dict[str, bool]:
     directory = _failed_dir(name)
+    # Read before the folder goes, which takes the names with it.
+    stems = await run_in_threadpool(uploads.folder_stems, directory)
     await run_in_threadpool(shutil.rmtree, directory)
+    settings = get_settings()
+    # A retry may have put the same stem back in the inbox, and an older failure of it may
+    # still stand in another folder: the record goes only with the last of its files.
+    gone = [s for s in sorted(stems) if not await run_in_threadpool(uploads.held, settings, s)]
+    try:
+        async with _pool(request).connection() as conn:
+            # A picture that was made from these bytes keeps its record.
+            await conn.execute(
+                "delete from uploads u where u.stem = any(%s)"
+                " and not exists (select 1 from images i where i.sha256 = u.sha256)",
+                (gone,),
+            )
+    except psycopg.Error:
+        # The folder is gone either way.
+        log.warning("delete: could not drop the upload rows for %s", name, exc_info=True)
     return {"ok": True}
 
 
@@ -567,14 +764,52 @@ async def stats(request: Request) -> dict[str, Any]:
 # -- system ---------------------------------------------------------------
 
 
-def _last_backup_at() -> str | None:
+def _backup_dir() -> Path | None:
     root = os.environ.get("BACKUP_DIR")
-    if not root or not Path(root).is_dir():
+    return Path(root) if root and Path(root).is_dir() else None
+
+
+def _last_backup_at() -> str | None:
+    root = _backup_dir()
+    if root is None:
         return None
-    mtimes = [f.stat().st_mtime for f in Path(root).iterdir() if f.is_file()]
+    try:
+        # Only the dumps count: the restore drill leaves its own file next to them, and a
+        # drill that ran tonight says nothing about whether a backup did.
+        mtimes = [f.stat().st_mtime for f in root.glob("*.dump") if f.is_file()]
+    except OSError:
+        return None
     if not mtimes:
         return None
     return datetime.fromtimestamp(max(mtimes), UTC).isoformat()
+
+
+def _restore_drill() -> dict[str, Any] | None:
+    """The last restore drill, as scripts/penish-restore-drill wrote it. Absent, unreadable
+    or not shaped like a result all read as no drill yet: this is a status line, not a gate."""
+    root = _backup_dir()
+    if root is None:
+        return None
+    try:
+        raw = json.loads((root / "restore-drill.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("ok"), bool):
+        return None
+    ran_at, reason, counts = raw.get("ran_at"), raw.get("reason"), raw.get("counts")
+    dump = raw.get("dump")
+    return {
+        "ok": raw["ok"],
+        "ran_at": ran_at if isinstance(ran_at, str) else None,
+        "dump": dump if isinstance(dump, str) else None,
+        "reason": reason if isinstance(reason, str) else None,
+        "counts": {
+            str(k): v for k, v in counts.items() if isinstance(v, int) and not isinstance(v, bool)
+        }
+        if isinstance(counts, dict)
+        else {},
+        "local_only": raw["local_only"] if isinstance(raw.get("local_only"), bool) else None,
+    }
 
 
 def _disk(path: Path) -> dict[str, int]:
@@ -596,12 +831,16 @@ async def system(request: Request) -> dict[str, Any]:
         )
         errors = await cur.fetchall()
     disk_path = settings.data_dir if settings.data_dir.exists() else Path("/")
+    drill = await run_in_threadpool(_restore_drill)
     return {
         "deployed_sha": settings.git_sha,
         "worker_heartbeat_at": _iso(beat["at"]) if beat else None,
         "worker_info": beat["info"] if beat else None,
         "disk": await run_in_threadpool(_disk, disk_path),
         "last_backup_at": await run_in_threadpool(_last_backup_at),
+        "restore_drill": drill,
+        # The drill reads .env, which the api cannot see; None until a drill has said.
+        "backup_local_only": drill["local_only"] if drill else None,
         "db_size": size,
         "recent_errors": [
             {

@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Weekly restore drill, run by penish-restore-drill.timer as the deploy user. Restores the newest
+# nightly dump into a throwaway Postgres, counts the tables that matter and writes the outcome
+# to backups/restore-drill.json, which /admin/system reads. Safe to run by hand at any time.
+# Env overrides (testing): APP_ROOT, BACKUP_DIR, DRILL_IMAGE, DRILL_TIMEOUT (seconds, restore).
+set -euo pipefail
+umask 022
+
+ROOT=${APP_ROOT:-/srv/peni.sh}
+ENV_FILE=$ROOT/.env
+BACKUPS=${BACKUP_DIR:-$ROOT/backups}
+RESULT=$BACKUPS/restore-drill.json
+TIMEOUT=${DRILL_TIMEOUT:-900}
+TABLES="images image_texts embeddings tags haikus collection_leaves comments votes"
+
+# Same image as the db service, so the drill proves the restore on the server that will be used.
+image=${DRILL_IMAGE:-}
+if [ -z "$image" ] && [ -f "$ROOT/compose.yaml" ]; then
+  image=$(awk '/^  db:/ {f=1; next} f && /^  [a-z]/ {exit} f && $1 == "image:" {print $2; exit}' "$ROOT/compose.yaml")
+fi
+[[ ${image:-} =~ ^[A-Za-z0-9._/:@-]+$ ]] || image=pgvector/pgvector:pg17
+
+name=penish-restore-drill-$$
+dump=
+dump_name=
+rows=
+reason=
+ok=false
+started=$(date -u +%FT%TZ)
+tmp=
+
+log() { printf 'penish-restore-drill: %s\n' "$*"; }
+err() { printf 'penish-restore-drill: ERROR: %s\n' "$*" >&2; }
+
+# One line, no quotes or control characters: the reason goes into a hand-built json string.
+json_text() {
+  local t=${1//[$'\n\r\t']/ }
+  t=${t//\"/}
+  t=${t//\\/}
+  printf '%s' "${t:0:200}" | tr -cd '[:print:]'
+}
+
+# Not every host has timeout (macOS); the box does.
+limited() {
+  if command -v timeout >/dev/null 2>&1; then timeout "$TIMEOUT" "$@"; else "$@"; fi
+}
+
+env_get() {
+  local line
+  line=$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 || true)
+  line=${line#*=}
+  line=${line#[\"\']}
+  line=${line%[\"\']}
+  printf '%s' "$line"
+}
+
+# Backups that never leave the box are worth saying so; null when .env cannot be read to tell.
+local_only() {
+  if [ ! -r "$ENV_FILE" ]; then printf 'null'; return; fi
+  if [ -n "$(env_get RESTIC_REPOSITORY)" ] || [ -n "$(env_get BACKUP_TARGET)" ]; then
+    printf 'false'
+  else
+    printf 'true'
+  fi
+}
+
+write_result() {
+  local reason_json=null dump_json=null
+  [ -z "$reason" ] || reason_json="\"$(json_text "$reason")\""
+  [ -z "$dump_name" ] || dump_json="\"$(json_text "$dump_name")\""
+  # Temp name then rename, so the api never reads a half-written file.
+  tmp=$(mktemp "$BACKUPS/.restore-drill.XXXXXX") || return 1
+  printf '{"dump":%s,"ran_at":"%s","ok":%s,"seconds":%s,"counts":%s,"reason":%s,"local_only":%s}\n' \
+    "$dump_json" "$started" "$ok" "$SECONDS" "{$rows}" "$reason_json" "$(local_only)" >"$tmp" || return 1
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$RESULT"
+  tmp=
+}
+
+# Every exit path comes through here: the container goes, the result is written, the status is kept.
+finish() {
+  local rc=$?
+  trap - EXIT
+  docker rm -f -v "$name" >/dev/null 2>&1 || true
+  if [ "$rc" != 0 ] && [ "$ok" = true ]; then ok=false; fi
+  if [ "$rc" != 0 ] && [ -z "$reason" ]; then reason="drill stopped before it finished"; fi
+  if [ -d "$BACKUPS" ] && ! write_result; then
+    [ -z "$tmp" ] || rm -f "$tmp"
+    err "could not write $RESULT"
+    [ "$rc" != 0 ] || rc=1
+  fi
+  if [ "$ok" = true ]; then log "ok: $dump_name restored, {$rows}"; else err "failed: ${reason:-unknown}"; fi
+  exit "$rc"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fail() {
+  reason=$1
+  exit 1
+}
+
+if [ ! -d "$BACKUPS" ]; then
+  # No directory to leave a result in: the only report is the exit status.
+  reason="no backup directory at $BACKUPS"
+  exit 1
+fi
+
+# /run/lock is world-writable on Ubuntu; the fallbacks keep the script usable unprivileged.
+if command -v flock >/dev/null 2>&1; then
+  lock_dir=/run/lock
+  [ -w "$lock_dir" ] || lock_dir=${XDG_RUNTIME_DIR:-/tmp}
+  exec 9>"$lock_dir/penish-restore-drill.lock"
+  if ! flock -n 9; then
+    # Another drill owns the result file; leave it be.
+    trap - EXIT
+    log "another drill is running"
+    exit 0
+  fi
+fi
+
+# ISO dates sort lexically, so the last name is the newest dump.
+dump=$(find "$BACKUPS" -maxdepth 1 -type f -name '*.dump' | sort | tail -n1)
+[ -n "$dump" ] || fail "no dump in $BACKUPS"
+dump_name=$(basename "$dump")
+log "restoring $dump_name with $image"
+
+command -v docker >/dev/null 2>&1 || fail "docker not found"
+
+# A drill killed with SIGKILL cannot clean up after itself; the label lets the next one do it.
+while read -r stale; do
+  [ -z "$stale" ] || docker rm -f -v "$stale" >/dev/null 2>&1 || true
+done < <(docker ps -aq --filter label=penish.drill=1 2>/dev/null || true)
+
+# No network and no published port: nothing can reach it, and it reaches nothing. --rm plus -v
+# on removal takes the anonymous data volume with it. The limits keep it off the live stack's
+# share of a small box; fsync off is fine for a database that exists for a minute.
+if ! out=$(limited docker run -d --rm --name "$name" --label penish.drill=1 --network none \
+  --memory 1g --shm-size 128m \
+  -e POSTGRES_USER=penish -e POSTGRES_DB=penish -e POSTGRES_PASSWORD=drill \
+  "$image" postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
+  -c shared_buffers=128MB -c maintenance_work_mem=128MB 2>&1); then
+  fail "could not start the container: $(printf '%s\n' "$out" | grep -v -e '--help' -e '^$' | tail -n1)"
+fi
+
+# The image starts a temporary server on its socket alone before the real one; asking over tcp
+# only succeeds once the real one is up.
+up=false
+for _ in $(seq 1 60); do
+  if docker exec "$name" pg_isready -q -h 127.0.0.1 -U penish -d penish >/dev/null 2>&1; then
+    up=true
+    break
+  fi
+  sleep 1
+done
+[ "$up" = true ] || fail "database did not start within 60s"
+
+# pg_restore sees the extension and the schema but not the roles, hence no owners or grants.
+if ! out=$(limited docker exec -i "$name" pg_restore -U penish -d penish --no-owner --no-acl <"$dump" 2>&1); then
+  fail "pg_restore failed: $(printf '%s' "$out" | tail -n1)"
+fi
+
+psql_one() { docker exec "$name" psql -U penish -d penish -XAtq -c "$1"; }
+
+rows=
+for t in $TABLES; do
+  # A table that does not exist is skipped, not an error: older dumps predate some of them.
+  present=$(psql_one "select to_regclass('public.$t') is not null" 2>/dev/null) || fail "could not query the restored database"
+  [ "$present" = t ] || continue
+  n=$(psql_one "select count(*) from public.$t" 2>/dev/null) || fail "could not count $t"
+  [[ $n =~ ^[0-9]+$ ]] || fail "could not count $t"
+  rows+=${rows:+,}\"$t\":$n
+done
+
+pictures=$(psql_one "select count(*) from public.images" 2>/dev/null || echo 0)
+[[ ${pictures:-0} =~ ^[0-9]+$ ]] || pictures=0
+if [ "$pictures" -eq 0 ]; then
+  fail "restored zero pictures"
+fi
+
+ok=true

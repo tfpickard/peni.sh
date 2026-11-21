@@ -35,7 +35,9 @@ services:
       DATABASE_URL: *db-url
       DATA_DIR: /data
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_READ_TOKEN: ${ADMIN_READ_TOKEN:-}
       SECRET_KEY: ${SECRET_KEY:-}
+      BACKUP_DIR: /backups
       TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
       TURNSTILE_SECRET: ${TURNSTILE_SECRET:-}
       # The worker's internal embed server, over the compose network only.
@@ -54,8 +56,16 @@ services:
       - ./data/media/orig:/data/media/orig
       # Admin uploads land here for the worker. Bind mounts stay writable under read_only.
       - ./data/inbox:/data/inbox
-      # Read-only: the admin status call quotes the .err file of a failed group.
-      - ./data/failed:/data/failed:ro
+      # rw: the admin retry moves a failed group back to the inbox and removes the folder.
+      # inbox and failed are separate mounts here, so that is a copy, then a delete of the
+      # source; the status call also quotes the .err file from here.
+      - ./data/failed:/data/failed
+      # Read-only: where an upload has got to, and whether a failed ingest job's folder
+      # is still being worked on, are read from here.
+      - ./data/processing:/data/processing:ro
+      # Read-only: the newest dump's time and the restore drill's result, for /admin/system.
+      # The directory is deploy's; the api reads it through its group (see docs/ops.md).
+      - ./backups:/backups:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

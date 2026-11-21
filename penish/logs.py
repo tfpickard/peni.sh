@@ -141,6 +141,9 @@ def secrets_from(settings: Settings) -> tuple[str, ...]:
         settings.openrouter_api_key,
         settings.xai_api_key,
         settings.admin_password,
+        # It travels in an Authorization header, but a repr of a request or a url can carry it
+        # bare, where the header pattern below would miss it.
+        settings.admin_read_token,
         settings.secret_key,
         settings.turnstile_secret,
     ]

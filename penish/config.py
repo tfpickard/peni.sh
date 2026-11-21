@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     xai_api_key: str | None = None
     # Unset turns the whole admin surface off (404), so a fresh deploy exposes nothing.
     admin_password: str | None = None
+    # Lets scripts read the admin api with `Authorization: Bearer`, never write. Shorter
+    # than 32 characters counts as unset, and it does nothing while the admin is off.
+    admin_read_token: str | None = None
     # Keys the hmac of voter ids and ip hashes. Rotating it orphans existing votes.
     secret_key: str = DEV_SECRET_KEY
     # Baked in at image build time so /system can say what is deployed.

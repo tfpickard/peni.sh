@@ -1,5 +1,14 @@
 const H = { 'X-Requested-With': 'penish' };
 
+export class HttpError extends Error {
+	constructor(
+		public status: number,
+		public detail: string | null
+	) {
+		super(detail ?? String(status));
+	}
+}
+
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
 	const r = await fetch(`/api/admin${path}`, {
 		method,
@@ -7,7 +16,17 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
 		headers: body === undefined ? H : { ...H, 'Content-Type': 'application/json' },
 		body: body === undefined ? undefined : JSON.stringify(body)
 	});
-	if (!r.ok) throw new Error(String(r.status));
+	if (!r.ok) {
+		// A refused setting says why (`claude-x is not another provider`); pages may show it.
+		let detail: string | null = null;
+		try {
+			const j = await r.json();
+			if (typeof j?.detail === 'string') detail = j.detail;
+		} catch {
+			detail = null;
+		}
+		throw new HttpError(r.status, detail);
+	}
 	const text = await r.text();
 	return (text ? JSON.parse(text) : null) as T;
 }
@@ -31,10 +50,12 @@ export const setComment = (id: number, status: CommentStatus) => post(`/comments
 export const deleteComment = (id: number) => del(`/comments/${id}`);
 
 // gallery is the serial of the gallery the haiku was written for; null for the deck.
+// model is the model that wrote it; null for owner and seed haikus and older model ones.
 export type Haiku = {
 	id: number;
 	lines: string[];
 	source: string;
+	model: string | null;
 	active: boolean;
 	gallery: number | null;
 };
@@ -52,9 +73,10 @@ export const deleteHaiku = (id: number) => del(`/haikus/${id}`);
 export const growHaikus = (n: number) => post('/haikus/grow', { n });
 
 export type Models = {
-	// Strings for models and prompts, null for an unset effort, a number for mycelium.daily_calls.
-	current: Record<string, string | number | null>;
-	default: Record<string, string | number | null>;
+	// Strings for models and prompts, null for an unset effort, a number for mycelium.daily_calls,
+	// a list of `provider:model` ids for haiku.fallback.
+	current: Record<string, string | number | string[] | null>;
+	default: Record<string, string | number | string[] | null>;
 	efforts: string[];
 	known_models: string[];
 	purposes: string[];
@@ -98,12 +120,23 @@ export type Stats = {
 };
 export const stats = () => get<Stats>('/stats');
 
+export type RestoreDrill = {
+	ok: boolean;
+	ran_at: string | null;
+	dump: string | null;
+	reason: string | null;
+	counts: Record<string, number>;
+	local_only: boolean | null;
+};
+
 export type System = {
 	deployed_sha: string | null;
 	worker_heartbeat_at: string | null;
 	worker_info: unknown;
 	disk: { total: number; used: number; free: number };
 	last_backup_at: string | null;
+	restore_drill: RestoreDrill | null;
+	backup_local_only: boolean | null;
 	db_size: number;
 	recent_errors: { id: number; type: string; status: string; attempts: number; error: string; at: string }[];
 };

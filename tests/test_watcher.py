@@ -84,6 +84,19 @@ async def test_lone_image_claimed_once(running: InboxWatcher, rec: Recorder) -> 
     assert [(c[1], c[2]) for c in rec.calls] == [("solo", {"solo.jpg": b"jpg"})]
 
 
+@pytest.mark.parametrize("image", ["x.heic", "IMG_0938.HEIC"])
+async def test_heic_group_claimed(running: InboxWatcher, rec: Recorder, image: str) -> None:
+    stem = image.rsplit(".", 1)[0]
+    (running.inbox / f"{stem}_collection.txt").write_text("line")
+    (running.inbox / image).write_bytes(b"heic")
+    await rec.first()
+    await asyncio.sleep(SETTLE * 4)
+    assert [(c[1], c[2]) for c in rec.calls] == [
+        (stem, {image: b"heic", f"{stem}_collection.txt": b"line"})
+    ]
+    assert list(running.inbox.iterdir()) == []
+
+
 async def test_temp_dotfile_never_claimed(running: InboxWatcher, rec: Recorder) -> None:
     tmp = running.inbox / ".x.png.AbC123"
     tmp.write_bytes(b"partial")

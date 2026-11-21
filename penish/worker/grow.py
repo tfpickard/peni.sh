@@ -31,6 +31,7 @@ from penish.worker.describe import (
     parse_json,
     rejected,
 )
+from penish.worker.haiku import Written
 from penish.worker.haiku import _validate as validate_haiku
 
 log = logging.getLogger(__name__)
@@ -150,7 +151,10 @@ async def grow(
         for entry in data["haikus"]:
             try:
                 # Reuses haiku.py's line checks and em dash fix; its input is the JSON text.
-                h = validate_haiku(json.dumps({"lines": entry}))
+                h: Haiku = Written(
+                    validate_haiku(json.dumps({"lines": entry})),
+                    getattr(text, "served", None) or model,
+                )
             except (ValueError, jsonschema.ValidationError) as exc:
                 stats.invalid += 1
                 log.warning(
@@ -200,9 +204,9 @@ async def load_pool(conn: psycopg.AsyncConnection[Any]) -> list[Haiku]:
 async def insert(conn: psycopg.AsyncConnection[Any], haikus: list[Haiku]) -> None:
     async with conn.cursor() as cur:
         await cur.executemany(
-            "insert into haikus (l1, l2, l3, source, image_id) values (%s, %s, %s, 'model', null)"
-            " on conflict do nothing",
-            haikus,
+            "insert into haikus (l1, l2, l3, source, image_id, model)"
+            " values (%s, %s, %s, 'model', null, %s) on conflict do nothing",
+            [(*h, getattr(h, "model", None)) for h in haikus],
         )
 
 

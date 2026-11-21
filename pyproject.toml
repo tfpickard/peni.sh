@@ -10,6 +10,7 @@ dependencies = [
     "pgvector",
     "pydantic-settings",
     "pyvips[binary]",
+    "pillow-heif>=1.8.1",
     "blurhash-python",
     "anthropic",
     "watchfiles",

@@ -666,6 +666,8 @@ async def _delete(pool: Any, image_id: int) -> tuple[str, list[str]] | None:
                 gone = await cur.fetchone()
                 if gone is None:
                     return None
+                # The arrival record has nothing left to describe.
+                await conn.execute("delete from uploads where sha256 = %s", (sha,))
                 cur = await conn.execute(
                     "select exists (select 1 from images where pub_sha = %s) as shared",
                     (gone["pub_sha"],),
