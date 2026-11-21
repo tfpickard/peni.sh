@@ -452,3 +452,51 @@ async def test_republish_files_a_request_made_while_down(p: Any, settings: Setti
     assert [r["payload"] for r in rows] == [{"image_id": image_id, "collection_id": c["id"]}]
     await file(p, settings, image_id)
     assert (await leaves(p))[image_id][0] == 3
+
+
+# -- why a leaf went where it did ------------------------------------------------------
+
+
+async def test_filing_by_score_keeps_the_scores(p: Any, settings: Settings) -> None:
+    a, b = await _filed(p, settings, [e(2), e(2, 4)])
+    rows = {r["image_id"]: r for r in await history(p) if r["from_book"] is None}
+    got = rows[a]
+    assert (got["chosen_by"], got["to_book"]) == ("score", 3)
+    s = got["scores"]
+    assert (s["best"], s["runner_up"]) == (3, 1)
+    assert s["margin"] == pytest.approx(1.0)
+    assert s["tuning"]["anchor_k"] == 10.0
+    assert [x["number"] for x in s["books"]] == list(range(1, 8))
+    for x in s["books"]:
+        assert x["cos"] + x["tag"] + x["fill"] == pytest.approx(x["total"])
+    # The second saw the first in book iii, and its best is the book it went to.
+    assert rows[b]["scores"]["best"] == rows[b]["to_book"]
+    # A leaf pushed along inside its book decides no book.
+    assert all(r["chosen_by"] is None for r in await history(p) if r["from_book"] is not None)
+
+
+async def test_a_book_the_owner_gave_is_owner_and_still_scored(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    c = await collection(p)
+    a = await picture(p, settings, 1, e(0))
+    async with p.connection() as conn:
+        await store.request(conn, c, a, 5, None)
+    await file(p, settings, a)
+    (row,) = await history(p)
+    assert (row["chosen_by"], row["to_book"], row["scores"]["best"]) == ("owner", 5, 1)
+    # A move of a filed leaf by the owner says so too.
+    async with p.connection() as conn:
+        await store.place(conn, c, a, 6, None, settings)
+    assert (await history(p))[-1]["chosen_by"] == "owner"
+
+
+async def test_resort_records_the_scores_of_a_book_move(p: Any, settings: Settings) -> None:
+    (a,) = await _filed(p, settings, [e(0)])
+    c = await collection(p)
+    async with p.connection() as conn:
+        await store.place(conn, c, a, 4, None, settings)
+        await store.set_pin(conn, c, a, False, settings)
+        moves = await store.resort(conn, c, settings, dry_run=False)
+    assert [(m.image_id, m.after[0] if m.after else None) for m in moves] == [(a, 1)]
+    last = (await history(p))[-1]
+    assert (last["reason"], last["chosen_by"], last["scores"]["best"]) == ("resort", "score", 1)

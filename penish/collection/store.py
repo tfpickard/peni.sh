@@ -7,7 +7,10 @@ state. Shared by the api (owner actions) and the worker (filing, anchors, re-sor
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -23,9 +26,12 @@ from penish.collection.plan import (
     Placement,
     Shape,
     Tuning,
-    choose_book,
+    Weighing,
     lay_books,
     plan_resort,
+    weigh,
+    weigh_leaf,
+    weigh_leaves,
 )
 from penish.config import Settings
 
@@ -33,6 +39,8 @@ log = logging.getLogger(__name__)
 
 Conn = AsyncConnection[DictRow]
 Reason = Literal["auto", "resort", "owner"]
+# How a leaf's book was decided, kept on its history row. The schema also allows `judge`.
+ChosenBy = Literal["score", "owner"]
 
 FILE_JOB = "collection_file"
 ANCHOR_JOB = "collection_anchor"
@@ -48,12 +56,31 @@ class Refused(Exception):
     """An owner request that cannot be carried out as asked. The message is shown as is."""
 
 
+class AnchorsWaiting(Refused):
+    """A book's anchor has no vector yet, so planning now would score that book blind."""
+
+    def __init__(self) -> None:
+        super().__init__("anchors")
+
+
 @dataclass(frozen=True)
 class Move:
     image_id: int
     before: tuple[int, int] | None
     after: tuple[int, int] | None
     reason: Reason
+    # Set when this move is where the leaf's book was decided.
+    chosen_by: ChosenBy | None = None
+    scores: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class Choice:
+    """A book for a picture, how it was decided, and what the scores said then."""
+
+    book: int
+    chosen_by: ChosenBy
+    scores: dict[str, Any] | None = None
 
 
 @dataclass
@@ -207,10 +234,12 @@ async def _write(
     owner: int | None = None,
     before: dict[int, tuple[int, int] | None] | None = None,
     touched: frozenset[int] = frozenset(),
+    basis: Mapping[int, Choice] | None = None,
 ) -> list[Move]:
     """Bring the rows in line with the plan and append a history row per move. `owner` is
     the leaf the owner moved; the leaves it pushes aside move for the filer's reason.
-    `touched` are leaves whose pins changed without necessarily moving."""
+    `touched` are leaves whose pins changed without necessarily moving. `basis` says how
+    a leaf's book was chosen, for the leaves whose book this event decided."""
     if before is None:
         before = {x.image_id: (x.book, x.position) for x in state.leaves}
     cid = state.collection["id"]
@@ -238,7 +267,17 @@ async def _write(
                 (new[0], new[1], leaf.book_pinned, leaf.pinned, leaf.image_id, cid),
             )
         if old != new:
-            moves.append(Move(leaf.image_id, old, new, why))
+            c = (basis or {}).get(leaf.image_id)
+            moves.append(
+                Move(
+                    leaf.image_id,
+                    old,
+                    new,
+                    why,
+                    c.chosen_by if c else None,
+                    c.scores if c else None,
+                )
+            )
     for m in moves:
         await _history(conn, cid, m)
     return moves
@@ -248,8 +287,9 @@ async def _history(conn: Conn, collection_id: int, m: Move) -> None:
     await conn.execute(
         """
         insert into collection_leaf_history
-          (image_id, collection_id, from_book, from_position, to_book, to_position, reason)
-        values (%s, %s, %s, %s, %s, %s, %s)
+          (image_id, collection_id, from_book, from_position, to_book, to_position, reason,
+           chosen_by, scores)
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             m.image_id,
@@ -259,6 +299,8 @@ async def _history(conn: Conn, collection_id: int, m: Move) -> None:
             m.after[0] if m.after else None,
             m.after[1] if m.after else None,
             m.reason,
+            m.chosen_by,
+            Jsonb(m.scores) if m.scores is not None else None,
         ),
     )
 
@@ -270,6 +312,34 @@ def _check_shape(collection: dict[str, Any], book: int | None, position: int | N
         raise Refused(f"no leaf {position}")
     if position is not None and book is None:
         raise Refused("a leaf needs a book")
+
+
+def _record(w: Weighing, tuning: Tuning) -> dict[str, Any]:
+    # The tuning goes with the scores: they mean nothing once it has been changed.
+    return {**w.to_json(), "tuning": tuning.to_json()}
+
+
+def choose(
+    state: State,
+    image_id: int,
+    vec: np.ndarray | None,
+    tags: frozenset[str],
+    book: int | None,
+) -> Choice:
+    """Which book a picture is filed into: the owner's when given, otherwise the best score
+    among books with room. Every filing decides here, so a different way of deciding goes
+    here too, with the score as its fallback. The scores are kept either way, so the
+    admin can show what the filer thought of a book the owner chose."""
+    others = [x for x in state.leaves if x.image_id != image_id]
+    w = weigh(state.shape, others, vec, tags) if vec is not None else None
+    scores = _record(w, state.shape.tuning) if w is not None else None
+    if book is not None:
+        return Choice(book, "owner", scores)
+    if vec is None:
+        raise Refused("no vector")
+    if w is None:
+        raise Refused("every book is full")
+    return Choice(w.best, "score", scores)
 
 
 async def _place(
@@ -287,16 +357,10 @@ async def _place(
     _check_shape(state.collection, book, position)
     current = state.leaf(image_id)
     pinned_book = book is not None
-    if book is None:
-        if current is not None:
-            return []
-        if vec is None:
-            raise Refused("no vector")
-        others = [x for x in state.leaves if x.image_id != image_id]
-        chosen = choose_book(state.shape, others, vec, tags)
-        if chosen is None:
-            raise Refused("every book is full")
-        book = chosen[0]
+    if book is None and current is not None:
+        return []
+    choice = choose(state, image_id, vec, tags, book)
+    book = choice.book
     if state.occupied(book, besides=image_id) >= state.shape.cap:
         raise Refused(f"book {roman(book)} is full")
     if position is not None:
@@ -336,6 +400,7 @@ async def _place(
         owner=image_id if reason == "owner" else None,
         before=before,
         touched=frozenset({image_id}),
+        basis={image_id: choice},
     )
 
 
@@ -398,25 +463,267 @@ async def unfile(conn: Conn, collection_id: int, image_id: int) -> bool:
     return dropped or row is not None
 
 
+def _diff(state: State, placement: Placement) -> tuple[list[Move], dict[int, float | None]]:
+    """Every leaf the placement moves, and how far its new book leads the best other book
+    with the leaf left out of its own (None without a vector). A leaf that changes book
+    carries its scores, since this is where its book was decided."""
+    where = {i: bp[0] for i, bp in placement.items()}
+    moving = [x.image_id for x in state.leaves if placement[x.image_id] != (x.book, x.position)]
+    weighed = weigh_leaves(state.shape, state.leaves, where, moving)
+    moves: list[Move] = []
+    leads: dict[int, float | None] = {}
+    for x in state.leaves:
+        after = placement[x.image_id]
+        if after == (x.book, x.position):
+            continue
+        w = weighed[x.image_id]
+        leads[x.image_id] = w.lead(after[0]) if w is not None else None
+        crossed = after[0] != x.book
+        moves.append(
+            Move(
+                x.image_id,
+                (x.book, x.position),
+                after,
+                "resort",
+                "score" if crossed else None,
+                _record(w, state.shape.tuning) if crossed and w is not None else None,
+            )
+        )
+    return moves, leads
+
+
+def _basis(moves: list[Move]) -> dict[int, Choice]:
+    return {
+        m.image_id: Choice(m.after[0], m.chosen_by, m.scores)
+        for m in moves
+        if m.chosen_by is not None and m.after is not None
+    }
+
+
+async def _commit_resort(
+    conn: Conn, state: State, placement: Placement, moves: list[Move]
+) -> list[Move]:
+    written = await _write(conn, state, placement, "resort", basis=_basis(moves))
+    await conn.execute(
+        "update collections set last_resort_at = now() where id = %s", (state.collection["id"],)
+    )
+    return written
+
+
 async def resort(
     conn: Conn, collection: dict[str, Any], settings: Settings, *, dry_run: bool
 ) -> list[Move]:
-    """Book for every leaf the owner did not pin to one, then positions in every book."""
+    """Book for every leaf the owner did not pin to one, then positions in every book.
+    The weekly job's path: it plans and writes in one go, after embedding the anchors."""
     async with conn.transaction():
         await lock(conn, collection["id"])
         state = await load(conn, collection, settings)
         placement = plan_resort(state.shape, state.leaves)
+        moves, _ = _diff(state, placement)
         if dry_run:
-            return [
-                Move(x.image_id, (x.book, x.position), placement[x.image_id], "resort")
-                for x in state.leaves
-                if placement[x.image_id] != (x.book, x.position)
-            ]
-        moves = await _write(conn, state, placement, "resort")
-        await conn.execute(
-            "update collections set last_resort_at = now() where id = %s", (collection["id"],)
-        )
-        return moves
+            return moves
+        return await _commit_resort(conn, state, placement, moves)
+
+
+# -- the owner's re-sort: a plan, then exactly that plan ---------------------------------
+
+
+@dataclass(frozen=True)
+class Plan:
+    # Names the plan and the state it was planned from; apply refuses any other state.
+    id: str
+    moves: list[Move]
+    leads: dict[int, float | None]
+
+
+async def _digest(conn: Conn, collection: dict[str, Any]) -> dict[str, Any]:
+    """What a plan was made from: the shape and tuning, each book's anchor text, hints and
+    vector, and every leaf's place and pins. A picture's own vector is left out: a plan
+    made from it is still the plan the owner was shown, and the corpus mean moves with
+    every upload."""
+    cid = collection["id"]
+    tuning = Tuning.from_json(collection["tuning"]).to_json()
+    # A switch, not a weight: it changes no plan.
+    tuning.pop("weekly_resort", None)
+    cur = await conn.execute(
+        """
+        select number, anchor_text, tag_hints, anchor_model, anchor_dim,
+               md5(anchor_embedding::text) as anchor
+          from collection_books where collection_id = %s order by number
+        """,
+        (cid,),
+    )
+    books = [
+        [
+            r["number"],
+            r["anchor_text"],
+            sorted(r["tag_hints"] or ()),
+            r["anchor_model"],
+            r["anchor_dim"],
+            r["anchor"],
+        ]
+        for r in await cur.fetchall()
+    ]
+    cur = await conn.execute(
+        "select image_id, book, position, book_pinned, pinned from collection_leaves"
+        " where collection_id = %s order by image_id",
+        (cid,),
+    )
+    leaves = [
+        [r["image_id"], r["book"], r["position"], r["book_pinned"], r["pinned"]]
+        for r in await cur.fetchall()
+    ]
+    return {
+        "collection": cid,
+        "book_count": collection["book_count"],
+        "cap": collection["leaves_per_book"],
+        "tuning": tuning,
+        "books": books,
+        "leaves": leaves,
+    }
+
+
+def _stale(digest: dict[str, Any], settings: Settings) -> bool:
+    # As stale_anchors: written text with no vector under today's model.
+    return any(
+        text and (vec is None or model != settings.embed_model or dim != settings.embed_dim)
+        for _, text, _, model, dim, vec in digest["books"]
+    )
+
+
+PlanMove = tuple[int, tuple[int, int], tuple[int, int]]
+
+
+def plan_id(digest: dict[str, Any], moves: list[PlanMove]) -> str:
+    body = {
+        "v": 1,
+        "state": digest,
+        "moves": sorted([i, list(b), list(a)] for i, b, a in moves),
+    }
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _plan_moves(moves: list[Move]) -> list[PlanMove]:
+    return [(m.image_id, m.before, m.after) for m in moves if m.before and m.after]
+
+
+async def _fresh(conn: Conn, collection: dict[str, Any]) -> dict[str, Any]:
+    # Re-read under the lock: the row the caller holds may predate a tuning edit.
+    row = await collection_by_id(conn, collection["id"])
+    if row is None:
+        raise Refused("not here")
+    return row
+
+
+async def plan(conn: Conn, collection: dict[str, Any], settings: Settings) -> Plan:
+    """The re-sort as it would be made now, and its id. Writes nothing. Refuses while an
+    anchor waits for its vector; the caller queues the anchor job."""
+    async with conn.transaction():
+        await lock(conn, collection["id"])
+        fresh = await _fresh(conn, collection)
+        before = await _digest(conn, fresh)
+        if _stale(before, settings):
+            raise AnchorsWaiting()
+        state = await load(conn, fresh, settings)
+        # Owner text and tuning are edited without the lock; a plan read across such an
+        # edit would carry an id for a state it was not made from.
+        if await _digest(conn, await _fresh(conn, fresh)) != before:
+            raise Refused("changed")
+        placement = plan_resort(state.shape, state.leaves)
+        moves, leads = _diff(state, placement)
+        return Plan(plan_id(before, _plan_moves(moves)), moves, leads)
+
+
+def _check_plan(state: State, placement: Placement) -> None:
+    """A plan that came back over the wire still has to keep the owner's pins and the
+    book's shape; the id alone does not prove it was ever made here."""
+    books = {b.number for b in state.shape.books}
+    for x in state.leaves:
+        book, pos = placement[x.image_id]
+        if x.pinned and (book, pos) != (x.book, x.position):
+            raise Refused("bad plan")
+        if x.book_pinned and book != x.book:
+            raise Refused("bad plan")
+        if book not in books or not 1 <= pos <= state.shape.cap:
+            raise Refused("bad plan")
+    if len(set(placement.values())) != len(placement):
+        raise Refused("bad plan")
+
+
+async def apply(
+    conn: Conn,
+    collection: dict[str, Any],
+    settings: Settings,
+    given_id: str,
+    moves: list[PlanMove],
+) -> list[Move]:
+    """Exactly the plan the owner was shown, or nothing: `changed` when the collection is
+    no longer the one it was planned from."""
+    async with conn.transaction():
+        await lock(conn, collection["id"])
+        fresh = await _fresh(conn, collection)
+        if plan_id(await _digest(conn, fresh), moves) != given_id:
+            raise Refused("changed")
+        state = await load(conn, fresh, settings)
+        placement: Placement = {x.image_id: (x.book, x.position) for x in state.leaves}
+        for image_id, before, after in moves:
+            if placement.get(image_id) != tuple(before):
+                raise Refused("changed")
+            placement[image_id] = (int(after[0]), int(after[1]))
+        _check_plan(state, placement)
+        diff, _ = _diff(state, placement)
+        return await _commit_resort(conn, state, placement, diff)
+
+
+async def enqueue_anchor_job(conn: Conn, collection_id: int) -> None:
+    await conn.execute(
+        "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s) on conflict do nothing",
+        (ANCHOR_JOB, Jsonb({"collection_id": collection_id}), f"{ANCHOR_JOB}:{collection_id}"),
+    )
+
+
+# -- why a leaf is where it is ------------------------------------------------------
+
+
+async def explain(
+    conn: Conn, collection: dict[str, Any], image_id: int, settings: Settings
+) -> dict[str, Any] | None:
+    """One leaf's scores by book as a re-sort would see them now, and what they were when
+    it was filed. None when the picture is not a leaf here."""
+    state = await load(conn, collection, settings)
+    leaf = state.leaf(image_id)
+    if leaf is None:
+        return None
+    w = weigh_leaf(state.shape, state.leaves, image_id)
+    cur = await conn.execute(
+        """
+        select at, to_book, to_position, reason, chosen_by, scores
+          from collection_leaf_history
+         where image_id = %s and collection_id = %s and from_book is null
+         order by id desc limit 1
+        """,
+        (image_id, collection["id"]),
+    )
+    filed = await cur.fetchone()
+    return {
+        "image_id": image_id,
+        "book": leaf.book,
+        "position": leaf.position,
+        "pinned": leaf.pinned,
+        "book_pinned": leaf.book_pinned,
+        "now": None if w is None else {**w.to_json(), "lead": w.lead(leaf.book)},
+        "filed": None
+        if filed is None
+        else {
+            "at": filed["at"].isoformat(),
+            "book": filed["to_book"],
+            "position": filed["to_position"],
+            "reason": filed["reason"],
+            "chosen_by": filed["chosen_by"],
+            "scores": filed["scores"],
+        },
+    }
 
 
 # -- requests -------------------------------------------------------------------

@@ -12,11 +12,15 @@ from penish.collection.plan import (
     Shape,
     Tuning,
     assign_books,
+    centroid,
     choose_book,
     lay_books,
     plan_resort,
     positions,
     tag_overlap,
+    weigh,
+    weigh_leaf,
+    weigh_leaves,
 )
 
 DIM = 12
@@ -168,6 +172,121 @@ def test_fill_pressure_spreads_a_near_tie() -> None:
     leaves = [leaf(i, 1, i, e(0)) for i in range(1, 9)]
     got = choose_book(s, leaves, e(0), frozenset())
     assert got is not None and got[0] == 2
+
+
+# -- the scores in parts -------------------------------------------------------------
+
+
+def _old_choose_book(
+    s: Shape, leaves: list[Leaf], vec: np.ndarray, tags: frozenset[str]
+) -> tuple[int, dict[int, float]] | None:
+    """choose_book as it was before the parts were kept, formula and all."""
+    t = s.tuning
+    out: dict[int, float] = {}
+    for b in s.books:
+        mine = [x for x in leaves if x.book == b.number]
+        if len(mine) >= s.cap:
+            continue
+        vecs = [x.vec for x in mine if x.vec is not None]
+        c = centroid(b.anchor, np.sum(vecs, axis=0) if vecs else None, len(vecs), t.anchor_k)
+        cos = float(np.dot(vec, c)) if c is not None else 0.0
+        out[b.number] = (
+            cos + t.tag_alpha * tag_overlap(tags, b.hints) - t.fill_beta * (len(mine) / s.cap) ** 2
+        )
+    if not out:
+        return None
+    return min(out, key=lambda n: (-out[n], n)), out
+
+
+def _random_case(seed: int) -> tuple[Shape, list[Leaf], np.ndarray, frozenset[str]]:
+    rng = np.random.default_rng(seed)
+    hints = ["serpent", "moon", "lab", "zodiac", "flask", "saint", "bath"]
+    books = [
+        Book(n, e(n - 1) if n != 4 else None, frozenset(rng.choice(hints, 2, replace=False)))
+        for n in range(1, 8)
+    ]
+    s = Shape(books, 6, Tuning(anchor_k=float(rng.integers(0, 12)), tag_alpha=0.3, fill_beta=0.2))
+    leaves = []
+    for i in range(1, int(rng.integers(0, 30))):
+        v = rng.normal(size=DIM)
+        vec = None if i % 9 == 0 else v / np.linalg.norm(v)
+        leaves.append(Leaf(i, int(rng.integers(1, 8)), i, vec, frozenset()))
+    # Never more than a book holds.
+    leaves = [x for x in leaves if sum(1 for y in leaves if y.book == x.book) <= s.cap]
+    v = rng.normal(size=DIM)
+    tags = frozenset(str(t) for t in rng.choice([*hints, "zodiac-man", "coiled serpent"], 3))
+    return s, leaves, v / np.linalg.norm(v), tags
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_parts_add_up_and_the_choice_is_unchanged(seed: int) -> None:
+    s, leaves, vec, tags = _random_case(seed)
+    got = choose_book(s, leaves, vec, tags)
+    old = _old_choose_book(s, leaves, vec, tags)
+    w = weigh(s, leaves, vec, tags)
+    if old is None:
+        assert got is None and w is None
+        return
+    assert got is not None and w is not None
+    assert got[0] == old[0] == w.best
+    assert set(got[1]) == set(old[1]) == set(w.terms)
+    for n, t in w.terms.items():
+        assert t.cos + t.tag + t.fill == t.total == got[1][n]
+        assert got[1][n] == pytest.approx(old[1][n], abs=1e-12)
+        assert t.tag >= 0 and t.fill <= 0
+    if w.runner_up is not None:
+        assert w.margin == w.totals[w.best] - w.totals[w.runner_up] >= 0
+        assert w.runner_up == max(
+            (n for n in w.terms if n != w.best), key=lambda n: (w.totals[n], -n)
+        )
+
+
+def test_terms_name_each_part() -> None:
+    s = Shape([Book(1, e(0), frozenset({"moon"})), Book(2, e(1))], 4, Tuning(tag_alpha=0.1))
+    w = weigh(s, [leaf(9, 1, 1, e(5)), leaf(8, 1, 2, e(5))], e(0), frozenset({"moon"}))
+    assert w is not None and w.best == 1 and w.runner_up == 2
+    one = w.terms[1]
+    assert one.tag == pytest.approx(0.1)
+    assert one.fill == pytest.approx(-0.05 * (2 / 4) ** 2)
+    assert w.terms[2].cos == pytest.approx(0.0) and w.terms[2].fill == 0.0
+    assert w.lead(2) == pytest.approx(-(w.margin or 0))
+    js = w.to_json()
+    assert [b["number"] for b in js["books"]] == [1, 2] and js["best"] == 1
+
+
+def test_weigh_leaf_leaves_it_out_of_its_own_book() -> None:
+    s = Shape([Book(1, e(0)), Book(2, e(2))], 2, Tuning(anchor_k=1.0))
+    # Its book is full with it; without it, the book is one other leaf and has room.
+    me = leaf(1, 1, 1, e(1))
+    other = leaf(2, 1, 2, e(0))
+    w = weigh_leaf(s, [me, other], 1)
+    assert w is not None and set(w.terms) == {1, 2}
+    # Anchor and the other leaf are the same direction, so the centroid is that direction:
+    # no pull at all toward the leaf itself.
+    assert w.terms[1].cos == pytest.approx(0.0)
+    assert w.terms[1].fill == pytest.approx(-0.05 * (1 / 2) ** 2)
+    # With everyone placed as a plan would place them.
+    moved = weigh_leaf(s, [me, other], 1, {1: 2, 2: 2})
+    assert moved is not None and moved.terms[1].fill == 0.0
+    assert moved.terms[2].fill == pytest.approx(-0.05 * (1 / 2) ** 2)
+    assert weigh_leaf(s, [leaf(3, 1, 1, None)], 3) is None
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_weighing_every_leaf_at_once_is_weighing_each_alone(seed: int) -> None:
+    s, leaves, _, _ = _random_case(seed)
+    every = weigh_leaves(s, leaves)
+    for x in leaves:
+        alone = None
+        if x.vec is not None:
+            others = [y for y in leaves if y.image_id != x.image_id]
+            alone = weigh(s, others, x.vec, x.tags, own=x.book)
+        got = every[x.image_id]
+        assert (got is None) == (alone is None)
+        if got is not None and alone is not None:
+            assert set(got.terms) == set(alone.terms)
+            for n in got.terms:
+                assert got.totals[n] == pytest.approx(alone.totals[n], abs=1e-9)
 
 
 # -- positions ---------------------------------------------------------------------

@@ -150,6 +150,44 @@ def centroid(
     return _unit(w * anchor + (1.0 - w) * mean)
 
 
+@dataclass(frozen=True)
+class Terms:
+    """One book's score for one picture, in its parts. `tag` and `fill` are already
+    weighted and signed, so the parts add up to the score with nothing left over."""
+
+    cos: float
+    tag: float
+    fill: float
+
+    @property
+    def total(self) -> float:
+        return self.cos + self.tag + self.fill
+
+    def to_json(self, number: int) -> dict[str, Any]:
+        return {
+            "number": number,
+            "cos": self.cos,
+            "tag": self.tag,
+            "fill": self.fill,
+            "total": self.total,
+        }
+
+
+def terms(
+    vec: np.ndarray,
+    tags: frozenset[str],
+    book: Book,
+    center: np.ndarray | None,
+    occupied: int,
+    cap: int,
+    t: Tuning,
+) -> Terms:
+    cos = float(np.dot(vec, center)) if center is not None else 0.0
+    return Terms(
+        cos, t.tag_alpha * tag_overlap(tags, book.hints), -(t.fill_beta * (occupied / cap) ** 2)
+    )
+
+
 def score(
     vec: np.ndarray,
     tags: frozenset[str],
@@ -159,8 +197,7 @@ def score(
     cap: int,
     t: Tuning,
 ) -> float:
-    cos = float(np.dot(vec, center)) if center is not None else 0.0
-    return cos + t.tag_alpha * tag_overlap(tags, book.hints) - t.fill_beta * (occupied / cap) ** 2
+    return terms(vec, tags, book, center, occupied, cap, t).total
 
 
 class _Tally:
@@ -182,15 +219,20 @@ class _Tally:
             self.sums[book] = leaf.vec * sign if s is None else s + leaf.vec * sign
             self.n_vec[book] += sign
 
-    def scores(
+    def terms(
         self, shape: Shape, vec: np.ndarray, tags: frozenset[str], allowed: Iterable[int]
-    ) -> dict[int, float]:
+    ) -> dict[int, Terms]:
         out = {}
         for number in allowed:
             b = shape.book(number)
             c = centroid(b.anchor, self.sums[number], self.n_vec[number], shape.tuning.anchor_k)
-            out[number] = score(vec, tags, b, c, self.occupied[number], shape.cap, shape.tuning)
+            out[number] = terms(vec, tags, b, c, self.occupied[number], shape.cap, shape.tuning)
         return out
+
+    def scores(
+        self, shape: Shape, vec: np.ndarray, tags: frozenset[str], allowed: Iterable[int]
+    ) -> dict[int, float]:
+        return {n: t.total for n, t in self.terms(shape, vec, tags, allowed).items()}
 
 
 def _best(scores: Mapping[int, float]) -> int:
@@ -198,17 +240,111 @@ def _best(scores: Mapping[int, float]) -> int:
     return min(scores, key=lambda n: (-scores[n], n))
 
 
+@dataclass(frozen=True)
+class Weighing:
+    """Every book a picture could go to, scored in parts, with the best and the runner-up."""
+
+    terms: dict[int, Terms]
+    best: int
+    runner_up: int | None
+
+    @property
+    def totals(self) -> dict[int, float]:
+        return {n: t.total for n, t in self.terms.items()}
+
+    def lead(self, book: int) -> float | None:
+        """How far `book` scores above the best of the others; negative when it is not
+        the best. None when there is no other book to beat."""
+        others = [t.total for n, t in self.terms.items() if n != book]
+        if book not in self.terms or not others:
+            return None
+        return self.terms[book].total - max(others)
+
+    @property
+    def margin(self) -> float | None:
+        return self.lead(self.best)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "best": self.best,
+            "runner_up": self.runner_up,
+            "margin": self.margin,
+            "books": [t.to_json(n) for n, t in sorted(self.terms.items())],
+        }
+
+
+def _weighing(t: dict[int, Terms]) -> Weighing:
+    totals = {n: x.total for n, x in t.items()}
+    best = _best(totals)
+    rest = {n: v for n, v in totals.items() if n != best}
+    return Weighing(t, best, _best(rest) if rest else None)
+
+
+def weigh(
+    shape: Shape,
+    leaves: list[Leaf],
+    vec: np.ndarray,
+    tags: frozenset[str],
+    *,
+    own: int | None = None,
+) -> Weighing | None:
+    """A picture against these leaves, which must not include it: every book with room,
+    and `own` (the book it is in, which it may stay in however full). None when no book
+    is open to it."""
+    where = {leaf.image_id: leaf.book for leaf in leaves}
+    tally = _Tally(shape, leaves, where)
+    open_ = [
+        b.number for b in shape.books if b.number == own or tally.occupied[b.number] < shape.cap
+    ]
+    if not open_:
+        return None
+    return _weighing(tally.terms(shape, vec, tags, open_))
+
+
+def weigh_leaves(
+    shape: Shape,
+    leaves: list[Leaf],
+    where: Mapping[int, int] | None = None,
+    only: Iterable[int] | None = None,
+) -> dict[int, Weighing | None]:
+    """Each leaf as a re-sort sees it: everyone else in their book (`where`, or where they
+    are now), and the leaf taken out of its own, so staying put earns no self-similarity.
+    None for a leaf with no vector. `only` limits which leaves are weighed."""
+    where = where if where is not None else {x.image_id: x.book for x in leaves}
+    want = set(only) if only is not None else None
+    tally = _Tally(shape, leaves, where)
+    out: dict[int, Weighing | None] = {}
+    for x in leaves:
+        if want is not None and x.image_id not in want:
+            continue
+        if x.vec is None:
+            out[x.image_id] = None
+            continue
+        own = where[x.image_id]
+        # Out and back in, as assign_books does, so the books' sums are built once.
+        tally.add(x, own, -1)
+        open_ = [
+            b.number for b in shape.books if b.number == own or tally.occupied[b.number] < shape.cap
+        ]
+        out[x.image_id] = _weighing(tally.terms(shape, x.vec, x.tags, open_))
+        tally.add(x, own)
+    return out
+
+
+def weigh_leaf(
+    shape: Shape, leaves: list[Leaf], image_id: int, where: Mapping[int, int] | None = None
+) -> Weighing | None:
+    return weigh_leaves(shape, leaves, where, [image_id])[image_id]
+
+
 def choose_book(
     shape: Shape, leaves: list[Leaf], vec: np.ndarray, tags: frozenset[str]
 ) -> tuple[int, dict[int, float]] | None:
     """Best book with room for one more, and every score; None when all are full."""
-    where = {leaf.image_id: leaf.book for leaf in leaves}
-    tally = _Tally(shape, leaves, where)
-    room = [b.number for b in shape.books if tally.occupied[b.number] < shape.cap]
-    if not room:
+    w = weigh(shape, leaves, vec, tags)
+    if w is None:
         return None
-    s = tally.scores(shape, vec, tags, room)
-    return _best(s), s
+    return w.best, w.totals
 
 
 def assign_books(shape: Shape, leaves: list[Leaf]) -> dict[int, int]:

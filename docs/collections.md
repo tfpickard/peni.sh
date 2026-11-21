@@ -252,6 +252,9 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
 - History also records a filing (`from` null) and an unfiling (`to` null), so the admin list
   shows a leaf's whole life. The public `previous` is the latest row with a `from`, and is
   null when that equals where the leaf is now.
+- `migrations/024_leaf_history_scores.sql` gives each history row `chosen_by` (`score`,
+  `owner`; `judge` is allowed and unused) and `scores` (jsonb), set on the row where a
+  leaf's book was decided: a filing, an owner move, a re-sort that changes its book.
 - `migrations/019_collection_text.sql` adds the owner text and the note's provenance;
   `020_seed_pansophicon_text.sql` seeds the Pansophicon's text, filling only what is still
   empty. Tests re-apply 018 and 020 between runs.
@@ -338,6 +341,25 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   `collection sidecar: ...`. The picture publishes regardless.
 - A request for a picture that is down waits. Going live, republishing, and the worker
   start sweep each queue its filing.
+- Which book is decided in one place, `store.choose`: the owner's book when given, else
+  the best score among books with room. `plan.weigh` returns every open book's score in
+  its parts (`cos`, `tag`, `fill`, which add up to the total `choose_book` ranks by), the
+  best, the runner-up and the margin; the filing keeps them, with the tuning, on its
+  history row, also when the owner gave the book.
+- `GET /api/admin/collections/<slug>/explain?image_id=N` (readable with the read token):
+  the leaf's place and pins, every book's parts now with the leaf left out of its own (as a
+  re-sort sees it), the best, the runner-up, the margin and its own book's `lead`, and what
+  was kept when it was filed.
+- The owner's re-sort is a plan, then exactly that plan. The dry run answers `plan_id` and
+  the moves (thumbnail, before, after, and the margin: how far the new book scores above
+  the best other). `plan_id` is a hash of the moves and of the state they were planned
+  from: shape, tuning, each book's anchor text, hints and vector, and every leaf's place
+  and pins. Sent back with the moves, it applies them as they are, or answers 409 `changed`
+  when that state is no longer the collection's. The leaves' own vectors are not in it, so
+  an upload elsewhere on the site (which moves the corpus mean) does not void a plan.
+- A dry run while any anchor has no vector answers 409 `anchors` and queues
+  `collection_anchor`, instead of scoring a book blind. The weekly re-sort is still a job
+  that embeds the anchors, plans and writes in one go.
 
 ### Site
 

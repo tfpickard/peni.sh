@@ -120,9 +120,14 @@ export type Detail = Summary & {
 export type ProposedMove = {
 	image_id: number;
 	slug: string | null;
-	before: [number, number] | null;
-	after: [number, number] | null;
+	thumb: string | null;
+	before: [number, number];
+	after: [number, number];
+	// How far the leaf's new book scores above the best other book; null with no vector.
+	margin: number | null;
 };
+// A dry run's answer. Sent back whole, it applies exactly these moves or is refused `changed`.
+export type Plan = { plan_id: string; moves: ProposedMove[] };
 
 const at = (slug: string) => `/${encodeURIComponent(slug)}`;
 
@@ -160,6 +165,7 @@ export const writeNote = (slug: string, imageId: number) =>
 export const writeMissingNotes = (slug: string) => call<Detail>('POST', `${at(slug)}/notes`, {});
 export const retry = (slug: string, imageId: number) =>
 	call<Detail>('POST', `${at(slug)}/requests/${imageId}/retry`, {});
-export const dryRun = (slug: string) =>
-	call<{ moves: ProposedMove[] }>('POST', `${at(slug)}/resort`, { dry_run: true });
-export const resort = (slug: string) => call<Detail>('POST', `${at(slug)}/resort`, { dry_run: false });
+// Refused `anchors` while a book's anchor waits for its vector; the server queues it.
+export const dryRun = (slug: string) => call<Plan>('POST', `${at(slug)}/resort`, { dry_run: true });
+export const resort = (slug: string, plan: Plan) =>
+	call<Detail>('POST', `${at(slug)}/resort`, { dry_run: false, ...plan });

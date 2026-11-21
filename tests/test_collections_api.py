@@ -4,13 +4,17 @@ the admin surface, and the upload form's collection fields."""
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from penish.config import get_settings
-from tests import test_admin_pictures
+from tests import test_admin, test_admin_pictures
 from tests.test_admin_pictures import XHR, add, sha, sql
 
 # The admin pictures client: logged in, with a 4-wide test embedding space.
 client = test_admin_pictures.client
+# A client holding only the read token.
+reader = test_admin.reader
+bearer = test_admin._bearer
 
 PUB = "/api/collections"
 ADM = "/api/admin/collections"
@@ -353,18 +357,222 @@ async def test_admin_retry_request(client: httpx.AsyncClient, clean_db: str) -> 
     assert (await client.post(f"{ADM}/{SLUG}/requests/99/retry", headers=XHR)).status_code == 404
 
 
-async def test_admin_resort_dry_run_and_real(client: httpx.AsyncClient, clean_db: str) -> None:
+def anchored(dsn: str) -> None:
+    """Every book's anchor embedded, book n along axis (n - 1) % 4 of the test space."""
+    for n in range(1, 8):
+        v = [0.0] * 4
+        v[(n - 1) % 4] = 1.0
+        sql(
+            dsn,
+            "update collection_books set anchor_embedding = %s::vector, anchor_model = %s,"
+            " anchor_dim = 4 where number = %s",
+            str(v),
+            get_settings().embed_model,
+            n,
+        )
+
+
+async def dry(client: httpx.AsyncClient) -> httpx.Response:
+    return await client.post(f"{ADM}/{SLUG}/resort", headers=XHR, json={"dry_run": True})
+
+
+async def apply(client: httpx.AsyncClient, plan: dict[str, object]) -> httpx.Response:
+    return await client.post(f"{ADM}/{SLUG}/resort", headers=XHR, json={"dry_run": False, **plan})
+
+
+def places(dsn: str) -> dict[int, tuple[int, int]]:
+    rows = sql(dsn, "select image_id, book, position from collection_leaves")
+    return {i: (b, p) for i, b, p in rows}
+
+
+async def test_admin_resort_dry_run_and_apply(client: httpx.AsyncClient, clean_db: str) -> None:
+    anchored(clean_db)
     a = add(clean_db, 1, vec=[1, 0, 0, 0])
     b = add(clean_db, 2, vec=[1, 0, 0, 0])
+    stray = add(clean_db, 3, vec=[0, 1, 0, 0])
     leaf(clean_db, a, 1, 40)
     leaf(clean_db, b, 1, 41)
-    r = await client.post(f"{ADM}/{SLUG}/resort", headers=XHR, json={"dry_run": True})
-    moves = r.json()["moves"]
-    assert {m["slug"] for m in moves} == {"img-1", "img-2"}
+    leaf(clean_db, stray, 3, 5)
+    r = await dry(client)
+    assert r.status_code == 200
+    plan = r.json()
+    assert isinstance(plan["plan_id"], str) and len(plan["plan_id"]) >= 32
+    moves = {m["slug"]: m for m in plan["moves"]}
+    assert set(moves) == {"img-1", "img-2", "img-3"}
+    # The stray goes home to book ii, ahead of book vi (the same axis, with no leaves
+    # either) by nothing but the lower number.
+    m = moves["img-3"]
+    assert (m["before"], m["after"][0]) == ([3, 5], 2)
+    assert m["thumb"] and m["image_id"] == stray
+    assert m["margin"] == pytest.approx(0.0)
+    # Book v shares book i's axis and is empty, so img-1 trails it by book i's fill alone,
+    # well inside the margin a re-sort needs to move it.
+    assert -0.001 < moves["img-1"]["margin"] < 0
     assert sql(clean_db, "select count(*) from collection_leaf_history") == [(0,)]
+    # The same state plans the same plan.
+    assert (await dry(client)).json() == plan
+
+    r = await apply(client, plan)
+    assert r.status_code == 200
+    got = places(clean_db)
+    assert got == {x["image_id"]: tuple(x["after"]) for x in plan["moves"]}
+    hist = sql(
+        clean_db,
+        "select image_id, reason, chosen_by from collection_leaf_history order by id",
+    )
+    assert {(i, why) for i, why, _ in hist} == {(a, "resort"), (b, "resort"), (stray, "resort")}
+    assert {i: by for i, _, by in hist} == {a: None, b: None, stray: "score"}
+    assert r.json()["last_resort_at"]
+    # Applied once; the same plan again is for a collection that is no longer there.
+    assert (await apply(client, plan)).json() == {"detail": "changed"}
+    # No plan, no re-sort.
     r = await client.post(f"{ADM}/{SLUG}/resort", headers=XHR, json={"dry_run": False})
-    assert r.json()["resort"]["status"] == "queued"
-    assert sql(clean_db, "select type from jobs") == [("collection_resort",)]
+    assert r.status_code == 422
+
+
+async def test_apply_applies_the_plan_not_a_new_one(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    anchored(clean_db)
+    a = add(clean_db, 1, vec=[0, 1, 0, 0])
+    leaf(clean_db, a, 1, 1)
+    plan = (await dry(client)).json()
+    assert [m["after"][0] for m in plan["moves"]] == [2]
+    # The picture's own vector moves on after the dry run, and a fresh plan would keep it
+    # in book i; the owner is still given what they were shown.
+    sql(clean_db, "update embeddings set vec = '[1,0,0,0]' where image_id = %s", a)
+    assert (await dry(client)).json()["moves"] == []
+    assert (await apply(client, plan)).status_code == 200
+    assert places(clean_db)[a][0] == 2
+
+
+async def test_apply_refuses_a_changed_collection(client: httpx.AsyncClient, clean_db: str) -> None:
+    anchored(clean_db)
+    a = add(clean_db, 1, vec=[0, 1, 0, 0])
+    b = add(clean_db, 2, vec=[0, 0, 1, 0])
+    leaf(clean_db, a, 1, 1)
+    leaf(clean_db, b, 1, 2)
+
+    async def refused_after(change: str, *args: object) -> None:
+        plan = (await dry(client)).json()
+        assert plan["moves"]
+        sql(clean_db, change, *args)
+        r = await apply(client, plan)
+        assert (r.status_code, r.json()) == (409, {"detail": "changed"}), change
+        assert places(clean_db)[a][0] == 1
+
+    # A leaf moved, a pin changed, the tuning changed, an anchor re-embedded.
+    await refused_after("update collection_leaves set position = 9 where image_id = %s", b)
+    await refused_after("update collection_leaves set book_pinned = true where image_id = %s", b)
+    await refused_after("""update collections set tuning = tuning || '{"anchor_k": 4}'""")
+    await refused_after(
+        "update collection_books set anchor_embedding = '[0,0,0,1]' where number = 2"
+    )
+    # A plan altered on the way back is not the plan that was made.
+    plan = (await dry(client)).json()
+    plan["moves"][0]["after"] = [7, 77]
+    assert (await apply(client, plan)).json() == {"detail": "changed"}
+    plan = (await dry(client)).json()
+    plan["plan_id"] = "0" * 64
+    assert (await apply(client, plan)).json() == {"detail": "changed"}
+    assert sql(clean_db, "select count(*) from collection_leaf_history") == [(0,)]
+
+
+async def test_dry_run_waits_for_anchors(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    leaf(clean_db, a, 1, 40)
+    anchored(clean_db)
+    sql(clean_db, "update collection_books set anchor_embedding = null where number = 4")
+    for _ in range(2):
+        r = await dry(client)
+        assert (r.status_code, r.json()) == (409, {"detail": "anchors"})
+    # Queued once, however often it is asked.
+    assert sql(clean_db, "select type, payload from jobs") == [
+        ("collection_anchor", {"collection_id": cid(clean_db)})
+    ]
+    anchored(clean_db)
+    assert (await dry(client)).status_code == 200
+
+
+async def test_book_pinned_leaves_keep_their_book_in_a_plan(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    anchored(clean_db)
+    held = add(clean_db, 1, vec=[0, 1, 0, 0])
+    fixed = add(clean_db, 2, vec=[0, 0, 1, 0])
+    free = add(clean_db, 3, vec=[0, 0, 0, 1])
+    leaf(clean_db, held, 1, 40)
+    sql(clean_db, "update collection_leaves set book_pinned = true where image_id = %s", held)
+    leaf(clean_db, fixed, 1, 41, pinned=True)
+    leaf(clean_db, free, 1, 42)
+    plan = (await dry(client)).json()
+    by = {m["image_id"]: m for m in plan["moves"]}
+    assert fixed not in by
+    assert held not in by or by[held]["after"][0] == 1
+    assert by[free]["after"][0] == 4
+    assert (await apply(client, plan)).status_code == 200
+    got = places(clean_db)
+    assert got[held][0] == 1 and got[fixed] == (1, 41)
+
+
+async def test_explain_a_leaf(client: httpx.AsyncClient, clean_db: str) -> None:
+    anchored(clean_db)
+    a = add(clean_db, 1, vec=[0, 1, 0, 0])
+    b = add(clean_db, 2, vec=[1, 0, 0, 0])
+    leaf(clean_db, a, 1, 1)
+    leaf(clean_db, b, 1, 2)
+    sql(
+        clean_db,
+        "insert into collection_leaf_history (image_id, collection_id, to_book, to_position,"
+        " reason, chosen_by, scores) values (%s, %s, 1, 1, 'auto', 'score', %s)",
+        a,
+        cid(clean_db),
+        '{"best": 1, "runner_up": 2, "margin": 0.25, "books": []}',
+    )
+    r = await client.get(f"{ADM}/{SLUG}/explain", params={"image_id": a})
+    assert r.status_code == 200
+    got = r.json()
+    assert (got["slug"], got["book"], got["position"]) == ("img-1", 1, 1)
+    assert (got["pinned"], got["book_pinned"]) == (False, False)
+    now = got["now"]
+    books = {x["number"]: x for x in now["books"]}
+    assert set(books) == set(range(1, 8))
+    # Left out of book i, the leaf meets only the anchor and b there, both along axis 0,
+    # and counts one leaf of fill, not two.
+    assert books[1]["cos"] == pytest.approx(0.0)
+    assert books[1]["fill"] == pytest.approx(-0.05 * (1 / 77) ** 2)
+    assert books[2]["cos"] == pytest.approx(1.0) and books[2]["fill"] == 0.0
+    for x in now["books"]:
+        assert x["cos"] + x["tag"] + x["fill"] == pytest.approx(x["total"])
+    assert (now["best"], now["runner_up"]) == (2, 6)
+    assert now["margin"] == pytest.approx(0.0)
+    assert now["lead"] == pytest.approx(books[1]["total"] - 1.0)
+    assert got["filed"]["chosen_by"] == "score" and got["filed"]["scores"]["margin"] == 0.25
+    assert (got["filed"]["book"], got["filed"]["position"]) == (1, 1)
+
+    other = add(clean_db, 3, vec=[1, 0, 0, 0])
+    r = await client.get(f"{ADM}/{SLUG}/explain", params={"image_id": other})
+    assert (r.status_code, r.json()) == (404, {"detail": "not here"})
+    assert (await client.get(f"{ADM}/{SLUG}/explain", params={"image_id": 999})).status_code == 404
+    assert (await client.get(f"{ADM}/nope/explain", params={"image_id": a})).status_code == 404
+
+
+async def test_explain_reads_with_the_token(reader: httpx.AsyncClient, clean_db: str) -> None:
+    (row,) = sql(
+        clean_db,
+        "insert into images (sha256, slug, status, published_at) values (%s, 'img-1', 'live',"
+        " now()) returning id",
+        sha(1),
+    )
+    leaf(clean_db, row[0], 2, 3)
+    r = await reader.get(f"{ADM}/{SLUG}/explain", params={"image_id": row[0]}, headers=bearer())
+    assert r.status_code == 200, r.text
+    got = r.json()
+    # No vector, so no scores now, and never filed through the filer.
+    assert (got["book"], got["position"], got["now"], got["filed"]) == (2, 3, None, None)
+    assert (
+        await reader.get(f"{ADM}/{SLUG}/explain", params={"image_id": row[0]})
+    ).status_code == 401
 
 
 async def test_admin_picture_shows_collections(client: httpx.AsyncClient, clean_db: str) -> None:

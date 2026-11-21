@@ -344,15 +344,7 @@ async def edit_book(request: Request, slug: str, number: int, body: BookEdit) ->
                     " where collection_id = %s and number = %s",
                     (text, c["id"], number),
                 )
-                await conn.execute(
-                    "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s)"
-                    " on conflict do nothing",
-                    (
-                        store.ANCHOR_JOB,
-                        Jsonb({"collection_id": c["id"]}),
-                        f"{store.ANCHOR_JOB}:{c['id']}",
-                    ),
-                )
+                await store.enqueue_anchor_job(conn, c["id"])
     return await _answer(request, slug)
 
 
@@ -481,39 +473,86 @@ async def retry_request(request: Request, slug: str, image_id: int) -> dict[str,
 # -- re-sort ------------------------------------------------------------------------
 
 
+class PlannedMove(BaseModel):
+    # The dry run's moves come back as they were sent; their other fields are for display.
+    image_id: int
+    before: tuple[int, int]
+    after: tuple[int, int]
+
+
 class Resort(BaseModel):
     dry_run: bool = True
+    # The dry run's answer, sent back to apply it.
+    plan_id: str | None = Field(None, max_length=128)
+    moves: list[PlannedMove] | None = Field(None, max_length=100_000)
 
 
 @router.post("/{slug}/resort")
 async def resort(request: Request, slug: str, body: Resort) -> dict[str, Any]:
-    """A dry run plans against the vectors as they stand and answers with the moves. The
-    real one is a job, so the worker can embed any anchor still waiting first."""
+    """A dry run answers with the plan and its id; sending both back applies exactly that
+    plan, or refuses `changed` if the collection has moved on since. A dry run while an
+    anchor waits for its vector is refused `anchors`, and the anchor is queued, so the
+    next one a minute later can score every book."""
+    settings = get_settings()
     async with request.app.state.pool.connection() as conn:
         c = await _collection(conn, slug)
         if body.dry_run:
-            moves = await store.resort(conn, c, get_settings(), dry_run=True)
+            try:
+                plan = await store.plan(conn, c, settings)
+            except store.AnchorsWaiting as e:
+                await store.enqueue_anchor_job(conn, c["id"])
+                # Committed here: the refusal below would otherwise roll the job back.
+                await conn.commit()
+                raise _refused(e) from None
+            except store.Refused as e:
+                raise _refused(e) from None
             cur = await conn.execute(
-                "select id, slug from images where id = any(%s)", ([m.image_id for m in moves],)
+                f"select {_PICTURE} from images i where i.id = any(%s)".encode(),
+                ([m.image_id for m in plan.moves],),
             )
-            slugs = {r["id"]: r["slug"] for r in await cur.fetchall()}
+            pictures = {r["id"]: r for r in await cur.fetchall()}
+            thumbs = _thumbs(list(pictures.values()))
             return {
+                "plan_id": plan.id,
                 "moves": [
                     {
                         "image_id": m.image_id,
-                        "slug": slugs.get(m.image_id),
+                        "slug": pictures[m.image_id]["slug"] if m.image_id in pictures else None,
+                        "thumb": thumbs.get(m.image_id),
                         "before": m.before,
                         "after": m.after,
+                        "margin": plan.leads.get(m.image_id),
                     }
-                    for m in moves
-                ]
+                    for m in plan.moves
+                ],
             }
-        await conn.execute(
-            "insert into jobs (type, payload, dedupe_key) values (%s, %s, %s)"
-            " on conflict do nothing",
-            (store.RESORT_JOB, Jsonb({"collection_id": c["id"]}), f"{store.RESORT_JOB}:{c['id']}"),
-        )
+        if body.plan_id is None or body.moves is None:
+            raise HTTPException(status_code=422, detail="no plan")
+        try:
+            await store.apply(
+                conn,
+                c,
+                settings,
+                body.plan_id,
+                [(m.image_id, m.before, m.after) for m in body.moves],
+            )
+        except store.Refused as e:
+            raise _refused(e) from None
     return await _answer(request, slug)
+
+
+@router.get("/{slug}/explain")
+async def explain(request: Request, slug: str, image_id: int) -> dict[str, Any]:
+    """Why a leaf is in its book: every book's terms now, with the leaf left out of its own
+    as a re-sort sees it, and the scores kept when it was filed."""
+    async with request.app.state.pool.connection() as conn:
+        c = await _collection(conn, slug)
+        got = await store.explain(conn, c, image_id, get_settings())
+        if got is None:
+            raise _not_here()
+        cur = await conn.execute("select slug from images where id = %s", (image_id,))
+        row = await cur.fetchone()
+    return {**got, "slug": row["slug"] if row else None}
 
 
 # -- the admin picture page -----------------------------------------------------------
