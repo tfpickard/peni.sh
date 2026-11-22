@@ -12,7 +12,7 @@ from penish.api import embed_client
 from penish.api.routes_images import grid_items
 from penish.api.social import RateLimit, ip_hash
 from penish.categories import CATEGORIES
-from penish.collection.numerals import parse_number
+from penish.collection.numerals import LOOSE, parse_number
 from penish.config import get_settings
 from penish.mycelium.store import overgrowth_by_id
 from penish.text import slugify
@@ -174,9 +174,10 @@ async def _collection_query(
                 f"""
                 select {_COLS} from collection_leaves l join images i on i.id = l.image_id
                  where l.collection_id = %s and {_LIVE}
-                 order by l.book, l.position limit %s
+                 order by l.book = %s, l.book, l.position limit %s
                 """.encode(),
-                (c["id"], limit),
+                # The loose leaves (book 0) after the books, as the collection page has them.
+                (c["id"], LOOSE, limit),
             )
             return c, await cur.fetchall(), False
     # A leaf reference, with or without a name in front: `ptp iii 44`, `iii.44`.

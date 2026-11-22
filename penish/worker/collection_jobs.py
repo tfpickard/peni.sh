@@ -22,7 +22,7 @@ from psycopg.types.json import Jsonb
 
 from penish import runtime
 from penish.collection import judge, store
-from penish.collection.numerals import parse_line
+from penish.collection.numerals import LOOSE, parse_line
 from penish.collection.plan import Tuning
 from penish.config import Settings
 from penish.worker.ingest import DocumentEmbedder
@@ -232,12 +232,12 @@ async def enqueue_anchors(pool: Pool, settings: Settings) -> int:
                    jsonb_build_object('collection_id', b.collection_id),
                    '{store.ANCHOR_JOB}:' || b.collection_id
               from collection_books b
-             where b.anchor_text <> ''
+             where b.anchor_text <> '' and b.number <> %(loose)s
                and (b.anchor_embedding is null or b.anchor_model is distinct from %(m)s
                     or b.anchor_dim is distinct from %(d)s)
             on conflict do nothing
             """,
-            {"m": settings.embed_model, "d": settings.embed_dim},
+            {"m": settings.embed_model, "d": settings.embed_dim, "loose": LOOSE},
         )
         return cur.rowcount
 

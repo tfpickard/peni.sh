@@ -2,7 +2,8 @@
 
 Vectors place pictures by what they look like, and pictures of one medium look alike
 whatever they show. The judge reads the caption, the description and the analysis beside
-each of the collection's books with its title and anchor, and names a book by subject. The
+each of the collection's books with its title and anchor, and names a book by subject, or
+none, which makes the leaf loose (in the collection, in no book). The
 vector scores still place the leaf within its book, and stand in whenever the judge is off,
 fails or refuses, or names a book with no room.
 
@@ -25,7 +26,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import DictRow
 
 from penish import runtime
-from penish.collection.numerals import parse_number, roman
+from penish.collection.numerals import LOOSE, parse_number, roman
 from penish.config import Settings
 from penish.runtime import Pool, UsageRecorder
 from penish.text import no_em_dash
@@ -52,6 +53,9 @@ REASON_MAX = 200
 # the next time the question comes up.
 SETTLED = frozenset({"refused"})
 _FIELDS = ("caption", "description", "analysis")
+# The judge's word for a leaf whose subject belongs to no book. Never a runner-up: that is
+# always the nearest book.
+NONE = "none"
 
 _SHAPE: dict[str, Any] = {
     "type": "object",
@@ -88,6 +92,7 @@ class ShownBook:
 
 @dataclass(frozen=True)
 class Judgement:
+    # LOOSE when the judge said none.
     book: int
     runner_up: int
     reason: str
@@ -132,7 +137,7 @@ def default_client(settings: Settings) -> Any:
 
 def render(texts: Texts, books: Iterable[ShownBook]) -> str:
     """The user turn: the books first, so the leaf is read against them."""
-    lines = ["The books of the codex. The leaf goes into one of them:", ""]
+    lines = ["The books of the codex:", ""]
     for b in sorted(books, key=lambda x: x.number):
         head = f"book {roman(b.number)}"
         lines.append(f"{head}: {b.title}" if b.title else head)
@@ -153,7 +158,7 @@ def schema(books: Iterable[ShownBook]) -> dict[str, Any]:
     # The books as an enum, so a model that honours the schema cannot name another.
     names = [roman(b.number) for b in sorted(books, key=lambda x: x.number)]
     props = {
-        "book": {"type": "string", "enum": names},
+        "book": {"type": "string", "enum": [*names, NONE]},
         "runner_up": {"type": "string", "enum": names},
         "reason": {"type": "string"},
     }
@@ -186,11 +191,13 @@ def check(raw: Any, books: Iterable[ShownBook]) -> tuple[int, int, str]:
     """(book, runner_up, reason), or ValueError saying why the answer is not a judgement."""
     jsonschema.validate(raw, _SHAPE)
     numbers = {b.number for b in books}
-    book = _numeral(raw["book"])
+    said = raw["book"].strip().lower()
+    book = LOOSE if said == NONE else _numeral(raw["book"])
     runner_up = _numeral(raw["runner_up"])
-    for n in (book, runner_up):
-        if n not in numbers:
-            raise ValueError(f"no book {n}")
+    if book != LOOSE and book not in numbers:
+        raise ValueError(f"no book {book}")
+    if runner_up not in numbers:
+        raise ValueError(f"no book {runner_up}")
     if book == runner_up:
         raise ValueError("book and runner-up are the same")
     reason = " ".join(raw["reason"].split())

@@ -19,7 +19,7 @@ from penish.api.routes_galleries import gallery_card, parse_serial
 from penish.api.routes_images import resolve_live
 from penish.api.routes_meta import SHOWN_HAIKU, random_haiku
 from penish.categories import SLUGS as CATEGORY_SLUGS
-from penish.collection.numerals import roman
+from penish.collection.numerals import LOOSE, book_name
 from penish.collection.store import leaf_for_image
 from penish.config import get_settings
 
@@ -276,7 +276,8 @@ def _static_og(slug: str) -> tuple[str, tuple[int, int] | None] | None:
 
 
 async def _collection_image(conn: Any, c: dict[str, Any], base: str) -> list[str]:
-    """The owner's PNG if one was dropped in, else the first leaf's JPEG, else nothing."""
+    """The owner's PNG if one was dropped in, else the first leaf's JPEG (a loose leaf only
+    when no book has one), else nothing."""
     static = _static_og(c["slug"])
     if static is not None:
         url, size = static
@@ -289,9 +290,9 @@ async def _collection_image(conn: Any, c: dict[str, Any], base: str) -> list[str
         select i.pub_sha, i.width, i.height
           from collection_leaves l join images i on i.id = l.image_id
          where l.collection_id = %s and i.status = 'live' and i.published_at is not null
-         order by l.book, l.position limit 1
+         order by l.book = %s, l.book, l.position limit 1
         """,
-        (c["id"],),
+        (c["id"], LOOSE),
     )
     row = await cur.fetchone()
     if row is None:
@@ -304,8 +305,18 @@ async def _collection_page(request: Request, slug: str, book: str | None) -> HTM
     # The connection goes back before the shell is rendered: render_index takes one of its
     # own, and holding two per request starves the pool under a burst of these pages.
     tags: list[str] | None = None
+    # The loose leaves' title when that is the page asked for, None when it has no row.
+    loose: str | None = None
     async with request.app.state.pool.connection() as conn:
         c = await published(conn, slug)
+        if c is not None and book is not None and book.isascii() and book.isdigit():
+            if int(book) == LOOSE:
+                cur = await conn.execute(
+                    "select title from collection_books where collection_id = %s and number = %s",
+                    (c["id"], LOOSE),
+                )
+                row = await cur.fetchone()
+                loose = None if row is None else book_name(LOOSE, row["title"])
         if c is not None and book is None:
             tags = [_meta("og:type", "website")]
             if c["gloss"] and c["gloss"].strip():
@@ -319,9 +330,16 @@ async def _collection_page(request: Request, slug: str, book: str | None) -> HTM
     if tags is not None:
         return await render_index(request, "".join(tags), title=c["title"])
     assert book is not None
-    if not (book.isascii() and book.isdigit()) or not 1 <= int(book) <= c["book_count"]:
+    if not (book.isascii() and book.isdigit()):
         return await render_index(request, status_code=404)
-    title = f"{c['abbrev']} {roman(int(book))}"
+    n = int(book)
+    if n == LOOSE and loose is not None:
+        name = loose
+    elif 1 <= n <= c["book_count"]:
+        name = book_name(n, None)
+    else:
+        return await render_index(request, status_code=404)
+    title = f"{c['abbrev']} {name}"
     return await render_index(request, _meta("og:type", "website"), title=title)
 
 

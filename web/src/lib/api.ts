@@ -63,7 +63,8 @@ export type ImageDetail = Omit<ImageItem, 'overgrowth'> & {
 	leaf: Leaf | null;
 };
 export type Leaf = {
-	collection: { slug: string; title: string; abbrev: string; abbrev_latin: string };
+	// loose_title names book 0, the leaves in no book, wherever a numeral would go.
+	collection: { slug: string; title: string; abbrev: string; abbrev_latin: string; loose_title: string };
 	book: number;
 	position: number;
 	previous: { book: number; position: number } | null;
@@ -487,6 +488,8 @@ export type Collection = CollectionHead & {
 	gloss: string;
 	record: [string, string][];
 	vendor_text: string | null;
+	// The books in order, then book 0 (the leaves in no book, named by title alone) while
+	// it has any.
 	books: { number: number; title: string | null; leaves: StripLeaf[] }[];
 };
 export type BookSlot = (ImageItem & { position: number }) | null;
@@ -494,7 +497,7 @@ export type CollectionBook = {
 	collection: CollectionHead;
 	number: number;
 	title: string | null;
-	// Every slot in leaf order, empty ones null.
+	// Every slot in leaf order, empty ones null. Book 0 has no cap and sends only its leaves.
 	slots: BookSlot[];
 };
 

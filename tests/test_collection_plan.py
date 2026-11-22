@@ -5,12 +5,21 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from penish.collection.numerals import Request, format_line, parse_line, parse_number, roman
+from penish.collection.numerals import (
+    LOOSE,
+    Request,
+    book_name,
+    format_line,
+    parse_line,
+    parse_number,
+    roman,
+)
 from penish.collection.plan import (
     Book,
     Leaf,
     Shape,
     Tuning,
+    accession,
     assign_books,
     centroid,
     choose_book,
@@ -73,6 +82,11 @@ def test_parse_number_refuses(bad: str) -> None:
         ("pansophicon iii xiv", Request("pansophicon", 3, 14)),
         ("pansophicon 3, 14", Request("pansophicon", 3, 14)),
         ("\n\npansophicon vii 77\n\n", Request("pansophicon", 7, 77)),
+        # Incertae sedis: book 0, as `0` or `n` (nulla), with no cap on its leaf.
+        ("pansophicon 0", Request("pansophicon", LOOSE)),
+        ("pansophicon n", Request("pansophicon", LOOSE)),
+        ("pansophicon N 4", Request("pansophicon", LOOSE, 4)),
+        ("pansophicon 0 120", Request("pansophicon", LOOSE, 120)),
     ],
 )
 def test_parse_line_valid(text: str, want: Request) -> None:
@@ -88,7 +102,9 @@ def test_parse_line_valid(text: str, want: Request) -> None:
         "pansophicon\nanother",
         "pansophicon three",
         "pansophicon iii fourteen",
-        "pansophicon 0",
+        "pansophicon iii 0",
+        "pansophicon iii n",
+        "pansophicon nn",
         "the pansophicon!",
         "��",
     ],
@@ -103,6 +119,15 @@ def test_format_line() -> None:
     assert format_line(Request("pansophicon", 3)) == "pansophicon iii"
     assert format_line(Request("pansophicon", 3, 14)) == "pansophicon iii 14"
     assert parse_line(format_line(Request("pansophicon", 7, 77))) == Request("pansophicon", 7, 77)
+    assert format_line(Request("pansophicon", LOOSE, 4)) == "pansophicon n 4"
+    assert parse_line(format_line(Request("pansophicon", LOOSE))) == Request("pansophicon", LOOSE)
+
+
+def test_book_name() -> None:
+    assert book_name(3, "incertae sedis") == "iii"
+    assert book_name(LOOSE, "of uncertain place") == "of uncertain place"
+    # The row's title gone by hand: the line still names something.
+    assert book_name(LOOSE, None) == "incertae sedis"
 
 
 # -- choosing a book ---------------------------------------------------------------
@@ -471,3 +496,91 @@ def test_a_tie_between_gaps_goes_to_the_roomier_one() -> None:
     pos = positions(book, [*pins, *free], 77)
     _check(pos, 77)
     assert all(20 < pos[x.image_id] < 60 for x in free)
+
+
+# -- the loose leaves (incertae sedis) ----------------------------------------------
+
+
+def test_loose_leaves_fill_no_book_and_pull_none() -> None:
+    s = shape(n_books=2, cap=2)
+    # Book 1 is full; two loose leaves sit exactly on book 2's subject.
+    leaves = [leaf(1, 1, 1, e(0)), leaf(2, 1, 2, e(0))]
+    loose = [leaf(3, LOOSE, 1, e(5)), leaf(4, LOOSE, 2, e(5))]
+    w = weigh(s, leaves + loose, e(1), frozenset())
+    assert w is not None and set(w.terms) == {2}
+    assert w.terms[2].fill == 0.0
+    assert w.terms[2] == weigh(s, leaves, e(1), frozenset()).terms[2]  # type: ignore[union-attr]
+    # Every book full: loose leaves do not open one.
+    full = [*leaves, leaf(5, 2, 1, e(1)), leaf(6, 2, 2, e(1))]
+    assert weigh(s, full + loose, e(1), frozenset()) is None
+
+
+def test_a_loose_leaf_is_weighed_against_the_books_only() -> None:
+    s = shape(n_books=3)
+    leaves = [leaf(1, LOOSE, 4, e(1)), leaf(2, 2, 1, e(1))]
+    w = weigh_leaf(s, leaves, 1)
+    assert w is not None and set(w.terms) == {1, 2, 3} and w.best == 2
+    # It is in no book, so it leads none.
+    assert w.lead(LOOSE) is None
+
+
+def test_a_loose_leaf_has_no_weighing_when_every_book_is_full() -> None:
+    s = shape(n_books=1, cap=1)
+    leaves = [leaf(1, 1, 1, e(0)), leaf(2, LOOSE, 1, e(0))]
+    assert weigh_leaf(s, leaves, 2) is None
+    # The full book's own leaf is still weighed: it may stay where it is.
+    assert weigh_leaf(s, leaves, 1) is not None
+
+
+def test_resort_never_moves_a_leaf_into_or_out_of_the_loose_leaves() -> None:
+    s, leaves = _scrambled()
+    # Loose leaves that would score clearly in book 1, and one with no business anywhere.
+    loose = [leaf(100, LOOSE, 1, e(0)), leaf(101, LOOSE, 3, e(0)), leaf(102, LOOSE, 2, e(11))]
+    plan = plan_resort(s, leaves + loose)
+    for x in loose:
+        assert plan[x.image_id] == (LOOSE, x.position)
+    assert all(plan[x.image_id][0] != LOOSE for x in leaves)
+    # And their presence changes nothing about where the rest go.
+    assert {i: plan[i] for i in plan if i < 100} == plan_resort(s, leaves)
+    where = assign_books(s, leaves + loose)
+    assert all(where[x.image_id] == LOOSE for x in loose)
+
+
+def test_accession_numbers_in_order_of_arrival() -> None:
+    there = [leaf(5, LOOSE, 1, e(0)), leaf(9, LOOSE, 4, e(1))]
+    # Arrivals carry no number; they go after the highest, in image id order.
+    got = accession([*there, leaf(7, LOOSE, 0, None), leaf(3, LOOSE, 0, e(2))])
+    assert got == {5: 1, 9: 4, 3: 5, 7: 6}
+
+
+def test_accession_gives_an_owner_pin_its_number() -> None:
+    there = [leaf(5, LOOSE, 1, e(0)), leaf(9, LOOSE, 2, e(1))]
+    got = accession([*there, leaf(3, LOOSE, 2, e(2), book_pinned=True, pinned=True)])
+    # The leaf already at 2 goes to the end; the gap the pin filled is not closed.
+    assert got == {3: 2, 5: 1, 9: 3}
+    with pytest.raises(ValueError):
+        accession(
+            [
+                leaf(1, LOOSE, 2, e(0), book_pinned=True, pinned=True),
+                leaf(2, LOOSE, 2, e(1), book_pinned=True, pinned=True),
+            ]
+        )
+
+
+def test_lay_books_takes_leaves_into_and_out_of_the_loose_leaves() -> None:
+    s = shape(n_books=2)
+    leaves = [
+        leaf(1, LOOSE, 1, e(0)),
+        leaf(2, LOOSE, 2, e(0)),
+        leaf(3, LOOSE, 3, e(0)),
+        leaf(4, 1, 5, e(0)),
+        leaf(5, 1, 9, e(0, 1)),
+    ]
+    # 2 leaves for book 2 and 4 is made loose: 2's number stays a gap, 4 takes 4.
+    out = lay_books(s, leaves, {1: LOOSE, 2: 2, 3: LOOSE, 4: LOOSE, 5: 1}, [], settled=True)
+    assert out[1] == (LOOSE, 1) and out[3] == (LOOSE, 3)
+    assert out[4] == (LOOSE, 4)
+    assert out[2][0] == 2 and out[5] == (1, 9)
+    # Named on its own, the loose leaves are not laid again.
+    again = lay_books(s, leaves, {x.image_id: x.book for x in leaves}, [LOOSE, 1])
+    assert [again[i] for i in (1, 2, 3)] == [(LOOSE, 1), (LOOSE, 2), (LOOSE, 3)]

@@ -183,13 +183,20 @@
 		});
 	const noteBy = (c: pics.PictureCollection) =>
 		!c.leaf?.note ? '' : c.leaf.note_source === 'owner' ? 'owner' : (c.leaf.note_model ?? '');
+	// Book 0 is the loose leaves, named by title: there is no numeral to give.
+	const bookOf = (c: pics.PictureCollection, n: number) =>
+		n === 0 ? (c.loose_title ?? '') : `book ${roman(n)}`;
 	const where = (c: pics.PictureCollection) => {
 		if (c.leaf) {
 			const pin = c.leaf.pinned ? 'pinned' : c.leaf.book_pinned ? 'book pinned' : 'auto';
-			return `book ${roman(c.leaf.book)} leaf ${c.leaf.position} / ${pin}`;
+			return `${bookOf(c, c.leaf.book)} leaf ${c.leaf.position} / ${pin}`;
 		}
 		if (c.request) {
-			const want = c.request.book ? ` ${roman(c.request.book)}${c.request.position ? ` ${c.request.position}` : ''}` : '';
+			const b = c.request.book;
+			const want =
+				b !== null
+					? ` ${b === 0 ? c.loose_title : roman(b)}${c.request.position ? ` ${c.request.position}` : ''}`
+					: '';
 			return `unfiled${want}${c.request.error ? ` / ${c.request.error}` : ''}`;
 		}
 		return '';
@@ -331,12 +338,13 @@
 							{#each Array.from({ length: c.book_count }, (_, k) => k + 1) as n (n)}
 								<option value={String(n)}>{roman(n)}</option>
 							{/each}
+							{#if c.loose_title !== null}<option value="0">{c.loose_title}</option>{/if}
 						</select>
 						<input
 							class="num"
 							type="number"
 							min="1"
-							max={c.leaves_per_book}
+							max={filing[c.slug]?.book === '0' ? undefined : c.leaves_per_book}
 							placeholder="leaf"
 							aria-label="leaf"
 							bind:value={filing[c.slug].leaf}

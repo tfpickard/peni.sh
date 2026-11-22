@@ -137,6 +137,52 @@ async def test_sidecar_pins_book_and_leaf(p: Any, settings: Settings) -> None:
 
 
 @pytest.mark.parametrize(
+    ("line", "want"),
+    [
+        # n is nulla, the medieval zero: in the collection, in no book.
+        ("pansophicon n", [(0, 1, True, False), (0, 2, True, False)]),
+        ("pansophicon 0", [(0, 1, True, False), (0, 2, True, False)]),
+        # A number given is the owner's, past 77 if need be: the loose leaves have no cap.
+        ("pansophicon n 90", [(0, 90, True, True)]),
+    ],
+)
+async def test_sidecar_files_into_the_loose_leaves(
+    p: Any, settings: Settings, line: str, want: list[tuple[int, int, bool, bool]]
+) -> None:
+    ids = []
+    for n, _ in enumerate(want, start=1):
+        await run(drop(settings, f"loose{n}", png(n), collection=line), p, settings)
+        img = (await q(p, "select id from images order by id desc limit 1"))[0]
+        await file(p, settings, img["id"])
+        ids.append(img["id"])
+    got = await leaves(p)
+    # In the order they came.
+    assert [got[i] for i in ids] == want
+    h = await history(p)
+    assert all((r["to_book"], r["chosen_by"]) == (0, "owner") for r in h)
+
+
+async def test_resort_leaves_loose_leaves_alone(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    c = await collection(p)
+    a = await picture(p, settings, 50, e(2))
+    async with p.connection() as conn:
+        await store.request(conn, c, a, 0, None)
+    await file(p, settings, a)
+    # Unpinned from the owner's hand, it is still no book's to take.
+    async with p.connection() as conn:
+        await store.set_pin(conn, c, a, False, settings)
+    assert (await leaves(p))[a] == (0, 1, False, False)
+    ids = await _filed(p, settings, [e(2), e(2, 3)])
+    async with p.connection() as conn:
+        moves = await store.resort(conn, c, settings, dry_run=False)
+    assert all(m.image_id != a for m in moves)
+    got = await leaves(p)
+    assert got[a] == (0, 1, False, False)
+    assert all(got[i][0] != 0 for i in ids)
+
+
+@pytest.mark.parametrize(
     ("line", "why"),
     [
         ("pansophicon viii", "no book viii"),

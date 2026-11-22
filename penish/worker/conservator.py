@@ -20,7 +20,7 @@ import jsonschema
 
 from penish import runtime
 from penish.collection import store
-from penish.collection.numerals import roman
+from penish.collection.numerals import LOOSE, book_name, roman
 from penish.config import Settings
 from penish.text import no_em_dash
 from penish.worker.describe import (
@@ -83,18 +83,28 @@ def facts(ctx: store.NoteContext) -> str:
             lines.append(f"{label}:")
             lines.extend(f"  {p}" for p in parts)
     lines.append("")
-    lines.append(
-        f"This leaf: book {roman(ctx.book)}, leaf {ctx.position} of {ctx.leaves_per_book}."
-    )
+
+    loose = book_name(LOOSE, ctx.loose_title)
+
+    def place(book: int, position: int) -> str:
+        # A loose leaf has no numeral and no count of leaves to be one of.
+        if book == LOOSE:
+            return f"in no book ({loose}), leaf {position}"
+        return f"book {roman(book)}, leaf {position}"
+
+    here = place(ctx.book, ctx.position)
+    if ctx.book != LOOSE:
+        here += f" of {ctx.leaves_per_book}"
+    lines.append(f"This leaf: {here}.")
     if ctx.previous is not None:
-        b, p = ctx.previous
-        lines.append(f"Earlier place in the sequence: book {roman(b)}, leaf {p}.")
+        lines.append(f"Earlier place in the sequence: {place(*ctx.previous)}.")
     lines.append("")
+    of = loose if ctx.book == LOOSE else f"book {roman(ctx.book)}"
     if ctx.book_notes:
-        lines.append(f"Notes already written for other leaves of book {roman(ctx.book)}:")
+        lines.append(f"Notes already written for other leaves of {of}:")
         lines.extend(f"leaf {pos}: {text}" for pos, text in ctx.book_notes)
     else:
-        lines.append(f"No other leaf of book {roman(ctx.book)} has a note yet.")
+        lines.append(f"No other leaf of {of} has a note yet.")
     return "\n".join(lines)
 
 

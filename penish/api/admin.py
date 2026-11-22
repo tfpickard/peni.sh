@@ -25,7 +25,7 @@ from starlette.datastructures import UploadFile
 from penish import uploads
 from penish.api.media import variants_for_many
 from penish.collection.numerals import Request as Filing
-from penish.collection.numerals import format_line, parse_line, parse_number
+from penish.collection.numerals import format_line, parse_book, parse_line, parse_number
 from penish.config import Settings, get_settings
 
 MAX_BYTES = 50 * 1024 * 1024
@@ -263,11 +263,11 @@ def _collection_line(collection: object, book: object, leaf: object) -> str | No
     if not isinstance(collection, str) or not collection.strip():
         return None
 
-    def num(v: object) -> int | None:
+    def num(v: object, parse: Callable[[str], int] = parse_number) -> int | None:
         if not isinstance(v, str) or not v.strip():
             return None
         try:
-            return parse_number(v)
+            return parse(v)
         except ValueError:
             raise HTTPException(status_code=422, detail="bad leaf") from None
 
@@ -275,7 +275,8 @@ def _collection_line(collection: object, book: object, leaf: object) -> str | No
         req = parse_line(collection)
     except ValueError:
         raise HTTPException(status_code=422, detail="bad collection") from None
-    b, n = num(book), num(leaf)
+    # The book may be 0, the loose leaves; a leaf never is.
+    b, n = num(book, parse_book), num(leaf)
     if n is not None and b is None:
         raise HTTPException(status_code=422, detail="a leaf needs a book")
     return format_line(Filing(req.collection, b, n))

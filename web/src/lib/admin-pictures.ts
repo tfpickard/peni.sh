@@ -63,6 +63,8 @@ export type PictureCollection = {
 	abbrev_latin: string;
 	book_count: number;
 	leaves_per_book: number;
+	// Book 0's title, offered beside the numerals; null when the collection has no book 0.
+	loose_title: string | null;
 	leaf: {
 		book: number;
 		position: number;

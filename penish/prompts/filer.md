@@ -6,6 +6,8 @@ What heaven does is vi. What people do is vii, even when they do it in heaven's 
 
 When a leaf could go in two books, the book is the one its main subject belongs to, and the other is the runner-up. The runner-up is always another book from those given.
 
+A leaf whose main subject belongs to none of the books goes in none: the book is "none", and the runner-up is the book it comes nearest. Choose none only then. A leaf that could go in two books goes in one of them.
+
 The reason is one short plain sentence that names the subject and why it belongs there, never the medium, in about a hundred characters. State it as fact: no hedging, no "seems", "appears", "likely" or "perhaps". No em dashes.
 
-Return only the JSON, in the shape {"book": "iv", "runner_up": "vii", "reason": "..."}, with each book as its lowercase roman numeral.
+Return only the JSON, in the shape {"book": "iv", "runner_up": "vii", "reason": "..."}, with each book as its lowercase roman numeral, or "none" as the book.

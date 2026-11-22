@@ -141,6 +141,145 @@ async def test_book_has_every_slot(client: httpx.AsyncClient, clean_db: str) -> 
     assert page.status_code == 200 and "ΠΤΠ iii" in page.text
 
 
+# -- incertae sedis: the loose leaves (book 0) --------------------------------------
+
+
+async def test_loose_leaves_row_and_counts(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    b = add(clean_db, 2, vec=[0, 1, 0, 0])
+    c = add(clean_db, 3, vec=[0, 0, 1, 0])
+    leaf(clean_db, a, 3, 14)
+    publish(clean_db)
+    # None loose yet: seven rows, as ever.
+    got = (await client.get(f"{PUB}/{SLUG}")).json()
+    assert [bk["number"] for bk in got["books"]] == list(range(1, 8))
+    leaf(clean_db, b, 0, 4)
+    leaf(clean_db, c, 0, 1)
+    # The books' count is the books'; capacity stays seven of seventy-seven.
+    head = (await client.get(PUB)).json()["collections"][0]
+    assert (head["leaves"], head["capacity"], head["book_count"]) == (1, 539, 7)
+    got = (await client.get(f"{PUB}/{SLUG}")).json()
+    assert got["leaves"] == 1
+    assert [bk["number"] for bk in got["books"]] == [1, 2, 3, 4, 5, 6, 7, 0]
+    loose = got["books"][-1]
+    assert loose["title"] == "incertae sedis"
+    assert [(x["position"], x["slug"]) for x in loose["leaves"]] == [(1, "img-3"), (4, "img-2")]
+
+
+async def test_loose_leaves_page(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    b = add(clean_db, 2, vec=[0, 1, 0, 0])
+    leaf(clean_db, a, 0, 4)
+    leaf(clean_db, b, 0, 120)
+    publish(clean_db)
+    r = (await client.get(f"{PUB}/{SLUG}/books/0")).json()
+    # No frame of 77: the leaves there are, in number order, past 77 if need be.
+    assert (r["number"], r["title"]) == (0, "incertae sedis")
+    assert [(s["position"], s["slug"]) for s in r["slots"]] == [(4, "img-1"), (120, "img-2")]
+    assert r["collection"]["leaves"] == 0
+    page = await client.get(f"/collections/{SLUG}/0")
+    assert page.status_code == 200 and "ΠΤΠ incertae sedis" in page.text
+    # Its title is the owner's, on the page as anywhere.
+    sql(clean_db, "update collection_books set title = 'sine loco' where number = 0")
+    page = await client.get(f"/collections/{SLUG}/0")
+    assert "ΠΤΠ sine loco" in page.text
+    # A collection with no place for loose leaves has no such page.
+    sql(clean_db, "delete from collection_leaves")
+    sql(clean_db, "delete from collection_books where number = 0")
+    assert (await client.get(f"{PUB}/{SLUG}/books/0")).status_code == 404
+    assert (await client.get(f"/collections/{SLUG}/0")).status_code == 404
+
+
+async def test_a_loose_leaf_on_its_picture_page(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    b = add(clean_db, 2, vec=[0, 1, 0, 0])
+    leaf(clean_db, a, 0, 4)
+    moved(clean_db, a, None, (0, 4))
+    leaf(clean_db, b, 3, 14)
+    moved(clean_db, b, (0, 4), (3, 14))
+    publish(clean_db)
+    # The line names the loose leaves by the title it is given (`ptp incertae sedis, leaf 4`),
+    # and a leaf once loose says so (`formerly ptp incertae sedis, leaf 4`).
+    got = (await client.get("/api/images/img-1")).json()["leaf"]
+    assert (got["book"], got["position"], got["previous"]) == (0, 4, None)
+    assert got["collection"]["loose_title"] == "incertae sedis"
+    got = (await client.get("/api/images/img-2")).json()["leaf"]
+    assert (got["book"], got["previous"]) == (3, {"book": 0, "position": 4})
+    # Strips carry the title too: img-2's neighbours include the loose img-1.
+    near = (await client.get("/api/images/img-2")).json()
+    refs = [x["leaf"] for k in ("similar", "dissimilar") for x in near.get(k, []) if x.get("leaf")]
+    assert refs and all(r["book"] == 0 for r in refs)
+    assert all(r["collection"]["loose_title"] == "incertae sedis" for r in refs)
+
+
+async def test_the_week_line_names_a_loose_leaf(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    leaf(clean_db, a, 0, 4)
+    moved(clean_db, a, (2, 9), (0, 4))
+    publish(clean_db)
+    got = (await client.get("/api/stats")).json()["changed"]
+    assert (got["book"], got["position"], got["from"]) == (0, 4, {"book": 2, "position": 9})
+    assert got["collection"]["loose_title"] == "incertae sedis"
+
+
+async def test_admin_loose_leaves(client: httpx.AsyncClient, clean_db: str) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    b = add(clean_db, 2, vec=[0, 1, 0, 0])
+    leaf(clean_db, a, 3, 14)
+    leaf(clean_db, b, 0, 1)
+    d = (await client.get(f"{ADM}/{SLUG}")).json()
+    assert d["loose_title"] == "incertae sedis"
+    last = d["books"][-1]
+    assert (last["number"], last["title"], last["anchor_state"], last["hint_leaves"]) == (
+        0,
+        "incertae sedis",
+        None,
+        {},
+    )
+    assert [x["image_id"] for x in last["leaves"]] == [b]
+    listed = (await client.get(ADM)).json()["collections"][0]
+    assert listed["loose_title"] == "incertae sedis"
+    # The owner moves a leaf out of a book into the loose leaves, and gives one a number.
+    r = await client.put(f"{ADM}/{SLUG}/leaves/{a}", json={"book": 0})
+    assert r.status_code == 200
+    assert places(clean_db)[a] == (0, 2)
+    r = await client.put(f"{ADM}/{SLUG}/leaves/{a}", json={"book": 0, "position": 1})
+    # The leaf the filer had at 1 goes to the end, which a's leaving 2 has made 2.
+    assert places(clean_db) == {a: (0, 1), b: (0, 2)}
+    # Pinned there, it cannot be pushed aside; moving out leaves its number empty.
+    assert (
+        await client.put(f"{ADM}/{SLUG}/leaves/{b}", json={"book": 0, "position": 1})
+    ).json() == {"detail": "incertae sedis leaf 1 is taken"}
+    r = await client.put(f"{ADM}/{SLUG}/leaves/{a}", json={"book": 2})
+    # Out again: its number stays a gap, and nobody is renumbered into it.
+    assert places(clean_db) == {a: (2, 1), b: (0, 2)}
+    # A title and nothing else.
+    r = await client.patch(f"{ADM}/{SLUG}/books/0", json={"title": "sine loco"})
+    assert r.json()["loose_title"] == "sine loco"
+    r = await client.patch(
+        f"{ADM}/{SLUG}/books/0", json={"title": "sine loco", "anchor_text": "", "tag_hints": []}
+    )
+    assert r.status_code == 200
+    for bad in ({"anchor_text": "Things."}, {"tag_hints": ["x"]}, {"title": " "}):
+        assert (await client.patch(f"{ADM}/{SLUG}/books/0", json=bad)).status_code == 422
+    assert sql(clean_db, "select count(*) from jobs where type = 'collection_anchor'") == [(0,)]
+
+
+async def test_admin_files_a_picture_straight_into_the_loose_leaves(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    a = add(clean_db, 1, vec=[1, 0, 0, 0])
+    r = await client.put(f"{ADM}/{SLUG}/leaves/{a}", json={"book": 0, "position": 300})
+    assert r.status_code == 200 and r.json()["requests"][0]["book"] == 0
+    d = (await client.get(f"/api/admin/pictures/{a}")).json()["collections"][0]
+    assert d["request"]["book"] == 0
+    sql(clean_db, "delete from collection_requests")
+    sql(clean_db, "delete from collection_books where number = 0")
+    assert (await client.put(f"{ADM}/{SLUG}/leaves/{a}", json={"book": 0})).json() == {
+        "detail": "no book 0"
+    }
+
+
 async def test_picture_leaf_and_previous(client: httpx.AsyncClient, clean_db: str) -> None:
     a = add(clean_db, 1, vec=[1, 0, 0, 0])
     leaf(clean_db, a, 3, 14)
@@ -153,6 +292,7 @@ async def test_picture_leaf_and_previous(client: httpx.AsyncClient, clean_db: st
             "title": "Πανσοφικὸν τῶν πάντων",
             "abbrev": "ΠΤΠ",
             "abbrev_latin": "PTP",
+            "loose_title": "incertae sedis",
         },
         "book": 3,
         "position": 14,
@@ -321,7 +461,17 @@ async def test_anchor_state_and_when(client: httpx.AsyncClient, clean_db: str, p
     sql(clean_db, "update collection_books set anchor_embedding = null where number = 3")
     d = (await client.get(f"{ADM}/{SLUG}")).json()
     states = [b["anchor_state"] for b in d["books"]]
-    assert states == ["embedded", "stale", "stale", "embedded", "embedded", "embedded", "embedded"]
+    # The loose leaves come last, with no anchor to have a state.
+    assert states == [
+        "embedded",
+        "stale",
+        "stale",
+        "embedded",
+        "embedded",
+        "embedded",
+        "embedded",
+        None,
+    ]
     # Embedded before the time was kept.
     assert d["books"][0]["anchor_embedded_at"] is None
 
@@ -724,6 +874,7 @@ async def test_admin_picture_shows_collections(client: httpx.AsyncClient, clean_
             "abbrev_latin": "PTP",
             "book_count": 7,
             "leaves_per_book": 77,
+            "loose_title": "incertae sedis",
             "leaf": None,
             "request": None,
         }

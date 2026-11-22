@@ -14,7 +14,7 @@ from fastapi import APIRouter, Request, Response
 from penish.api.index import SITE, summary
 from penish.api.media import preview_image
 from penish.categories import SLUGS as CATEGORY_SLUGS
-from penish.collection.numerals import roman
+from penish.collection.numerals import LOOSE, book_name
 from penish.mycelium.store import galleries_public
 
 router = APIRouter()
@@ -97,9 +97,14 @@ async def _sitemap_urls(conn: Any) -> list[tuple[str, datetime | None]]:
             "select b.number, (select max(l.updated_at) from collection_leaves l"
             "  join images i on i.id = l.image_id"
             f" where l.collection_id = b.collection_id and l.book = b.number and {_LIVE}) as at"
-            " from collection_books b where b.collection_id = %s order by b.number",
+            " from collection_books b where b.collection_id = %s order by b.number = %s, b.number",
             c["id"],
+            LOOSE,
         ):
+            # The loose leaves' page is listed only while it has a leaf to show, as the
+            # collection page shows its row.
+            if b["number"] == LOOSE and b["at"] is None:
+                continue
             urls.append((f"/collections/{c['slug']}/{b['number']}", b["at"]))
     return urls
 
@@ -138,7 +143,9 @@ _LEAVES = f"""
       select distinct on (h.image_id, h.collection_id)
              h.id as history_id, h.at, i.id, i.slug, i.pub_sha, i.width, i.height,
              c.body as caption, d.body as description,
-             l.note, co.abbrev_latin, l.book, l.position
+             l.note, co.abbrev_latin, l.book, l.position,
+             (select b.title from collection_books b
+               where b.collection_id = co.id and b.number = %s) as loose_title
         from collection_leaf_history h
         join collections co on co.id = h.collection_id and co.published
         join collection_leaves l on l.image_id = h.image_id and l.collection_id = h.collection_id
@@ -171,8 +178,9 @@ async def _feed_entries(conn: Any, base: str) -> list[dict[str, Any]]:
     for r in await _rows(conn, _PICTURES, FEED_SIZE):
         text = summary(r["description"], _WHOLE) if r["description"] else None
         entries.append(_entry(base, r, id_=f"{_TAG}picture/{r['id']}", at=r["at"], text=text))
-    for r in await _rows(conn, _LEAVES, FEED_SIZE):
-        line = f"{r['abbrev_latin'].lower()} {roman(r['book'])}, leaf {r['position']}"
+    for r in await _rows(conn, _LEAVES, LOOSE, FEED_SIZE):
+        book = book_name(r["book"], r["loose_title"])
+        line = f"{r['abbrev_latin'].lower()} {book}, leaf {r['position']}"
         # The note when there is one, as on the leaf's page.
         body = r["note"] if r["note"] and r["note"].strip() else r["description"]
         text = f"{line}\n{summary(body, _WHOLE)}" if body else line

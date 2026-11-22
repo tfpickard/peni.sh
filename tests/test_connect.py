@@ -16,7 +16,8 @@ from tests.test_api_images import add_image, client, unit  # noqa: F401
 from tests.test_collections_api import SLUG, leaf, moved, publish
 from tests.test_galleries_api import colony, public
 
-LINE = {"slug": SLUG, "abbrev": "ΠΤΠ", "abbrev_latin": "PTP"}
+# loose_title names book 0 (incertae sedis) where a line would put a numeral.
+LINE = {"slug": SLUG, "abbrev": "ΠΤΠ", "abbrev_latin": "PTP", "loose_title": "incertae sedis"}
 
 
 @pytest.fixture(autouse=True)

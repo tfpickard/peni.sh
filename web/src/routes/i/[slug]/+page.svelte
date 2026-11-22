@@ -8,10 +8,9 @@
 	import Comments from '../../../lib/components/Comments.svelte';
 	import Overlap from '../../../lib/components/Overlap.svelte';
 	import PtpLogo from '../../../lib/components/PtpLogo.svelte';
-	import { leafLine } from '../../../lib/components/LeafLine.svelte';
+	import { bookName, leafLine } from '../../../lib/components/LeafLine.svelte';
 	import { postView } from '../../../lib/api';
 	import { markViewed } from '../../../lib/viewed';
-	import { roman } from '../../../lib/roman';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -34,7 +33,7 @@
 				? null
 				: p.book === l.book
 					? `formerly leaf ${p.position}`
-					: `formerly ${abbrev} ${roman(p.book)}, leaf ${p.position}`
+					: `formerly ${abbrev} ${bookName(l.collection, p.book)}, leaf ${p.position}`
 		};
 	});
 	const sizes = '(min-width: 60rem) 57rem, 100vw';

@@ -341,9 +341,10 @@ Where the spec left a choice open, or guessed at the repo, this is what was done
   forward then back, keeping chain order.
 - With no pins, one leaf sits at leaf 1, two at 1 and 77, and more spread between.
 - A pin onto an auto leaf moves the auto leaf aside (history reason `auto`). A pin onto a
-  pinned leaf, a pin into a full book, and a filing when every book is full are refused;
-  the reason stays on the request for the admin (`book iii leaf 14 is taken`), and the job
-  completes rather than retrying.
+  pinned leaf and a pin into a full book are refused; the reason stays on the request for
+  the admin (`book iii leaf 14 is taken`), and the job completes rather than retrying. A
+  filing when every book is full goes to incertae sedis (see below); only a collection with
+  no book 0 refuses it.
 - A malformed sidecar, an unknown collection, or a book or leaf outside the collection's
   shape becomes a failed `collection_file` job on `/admin/queue` with
   `collection sidecar: ...`. The picture publishes regardless.
@@ -384,7 +385,8 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
   reason is one line of at most 200 characters (an em dash in it is made `--`). Anything
   else, a refusal, an error or no answer in 60 seconds is a failure, and the filing goes by
   score. Whether the named book has room is checked after the answer: a filing into a full
-  book goes by score with `full`, and re-judging holds the leaf with `full`.
+  book, and a re-judged leaf whose book stays full, go to incertae sedis (see below). The
+  answer may also be `none`.
 - Settings on `/admin/models`: `filer.model` (default `claude-haiku-5-5`, the
   `FILER_MODEL` env var; Haiku did best in the trial and costs least), `filer.prompt`, and
   `filer.judge` (on by default; off, nothing asks: a filing goes by score, the re-judging
@@ -403,7 +405,8 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
   `chosen_by='judge'`, and `scores` keeps the weighing with `judge: {model, book,
   runner_up, reason}`. Otherwise the scores choose, and `scores.judge` says why not
   (`{error: "off" | "no text" | "refused" | "invalid" | "timeout" | "error" | "full"}`,
-  `full` being a book with no room when the lock is taken), with a log line. The
+  `full` being a book with no room when the lock is taken, in a collection with no book 0),
+  with a log line. The
   slot within the book is chosen as before. An owner's book never asks.
 - A leaf whose latest book decision in history is `judge` keeps its book in every vector
   re-sort, the owner's and the weekly one, as a `book_pinned` leaf does; it may still move
@@ -416,8 +419,8 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
   every leaf whose judged book is not its own, moved into a free slot of that book, chosen
   among the free slots as the filer would. No leaf that keeps its book changes its slot,
   so a number the owner gave stands. Each book move comes with
-  the judge's `reason` and `runner_up`. `held` lists what stays: a leaf whose judged book
-  is full (`book`, `why: "full"`), and one the judge did not judge (`why` is the failure,
+  the judge's `reason` and `runner_up`. `held` lists what stays: a loose leaf whose judged
+  book is full (`book`, `why: "full"`), and one the judge did not judge (`why` is the failure,
   `no text` or `no vector`). 409 `anchors` as the re-sort's dry run. `{"dry_run": false,
   plan_id, moves}` applies exactly that plan or answers 409 `changed`; the id covers the
   collection's state and the question behind each book move. Applied book moves are
@@ -444,6 +447,48 @@ they show (`docs/reports/ptp-filing.md`). So a model reads each new leaf and nam
   refused for an owner note, and clearing a note hands the leaf back.
 - `explain` returns `judged` (the judge chose its book), `filed.scores.judge` for a judged
   filing, and `judgement`: the kept answer for the leaf as it is now, or null.
+
+### Incertae sedis
+
+Leaves that are part of the Pansophicon but belong to none of its seven books. Membership
+stands; a place in a book does not exist. This is not unfiled (a request not placed yet,
+never public) and not unfiling (out of the collection).
+
+- Storage: book 0. `migrations/028_incertae_sedis.sql` relaxes the `collection_books.number`
+  check to `>= 0` and adds the Pansophicon's row with `title = 'incertae sedis'`, no anchor,
+  no vector, no hints. 0 rather than 8, so a book inferred later can take viii. The title is
+  the owner's from then on; it cannot be cleared, since nothing else names the row.
+  `book_count` stays 7. In code it is `LOOSE` (`penish/collection/numerals.py`).
+- No cap, accession order: a leaf arriving takes the number after the highest there. Its
+  numbers are never laid along a chain, and a leaf leaving leaves a gap. The owner may give
+  a leaf a number there; a leaf the filer put at that number goes to the end.
+- The vector filer never chooses it, scores it, counts it toward fill, or moves a leaf into
+  or out of it, in a filing or any re-sort. Its row is not in `Shape.books`, has no anchor
+  job, and is not shown to the judge. A re-sort plan that came back over the wire moving a
+  leaf across it, or renumbering one in it, is refused.
+- Who files there: the owner (move, pin, the upload form, the admin picture page, the
+  sidecar line `pansophicon n` or `pansophicon 0`, with a leaf: `pansophicon n 4`); the
+  judge, whose answer may be `"none"` (the runner-up is still a book: the nearest); and
+  overflow. A filing whose judged book is full goes there rather than into another book
+  (`chosen_by='judge'`, `scores.full` the book that was full), and so does a filing with
+  every book full (`chosen_by='score'`). A collection with no book 0 refuses as before.
+- Re-judging: a verdict of none for a leaf in a book moves it there; a verdict naming a book
+  for a loose leaf moves it into that book when there is room. A leaf whose judged book stays
+  full is made loose rather than left in a book the judge said is not its own, and held
+  `full` only when it is loose already. `book_pinned` leaves never move.
+- Public: after the seven books the collection page has one more row, its title alone
+  (no numeral), with its count and strip, linking to `/collections/pansophicon/0`. It is
+  absent while it has no leaves. `N of 539 leaves` counts books i to vii only. Its page lists
+  its leaves in number order with no 77-slot frame (the API sends only the filled ones),
+  server title `ΠΤΠ incertae sedis`, and is in the sitemap while it has a leaf. The leaf
+  line reads `ptp incertae sedis, leaf 4`, and a leaf once there `ptp iii, leaf 14
+  (formerly ptp incertae sedis, leaf 4)`; leaf payloads carry `collection.loose_title` so
+  no title is written into the web. Search does not resolve `0 4`.
+- The conservator is told `This leaf: in no book (incertae sedis), leaf 4.`
+- Admin: the row follows the books as its own section, title only, its leaves drawn as they
+  are (no empty cells), with the same pin, move, unfile and note actions. Every book picker
+  offers it by title; moves, held leaves, history and explain name it by title. Explain
+  scores books i to vii only.
 
 ### Site
 

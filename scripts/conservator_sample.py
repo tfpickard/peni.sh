@@ -105,6 +105,7 @@ async def notes(args: argparse.Namespace, settings: Any, pool: Any) -> int:
             book=leaf["book"],
             position=leaf["position"],
             leaves_per_book=77,
+            loose_title=leaf["collection"].get("loose_title"),
             note=None,
             note_source=None,
             previous=(prev["book"], prev["position"]) if prev else None,
