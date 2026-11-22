@@ -3,9 +3,11 @@
     pansophicon            file it
     pansophicon iii        pin to book iii, the filer picks the leaf
     pansophicon iii 14     pin to book iii, leaf 14
+    pansophicon n          in no book: incertae sedis (`0` as well)
 
-Either number may be roman or arabic. Ranges are checked later, against the collection's
-row: this module knows the grammar, not the shape of any one collection.
+Either number may be roman or arabic, and the book may be `n`, the medieval zero. Ranges
+are checked later, against the collection's row: this module knows the grammar, not the
+shape of any one collection.
 """
 
 from __future__ import annotations
@@ -29,6 +31,11 @@ _ROMAN = (
     (1, "i"),
 )
 _SLUG = re.compile(r"^[a-z0-9-]{1,40}$")
+# The book number of the leaves that belong to none of the books: in the collection, placed
+# nowhere in it. 0 rather than one past the last book, so a book found later can take that.
+LOOSE = 0
+# What the loose leaves are called when their row has no title to give.
+LOOSE_TITLE = "incertae sedis"
 
 
 def roman(n: int) -> str:
@@ -41,6 +48,12 @@ def roman(n: int) -> str:
             out.append(glyph)
             n -= value
     return "".join(out)
+
+
+def book_name(n: int, loose_title: str | None) -> str:
+    """A book as a line names it: its numeral, or for the loose leaves their title, since
+    they have no numeral."""
+    return (loose_title or LOOSE_TITLE) if n == LOOSE else roman(n)
 
 
 def parse_number(token: str) -> int:
@@ -64,6 +77,14 @@ def parse_number(token: str) -> int:
     return total
 
 
+def parse_book(token: str) -> int:
+    """A book number as parse_number reads it, or LOOSE for `0` or `n` (nulla)."""
+    t = token.strip().lower()
+    if t == "n" or (t.isascii() and t.isdigit() and int(t) == 0):
+        return LOOSE
+    return parse_number(token)
+
+
 @dataclass(frozen=True)
 class Request:
     collection: str
@@ -84,7 +105,7 @@ def parse_line(text: str) -> Request:
     slug = tokens[0]
     if not _SLUG.fullmatch(slug):
         raise ValueError(f"{tokens[0]!r} is not a collection")
-    book = parse_number(tokens[1]) if len(tokens) > 1 else None
+    book = parse_book(tokens[1]) if len(tokens) > 1 else None
     position = parse_number(tokens[2]) if len(tokens) > 2 else None
     return Request(slug, book, position)
 
@@ -92,7 +113,7 @@ def parse_line(text: str) -> Request:
 def format_line(req: Request) -> str:
     parts = [req.collection]
     if req.book is not None:
-        parts.append(roman(req.book))
+        parts.append("n" if req.book == LOOSE else roman(req.book))
         if req.position is not None:
             parts.append(str(req.position))
     return " ".join(parts)

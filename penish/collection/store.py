@@ -22,7 +22,7 @@ from psycopg.types.json import Jsonb
 
 from penish.collection import judge
 from penish.collection.judge import Failed, Judgement, ShownBook, Texts, Verdict
-from penish.collection.numerals import parse_line, roman
+from penish.collection.numerals import LOOSE, book_name, parse_line, roman
 from penish.collection.plan import (
     Book,
     Leaf,
@@ -104,6 +104,16 @@ class State:
     leaves: list[Leaf]
     # Centering for vectors that join later (the picture being filed).
     mean: np.ndarray | None
+    # The loose leaves' title; None when the collection has no place for them.
+    loose_title: str | None = None
+
+    @property
+    def has_loose(self) -> bool:
+        return self.loose_title is not None
+
+    def name(self, book: int) -> str:
+        """`book iii`, or the loose leaves' title, for a refusal the admin shows."""
+        return book_name(book, self.loose_title) if book == LOOSE else f"book {roman(book)}"
 
     def leaf(self, image_id: int) -> Leaf | None:
         return next((x for x in self.leaves if x.image_id == image_id), None)
@@ -113,6 +123,16 @@ class State:
 
 
 # -- reading ---------------------------------------------------------------------
+
+
+async def loose_title(conn: Conn, collection_id: int) -> str | None:
+    """The loose leaves' title, or None when the collection has no place for them."""
+    cur = await conn.execute(
+        "select title from collection_books where collection_id = %s and number = %s",
+        (collection_id, LOOSE),
+    )
+    row = await cur.fetchone()
+    return None if row is None else book_name(LOOSE, row["title"])
 
 
 async def collection_by_slug(conn: Conn, slug: str) -> dict[str, Any] | None:
@@ -173,16 +193,20 @@ async def load(conn: Conn, collection: dict[str, Any], settings: Settings) -> St
     params = {"c": collection["id"], "m": settings.embed_model, "d": settings.embed_dim}
     cur = await conn.execute(
         """
-        select number, case when anchor_model = %(m)s and anchor_dim = %(d)s
-                            then anchor_embedding::real[] end as anchor,
+        select number, title, case when anchor_model = %(m)s and anchor_dim = %(d)s
+                                   then anchor_embedding::real[] end as anchor,
                tag_hints
           from collection_books where collection_id = %(c)s order by number
         """,
         params,
     )
+    rows = await cur.fetchall()
+    # The loose leaves' row is no book, so the planner never sees it.
+    loose = next((r for r in rows if r["number"] == LOOSE), None)
     books = [
         Book(r["number"], _prep(r["anchor"], mean), frozenset(r["tag_hints"] or ()))
-        for r in await cur.fetchall()
+        for r in rows
+        if r["number"] != LOOSE
     ]
     cur = await conn.execute(
         """
@@ -217,7 +241,8 @@ async def load(conn: Conn, collection: dict[str, Any], settings: Settings) -> St
         for r in await cur.fetchall()
     ]
     shape = Shape(books, int(collection["leaves_per_book"]), Tuning.from_json(collection["tuning"]))
-    return State(collection, shape, leaves, mean)
+    title = None if loose is None else book_name(LOOSE, loose["title"])
+    return State(collection, shape, leaves, mean, title)
 
 
 async def _candidate(
@@ -325,9 +350,13 @@ async def _history(conn: Conn, collection_id: int, m: Move) -> None:
 
 
 def _check_shape(collection: dict[str, Any], book: int | None, position: int | None) -> None:
-    if book is not None and not 1 <= book <= int(collection["book_count"]):
+    """Within the collection's shape. The loose leaves have no cap; whether the collection
+    has a place for them is for the caller, which can read the row."""
+    if book is not None and book != LOOSE and not 1 <= book <= int(collection["book_count"]):
         raise Refused(f"no book {roman(book) if book >= 1 else book}")
-    if position is not None and not 1 <= position <= int(collection["leaves_per_book"]):
+    if position is not None and position < 1:
+        raise Refused(f"no leaf {position}")
+    if position is not None and book != LOOSE and position > int(collection["leaves_per_book"]):
         raise Refused(f"no leaf {position}")
     if position is not None and book is None:
         raise Refused("a leaf needs a book")
@@ -347,10 +376,14 @@ def choose(
     verdict: Verdict | None = None,
 ) -> Choice:
     """Which book a picture is filed into: the owner's when given, else the judge's when it
-    gave one for a book that still has room, else the best score among books with room.
+    gave one (none being the loose leaves), else the best score among books with room.
     Every filing decides here. `verdict` was asked before the lock was taken; nothing here
     calls a model. The scores are kept either way, so the admin can show what the filer
-    thought of a book the owner or the judge chose, and why the judge did not decide."""
+    thought of a book the owner or the judge chose, and why the judge did not decide.
+
+    A leaf with no book to go to is loose rather than refused: the judge's book full, or
+    every book full. It is refused only where the collection has no place for loose leaves.
+    """
     others = [x for x in state.leaves if x.image_id != image_id]
     w = weigh(state.shape, others, vec, tags) if vec is not None else None
     scores = _record(w, state.shape.tuning) if w is not None else None
@@ -358,13 +391,27 @@ def choose(
         return Choice(book, "owner", scores)
     if vec is None:
         raise Refused("no vector")
-    if w is None:
-        raise Refused("every book is full")
-    if isinstance(verdict, Judgement) and verdict.book in w.terms:
-        return Choice(verdict.book, "judge", {**(scores or {}), "judge": verdict.to_json()})
     if isinstance(verdict, Judgement):
-        # The book filled between the question and the lock.
-        verdict = Failed("full", verdict.model, f"book {roman(verdict.book)}")
+        said = {**(scores or {}), "judge": verdict.to_json()}
+        if w is not None and verdict.book in w.terms:
+            return Choice(verdict.book, "judge", said)
+        if verdict.book == LOOSE and state.has_loose:
+            return Choice(LOOSE, "judge", said)
+        if verdict.book == LOOSE:
+            # A collection with no place for loose leaves: none is no answer here.
+            verdict = Failed("invalid", verdict.model, "none")
+        elif state.has_loose:
+            # The judge's book filled between the question and the lock. It still decided
+            # the leaf is in no other book; `full` says why it is not in that one.
+            return Choice(LOOSE, "judge", {**said, "full": verdict.book})
+        else:
+            verdict = Failed("full", verdict.model, state.name(verdict.book))
+    if w is None:
+        if not state.has_loose:
+            raise Refused("every book is full")
+        if verdict is not None:
+            scores = {**(scores or {}), "judge": verdict.to_json()}
+        return Choice(LOOSE, "score", scores)
     if verdict is not None:
         log.log(
             logging.INFO if verdict.error == "off" else logging.WARNING,
@@ -391,14 +438,23 @@ async def _place(
     """File or move one picture. A book given pins the book; a leaf given pins the leaf.
     With neither, the filer picks the book; then only its own book is re-laid."""
     _check_shape(state.collection, book, position)
+    if book == LOOSE and not state.has_loose:
+        raise Refused(f"no book {book}")
     current = state.leaf(image_id)
     pinned_book = book is not None
     if book is None and current is not None:
         return []
     choice = choose(state, image_id, vec, tags, book, verdict)
     book = choice.book
-    if state.occupied(book, besides=image_id) >= state.shape.cap:
-        raise Refused(f"book {roman(book)} is full")
+    if book != LOOSE and state.occupied(book, besides=image_id) >= state.shape.cap:
+        raise Refused(f"{state.name(book)} is full")
+    if book == LOOSE and position is None and current is not None and current.book == LOOSE:
+        # Loose already: a move with no number keeps the one it has rather than going to
+        # the end, as the loose leaves are never laid again.
+        position = current.position
+        pinned_leaf = current.pinned
+    else:
+        pinned_leaf = position is not None
     if position is not None:
         holder = next(
             (
@@ -409,7 +465,7 @@ async def _place(
             None,
         )
         if holder is not None and holder.pinned:
-            raise Refused(f"book {roman(book)} leaf {position} is taken")
+            raise Refused(f"{state.name(book)} leaf {position} is taken")
 
     before: dict[int, tuple[int, int] | None] = {
         x.image_id: (x.book, x.position) for x in state.leaves
@@ -422,7 +478,7 @@ async def _place(
         vec if current is None else current.vec,
         tags,
         book_pinned=pinned_book,
-        pinned=position is not None,
+        pinned=pinned_leaf,
         judged=choice.chosen_by == "judge",
     )
     state.leaves = [x for x in state.leaves if x.image_id != image_id] + [me]
@@ -679,18 +735,27 @@ async def plan(conn: Conn, collection: dict[str, Any], settings: Settings) -> Pl
         return Plan(plan_id(before, _plan_moves(moves)), moves, leads)
 
 
-def _check_plan(state: State, placement: Placement, *, hold_judged: bool = True) -> None:
+def _check_plan(state: State, placement: Placement, *, judged: bool = False) -> None:
     """A plan that came back over the wire still has to keep the owner's pins and the
-    book's shape, and a vector re-sort the judge's books; the id alone does not prove it
-    was ever made here."""
+    book's shape, and a vector re-sort the judge's books and the loose leaves as they are;
+    the id alone does not prove it was ever made here. `judged`: a re-judging, which may
+    move a leaf the judge chose, and into or out of the loose leaves."""
     books = {b.number for b in state.shape.books}
     for x in state.leaves:
         book, pos = placement[x.image_id]
         if x.pinned and (book, pos) != (x.book, x.position):
             raise Refused("bad plan")
-        if (x.book_pinned or (hold_judged and x.judged)) and book != x.book:
+        if (x.book_pinned or (not judged and x.judged)) and book != x.book:
             raise Refused("bad plan")
-        if book not in books or not 1 <= pos <= state.shape.cap:
+        if not judged and (book == LOOSE) != (x.book == LOOSE):
+            raise Refused("bad plan")
+        # No plan lays the loose leaves again: one that stays keeps its number.
+        if book == x.book == LOOSE and pos != x.position:
+            raise Refused("bad plan")
+        if book == LOOSE:
+            if not state.has_loose or pos < 1:
+                raise Refused("bad plan")
+        elif book not in books or not 1 <= pos <= state.shape.cap:
             raise Refused("bad plan")
     if len(set(placement.values())) != len(placement):
         raise Refused("bad plan")
@@ -847,19 +912,16 @@ async def _kept(
 
 def _judged_moves(moves: list[Move], verdicts: Mapping[int, Verdict]) -> list[Move]:
     """A move to another book is the judge's: its scores keep the weighing beside the
-    judgement. A leaf only shifted within its book decides nothing."""
+    judgement. A leaf only shifted within its book decides nothing. A leaf made loose
+    because its judged book is full says which, as a filing does."""
     out = []
     for m in moves:
         v = verdicts.get(m.image_id)
         if m.before and m.after and m.before[0] != m.after[0] and isinstance(v, Judgement):
-            m = Move(
-                m.image_id,
-                m.before,
-                m.after,
-                "resort",
-                "judge",
-                {**(m.scores or {}), "judge": v.to_json()},
-            )
+            said: dict[str, Any] = {**(m.scores or {}), "judge": v.to_json()}
+            if m.after[0] != v.book:
+                said["full"] = v.book
+            m = Move(m.image_id, m.before, m.after, "resort", "judge", said)
         out.append(m)
     return out
 
@@ -908,18 +970,33 @@ async def judge_plan(
             for i, v in sorted(verdicts.items())
             if isinstance(v, Judgement) and v.book != where[i]
         }
-        # Room a leaf leaves behind can let another in, so go round until nothing fits.
-        moved = True
-        while moved:
-            moved = False
-            for i, book in list(want.items()):
-                if room[book] < state.shape.cap:
-                    room[where[i]] -= 1
-                    room[book] += 1
-                    where[i] = book
-                    del want[i]
-                    moved = True
-        held = [Held(i, (here[i].book, here[i].position), book, "full") for i, book in want.items()]
+        # Room a leaf leaves behind can let another in, so go round until nothing fits. A
+        # leaf whose judged book stays full is loose instead, since the judge has said it is
+        # not in the book it is in; the room that leaves can let another in again.
+        while True:
+            moved = True
+            while moved:
+                moved = False
+                for i, book in list(want.items()):
+                    if book == LOOSE and not state.has_loose:
+                        continue
+                    if book == LOOSE or room[book] < state.shape.cap:
+                        room[where[i]] -= 1
+                        room[book] += 1
+                        where[i] = book
+                        del want[i]
+                        moved = True
+            overflow = [i for i in want if state.has_loose and where[i] != LOOSE]
+            if not overflow:
+                break
+            for i in overflow:
+                room[where[i]] -= 1
+                where[i] = LOOSE
+        held = [
+            Held(i, (here[i].book, here[i].position), book, "none" if book == LOOSE else "full")
+            for i, book in want.items()
+            if where[i] == here[i].book
+        ]
         held += [
             Held(i, (here[i].book, here[i].position), None, v.error)
             for i, v in sorted(verdicts.items())
@@ -971,9 +1048,10 @@ async def apply_judged(
             placement[image_id] = (int(after[0]), int(after[1]))
         for i in crossing:
             v = found.get(i)
-            if not isinstance(v, Judgement) or v.book != placement[i][0]:
+            # Its judged book, or loose because that book was full.
+            if not isinstance(v, Judgement) or placement[i][0] not in (v.book, LOOSE):
                 raise Refused("changed")
-        _check_plan(state, placement, hold_judged=False)
+        _check_plan(state, placement, judged=True)
         diff, _ = _diff(state, placement)
         verdicts: dict[int, Verdict] = {i: v for i, v in found.items() if v is not None}
         judged = _judged_moves(diff, verdicts)
@@ -1077,6 +1155,8 @@ async def request(
     still in ingest is queued when it goes live. `note` is an owner note, written to the
     leaf once it is filed."""
     _check_shape(collection, book, position)
+    if book == LOOSE and await loose_title(conn, collection["id"]) is None:
+        raise Refused(f"no book {book}")
     note = clean_note(note)
     await conn.execute(
         """
@@ -1297,6 +1377,8 @@ class NoteContext:
     book: int
     position: int
     leaves_per_book: int
+    # The loose leaves' title, for a leaf in no book.
+    loose_title: str | None
     note: str | None
     note_source: str | None
     # The latest earlier place, (book, position), when the leaf has moved.
@@ -1327,6 +1409,8 @@ async def note_context(conn: Conn, collection_id: int, image_id: int) -> NoteCon
         """
         select i.sha256, i.crop, c.record, c.leaves_per_book, l.book, l.position, l.note,
                l.note_source,
+               (select b.title from collection_books b
+                 where b.collection_id = c.id and b.number = %s) as loose_title,
                (select array[h.from_book, h.from_position]
                   from collection_leaf_history h
                  where h.image_id = l.image_id and h.collection_id = l.collection_id
@@ -1337,7 +1421,7 @@ async def note_context(conn: Conn, collection_id: int, image_id: int) -> NoteCon
           join collections c on c.id = l.collection_id
          where l.image_id = %s and l.collection_id = %s
         """,
-        (image_id, collection_id),
+        (LOOSE, image_id, collection_id),
     )
     row = await cur.fetchone()
     if row is None:
@@ -1362,6 +1446,7 @@ async def note_context(conn: Conn, collection_id: int, image_id: int) -> NoteCon
         book=int(row["book"]),
         position=int(row["position"]),
         leaves_per_book=int(row["leaves_per_book"]),
+        loose_title=row["loose_title"],
         note=row["note"],
         note_source=row["note_source"],
         previous=previous,
@@ -1376,12 +1461,12 @@ async def stale_anchors(conn: Conn, collection_id: int, settings: Settings) -> l
     cur = await conn.execute(
         """
         select number, anchor_text from collection_books
-         where collection_id = %(c)s and anchor_text <> ''
+         where collection_id = %(c)s and anchor_text <> '' and number <> %(loose)s
            and (anchor_embedding is null or anchor_model is distinct from %(m)s
                 or anchor_dim is distinct from %(d)s)
          order by number
         """,
-        {"c": collection_id, "m": settings.embed_model, "d": settings.embed_dim},
+        {"c": collection_id, "m": settings.embed_model, "d": settings.embed_dim, "loose": LOOSE},
     )
     return list(await cur.fetchall())
 
@@ -1410,6 +1495,8 @@ async def leaf_for_image(conn: Conn, image_id: int) -> dict[str, Any] | None:
     cur = await conn.execute(
         """
         select c.slug, c.title, c.abbrev, c.abbrev_latin, l.book, l.position, l.note,
+               (select b.title from collection_books b
+                 where b.collection_id = c.id and b.number = %s) as loose_title,
                (select row_to_json(h) from (
                   select from_book as book, from_position as position
                     from collection_leaf_history
@@ -1422,7 +1509,7 @@ async def leaf_for_image(conn: Conn, image_id: int) -> dict[str, Any] | None:
          order by c.id
          limit 1
         """,
-        (image_id,),
+        (LOOSE, image_id),
     )
     row = await cur.fetchone()
     if row is None:
@@ -1437,6 +1524,8 @@ async def leaf_for_image(conn: Conn, image_id: int) -> dict[str, Any] | None:
             "title": row["title"],
             "abbrev": row["abbrev"],
             "abbrev_latin": row["abbrev_latin"],
+            # What a line names in place of a numeral for a leaf in no book.
+            "loose_title": book_name(LOOSE, row["loose_title"]),
         },
         "book": row["book"],
         "position": row["position"],

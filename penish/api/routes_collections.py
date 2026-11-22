@@ -2,6 +2,9 @@
 
 Only published collections exist here; anything else is not here. Filing internals
 (anchors, tag hints, scores) never leave the database through these routes.
+
+The loose leaves (book 0, in no book) follow the books as a row of their own, named by
+their title alone. They are not counted against the books' capacity.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from penish.api.media import variants_for_many
 from penish.api.routes_images import grid_items
+from penish.collection.numerals import LOOSE
 from penish.collection.store import record_pairs
 from penish.mycelium.store import overgrowth_by_id
 
@@ -77,11 +81,12 @@ async def list_collections(request: Request) -> dict[str, Any]:
             """
             select c.*,
                    (select count(*) from collection_leaves l join images i on i.id = l.image_id
-                     where l.collection_id = c.id and i.status = 'live')::int as n
+                     where l.collection_id = c.id and l.book <> %s and i.status = 'live')::int as n
               from collections c
              where c.published
              order by c.id
-            """
+            """,
+            (LOOSE,),
         )
         rows = await cur.fetchall()
     return {"collections": [_head(r, r["n"]) for r in rows]}
@@ -93,9 +98,11 @@ async def collection(request: Request, slug: str) -> dict[str, Any]:
         c = await published(conn, slug)
         if c is None:
             raise _not_here()
+        # The books in order, then the loose leaves.
         cur = await conn.execute(
-            "select number, title from collection_books where collection_id = %s order by number",
-            (c["id"],),
+            "select number, title from collection_books where collection_id = %s"
+            " order by number = %s, number",
+            (c["id"], LOOSE),
         )
         books = await cur.fetchall()
         cur = await conn.execute(f"{_FILLED} order by l.book, l.position".encode(), (c["id"],))
@@ -115,16 +122,18 @@ async def collection(request: Request, slug: str) -> dict[str, Any]:
             }
         )
     return {
-        **_head(c, len(filled)),
+        **_head(c, sum(1 for r in filled if r["book"] != LOOSE)),
         "preamble": c["preamble"],
         # Owner text, stated as written: the gloss under the title, the catalogue record
         # as [label, value] pairs, and the dealer's description, quoted apart.
         "gloss": c["gloss"],
         "record": [list(p) for p in record_pairs(c["record"])],
         "vendor_text": c["vendor_text"],
+        # A row for the loose leaves only while there are any to show.
         "books": [
             {"number": b["number"], "title": b["title"], "leaves": by_book.get(b["number"], [])}
             for b in books
+            if b["number"] != LOOSE or by_book.get(LOOSE)
         ],
         # `{id, lines}` as /api/haiku has it, or null while no leaf has one.
         "haiku": None
@@ -149,9 +158,9 @@ async def book(request: Request, slug: str, number: int) -> dict[str, Any]:
         cur = await conn.execute(
             b"""
             select count(*)::int as n from collection_leaves l join images i on i.id = l.image_id
-             where l.collection_id = %s and i.status = 'live'
+             where l.collection_id = %s and l.book <> %s and i.status = 'live'
             """,
-            (c["id"],),
+            (c["id"], LOOSE),
         )
         total = (await cur.fetchone() or {"n": 0})["n"]
         cur = await conn.execute(
@@ -159,11 +168,20 @@ async def book(request: Request, slug: str, number: int) -> dict[str, Any]:
         )
         filled = await cur.fetchall()
         og = await overgrowth_by_id(conn, [r["id"] for r in filled])
-    # Every slot, empty ones as null, so the grid never closes up around a gap.
-    slots: list[dict[str, Any] | None] = [None] * int(c["leaves_per_book"])
-    for r, item in zip(filled, grid_items(filled, og), strict=True):
-        if r["position"] <= len(slots):
-            slots[r["position"] - 1] = {**item, "position": r["position"]}
+    items = [
+        {**item, "position": r["position"]}
+        for r, item in zip(filled, grid_items(filled, og), strict=True)
+    ]
+    slots: list[dict[str, Any] | None]
+    if number == LOOSE:
+        # No cap, so no frame of empty slots: the filled leaves in number order.
+        slots = list(items)
+    else:
+        # Every slot, empty ones as null, so the grid never closes up around a gap.
+        slots = [None] * int(c["leaves_per_book"])
+        for item in items:
+            if item["position"] <= len(slots):
+                slots[item["position"] - 1] = item
     return {
         "collection": _head(c, total),
         "number": b["number"],

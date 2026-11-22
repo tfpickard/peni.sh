@@ -8,10 +8,12 @@
 	// Only the filled slots, in leaf order. The leaf number stays on each one, so the
 	// book's shape is still there without anyone scrolling past the gaps.
 	const leaves = $derived(b ? b.slots.filter((s) => s !== null) : []);
+	// Book 0, the leaves in no book, has a title and no numeral.
+	const name = $derived(b ? (b.number === 0 ? (b.title ?? '') : roman(b.number)) : '');
 </script>
 
 <svelte:head>
-	<title>{b ? `${b.collection.abbrev} ${roman(b.number)}` : 'not here'} -- peni.sh</title>
+	<title>{b ? `${b.collection.abbrev} ${name}` : 'not here'} -- peni.sh</title>
 </svelte:head>
 
 {#if !b}
@@ -19,7 +21,11 @@
 {:else}
 	<PtpLogo size="medium" title={b.collection.title} href="/collections/{data.slug}" />
 	<p class="up"><a href="/collections/{data.slug}">{b.collection.title}</a></p>
-	<h1>book {roman(b.number)}{#if b.title}<span class="title">{b.title}</span>{/if}</h1>
+	{#if b.number === 0}
+		<h1>{name}</h1>
+	{:else}
+		<h1>book {name}{#if b.title}<span class="title">{b.title}</span>{/if}</h1>
+	{/if}
 	{#if leaves.length}
 		<div class="grid">
 			{#each leaves as s (s.position)}

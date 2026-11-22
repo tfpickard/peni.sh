@@ -43,10 +43,11 @@ def new_books() -> Books:
 
 
 def books(conn: psycopg.Connection[Any]) -> Books:
+    # The seven books; 028's row for the loose leaves is no book and has its own test.
     rows = conn.execute(
         "select b.number, b.anchor_text, b.tag_hints from collection_books b"
         " join collections c on c.id = b.collection_id where c.slug = 'pansophicon'"
-        " order by b.number"
+        " and b.number >= 1 order by b.number"
     ).fetchall()
     return {n: (t, h) for n, t, h in rows}
 
@@ -55,7 +56,7 @@ def vectors(conn: psycopg.Connection[Any]) -> dict[int, tuple[Any, Any, Any]]:
     rows = conn.execute(
         "select b.number, b.anchor_embedding is not null, b.anchor_model, b.anchor_dim"
         " from collection_books b join collections c on c.id = b.collection_id"
-        " where c.slug = 'pansophicon' order by b.number"
+        " where c.slug = 'pansophicon' and b.number >= 1 order by b.number"
     ).fetchall()
     return {n: (e, m, d) for n, e, m, d in rows}
 
@@ -246,3 +247,74 @@ def test_down_leaves_an_owner_anchor_k_alone(clean_db: str) -> None:
         conn.execute(section("up"))
         conn.execute(section("down"))
         assert anchor_k(conn) == {"anchor_k": 6}
+
+
+# -- 028: incertae sedis ---------------------------------------------------------------
+
+LOOSE_MIGRATION = MIGRATIONS / "028_incertae_sedis.sql"
+
+
+def loose_section(name: str) -> bytes:
+    text = LOOSE_MIGRATION.read_text()
+    m = re.search(rf"--\s*migrate:{name}(.*?)(?:--\s*migrate:\w+|\Z)", text, re.S)
+    assert m
+    return m.group(1).encode()
+
+
+def loose_rows(conn: psycopg.Connection[Any]) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        "select b.title, b.anchor_text, b.anchor_embedding is null, b.tag_hints"
+        " from collection_books b join collections c on c.id = b.collection_id"
+        " where c.slug = 'pansophicon' and b.number = 0"
+    ).fetchall()
+
+
+def test_incertae_sedis_is_book_0(clean_db: str) -> None:
+    with psycopg.connect(clean_db, autocommit=True) as conn:
+        assert loose_rows(conn) == [("incertae sedis", "", True, [])]
+        # Run again, it adds nothing and keeps the owner's title.
+        conn.execute("update collection_books set title = 'sine loco' where number = 0")
+        conn.execute(loose_section("up"))
+        conn.execute(loose_section("up"))
+        assert loose_rows(conn) == [("sine loco", "", True, [])]
+        # Only the Pansophicon has one.
+        conn.execute(
+            "insert into collections (slug, title, abbrev, abbrev_latin, book_count,"
+            " leaves_per_book) values ('other', 't', 'a', 'a', 7, 7)"
+        )
+        conn.execute(loose_section("up"))
+        assert conn.execute(
+            "select count(*) from collection_books where number = 0"
+        ).fetchone() == (1,)
+        cid = conn.execute("select id from collections where slug = 'other'").fetchone()[0]  # type: ignore[index]
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "insert into collection_books (collection_id, number) values (%s, -1)", (cid,)
+            )
+
+
+def test_incertae_sedis_down_keeps_membership(clean_db: str) -> None:
+    with psycopg.connect(clean_db, autocommit=True) as conn:
+        image_id = conn.execute(
+            "insert into images (sha256, status) values (%s, 'live') returning id", (f"{1:064x}",)
+        ).fetchone()[0]  # type: ignore[index]
+        cid = conn.execute("select id from collections where slug = 'pansophicon'").fetchone()[0]  # type: ignore[index]
+        conn.execute(
+            "insert into collection_leaves (image_id, collection_id, book, position)"
+            " values (%s, %s, 0, 4)",
+            (image_id, cid),
+        )
+        try:
+            conn.execute(loose_section("down"))
+            assert loose_rows(conn) == []
+            assert conn.execute("select count(*) from collection_leaves").fetchone() == (0,)
+            # Still the owner's pick, waiting for the filer.
+            assert conn.execute(
+                "select image_id, book, position from collection_requests"
+            ).fetchall() == [(image_id, None, None)]
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "insert into collection_books (collection_id, number) values (%s, 0)", (cid,)
+                )
+        finally:
+            conn.execute(loose_section("up"))

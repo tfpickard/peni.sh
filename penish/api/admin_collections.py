@@ -3,6 +3,9 @@ every leaf by position, owner moves and pins, unfiled requests, re-sorts, re-jud
 history.
 
 Every write answers with the whole collection, so the page just swaps it in.
+
+The loose leaves (book 0) come after the books as one more, with a title and leaves but no
+anchor, hints or anchor state: the filer never scores them.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from penish.api.admin import _gate, require_admin
 from penish.api.media import variants_for_many
 from penish.collection import store
 from penish.collection.judge import Judgement
+from penish.collection.numerals import LOOSE, book_name
 from penish.collection.plan import LIMITS, Tuning, tag_words
 from penish.config import get_settings
 
@@ -135,11 +139,12 @@ async def detail(conn: Any, c: dict[str, Any], leaf: str | None = None) -> dict[
         """
         select number, title, anchor_text, tag_hints, anchor_embedded_at,
                anchor_embedding is not null and anchor_model = %s and anchor_dim = %s as anchored
-          from collection_books where collection_id = %s order by number
+          from collection_books where collection_id = %s order by number = %s, number
         """,
-        (settings.embed_model, settings.embed_dim, c["id"]),
+        (settings.embed_model, settings.embed_dim, c["id"], LOOSE),
     )
     books = list(await cur.fetchall())
+    loose = next((b for b in books if b["number"] == LOOSE), None)
     cur = await conn.execute(
         "select exists (select 1 from jobs where type = %s and status in ('queued', 'running')"
         " and payload->>'collection_id' = %s) as waiting",
@@ -230,6 +235,8 @@ async def detail(conn: Any, c: dict[str, Any], leaf: str | None = None) -> dict[
         "notes_queued": noting,
         "book_count": c["book_count"],
         "leaves_per_book": c["leaves_per_book"],
+        # The loose leaves' title, what a picker offers beside the numerals; null with no row.
+        "loose_title": None if loose is None else book_name(LOOSE, loose["title"]),
         "published": c["published"],
         "tuning": Tuning.from_json(c["tuning"]).to_json(),
         "tuning_default": Tuning().to_json(),
@@ -243,7 +250,10 @@ async def detail(conn: Any, c: dict[str, Any], leaf: str | None = None) -> dict[
                 "anchor_text": b["anchor_text"],
                 "tag_hints": b["tag_hints"],
                 "anchored": bool(b["anchored"]),
-                "anchor_state": _anchor_state(bool(b["anchored"]), anchor_waiting),
+                # Null for the loose leaves, which have no anchor to embed.
+                "anchor_state": None
+                if b["number"] == LOOSE
+                else _anchor_state(bool(b["anchored"]), anchor_waiting),
                 # Null with a vector: embedded before the time was kept.
                 "anchor_embedded_at": _iso(b["anchor_embedded_at"]),
                 "hint_leaves": _hint_leaves(list(b["tag_hints"] or ()), leaf_tags),
@@ -295,10 +305,25 @@ async def _answer(request: Request, slug: str, leaf: str | None = None) -> dict[
 async def list_collections(request: Request) -> dict[str, Any]:
     async with request.app.state.pool.connection() as conn:
         cur = await conn.execute(
-            "select slug, title, abbrev, abbrev_latin, book_count, leaves_per_book, published"
-            " from collections order by id"
+            """
+            select c.slug, c.title, c.abbrev, c.abbrev_latin, c.book_count, c.leaves_per_book,
+                   c.published, b.number is not null as loose, b.title as loose_title
+              from collections c
+              left join collection_books b on b.collection_id = c.id and b.number = %s
+             order by c.id
+            """,
+            (LOOSE,),
         )
-        return {"collections": list(await cur.fetchall())}
+        rows = await cur.fetchall()
+    return {
+        "collections": [
+            {
+                **{k: v for k, v in r.items() if k not in ("loose", "loose_title")},
+                "loose_title": book_name(LOOSE, r["loose_title"]) if r["loose"] else None,
+            }
+            for r in rows
+        ]
+    }
 
 
 @router.get("/{slug}")
@@ -391,6 +416,13 @@ async def edit_book(request: Request, slug: str, number: int, body: BookEdit) ->
         b = await cur.fetchone()
         if b is None:
             raise _not_here()
+        if number == LOOSE:
+            # A title and nothing else: the filer never scores the loose leaves, and with no
+            # numeral the title is all that names them.
+            if (body.anchor_text or "").strip() or body.tag_hints:
+                raise HTTPException(status_code=422, detail="no anchor here")
+            if "title" in given and not (body.title or "").strip():
+                raise HTTPException(status_code=422, detail="a title is needed")
         if "title" in given:
             # Empty means untitled: the page then shows only the numeral.
             title = (body.title or "").strip() or None
@@ -428,7 +460,8 @@ async def edit_book(request: Request, slug: str, number: int, body: BookEdit) ->
 class Place(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    book: int | None = Field(None, ge=1)
+    # 0 is the loose leaves.
+    book: int | None = Field(None, ge=0)
     position: int | None = Field(None, ge=1)
 
 
@@ -735,15 +768,17 @@ async def for_picture(conn: Any, image_id: int) -> list[dict[str, Any]]:
     cur = await conn.execute(
         """
         select c.slug, c.title, c.abbrev_latin, c.book_count, c.leaves_per_book,
+               lb.number is not null as loose, lb.title as loose_title,
                l.book, l.position, l.pinned, l.book_pinned, l.note, l.note_source, l.note_model,
                r.book as req_book, r.position as req_position, r.error as req_error,
                r.image_id is not null as requested
           from collections c
+          left join collection_books lb on lb.collection_id = c.id and lb.number = %(loose)s
           left join collection_leaves l on l.collection_id = c.id and l.image_id = %(id)s
           left join collection_requests r on r.collection_id = c.id and r.image_id = %(id)s
          order by c.id
         """,
-        {"id": image_id},
+        {"id": image_id, "loose": LOOSE},
     )
     out = []
     for r in await cur.fetchall():
@@ -754,6 +789,7 @@ async def for_picture(conn: Any, image_id: int) -> list[dict[str, Any]]:
                 "abbrev_latin": r["abbrev_latin"],
                 "book_count": r["book_count"],
                 "leaves_per_book": r["leaves_per_book"],
+                "loose_title": book_name(LOOSE, r["loose_title"]) if r["loose"] else None,
                 "leaf": None
                 if r["book"] is None
                 else {

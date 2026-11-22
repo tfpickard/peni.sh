@@ -38,6 +38,8 @@ export type Summary = {
 	abbrev_latin: string;
 	book_count: number;
 	leaves_per_book: number;
+	// Book 0's title: the leaves in the collection and in no book. Null with no such row.
+	loose_title: string | null;
 	published: boolean;
 };
 export type Tuning = {
@@ -70,7 +72,8 @@ export type AdminBook = {
 	tag_hints: string[];
 	// Embedded under today's model.
 	anchored: boolean;
-	anchor_state: AnchorState;
+	// Null for book 0, which has no anchor.
+	anchor_state: AnchorState | null;
 	// Null with a vector: embedded before the time was kept.
 	anchor_embedded_at: string | null;
 	// Each hint with how many of the collection's leaves carry a tag it matches.
@@ -111,6 +114,7 @@ export type HistoryRow = {
 	chosen_by: 'score' | 'owner' | 'judge' | null;
 	at: string;
 };
+// The books in order, then book 0 (the loose leaves): a title and leaves, nothing to file by.
 export type Detail = Summary & {
 	id: number;
 	preamble: string;
@@ -195,7 +199,8 @@ export type Explain = {
 		position: number;
 		reason: string;
 		chosen_by: 'score' | 'owner' | 'judge' | null;
-		scores: (Partial<Weighing> & { judge?: JudgeSaid }) | null;
+		// `full`: the judge's book had no room, so the leaf went to book 0 instead.
+		scores: (Partial<Weighing> & { judge?: JudgeSaid; full?: number }) | null;
 	} | null;
 };
 

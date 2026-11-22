@@ -135,14 +135,20 @@ async def test_rejudge_plans_and_applies(
     assert isinstance(plan["plan_id"], str) and len(plan["plan_id"]) == 64
     by = {m["image_id"]: m for m in plan["moves"]}
     crossing = {i: m for i, m in by.items() if m["before"][0] != m["after"][0]}
-    assert {i: m["after"][0] for i, m in crossing.items()} == {ids["zodiac"]: 4, ids["bath"]: 7}
+    # Book iv takes the first; the chart, judged into iv with no room left, is not left in a
+    # book the judge said is not its own, and is loose instead.
+    assert {i: m["after"][0] for i, m in crossing.items()} == {
+        ids["zodiac"]: 4,
+        ids["bath"]: 7,
+        ids["chart"]: 0,
+    }
     z = crossing[ids["zodiac"]]
     assert (z["reason"], z["runner_up"]) == ("The zodiac belongs in iv.", 7)
     assert z["before"] == [1, 1] and z["thumb"] and z["slug"] == "img-1"
     # Anything else in the plan only shifts within its book, which no judge decided.
     assert all(m["reason"] is None for i, m in by.items() if i not in crossing)
     held = {h["image_id"]: (h["book"], h["why"]) for h in plan["held"]}
-    assert held == {ids["chart"]: (4, "full"), ids["refusing"]: (None, "refused")}
+    assert held == {ids["refusing"]: (None, "refused")}
     assert ids["pinned"] not in by and ids["pinned"] not in held
     assert sql(clean_db, "select count(*) from collection_leaf_history") == [(0,)]
     # The same state plans the same plan, and asks nobody again.
@@ -153,7 +159,7 @@ async def test_rejudge_plans_and_applies(
     got = places(clean_db)
     for m in plan["moves"]:
         assert got[m["image_id"]] == tuple(m["after"])
-    assert got[ids["pinned"]] == (2, 1) and got[ids["chart"]] == (5, 1)
+    assert got[ids["pinned"]] == (2, 1) and got[ids["chart"]] == (0, 1)
     hist = sql(
         clean_db,
         "select image_id, reason, chosen_by, scores from collection_leaf_history"
@@ -162,7 +168,9 @@ async def test_rejudge_plans_and_applies(
     assert [(i, why, by) for i, why, by, _ in hist] == [
         (ids["zodiac"], "resort", "judge"),
         (ids["bath"], "resort", "judge"),
+        (ids["chart"], "resort", "judge"),
     ]
+    assert hist[2][3]["judge"]["book"] == 4 and hist[2][3]["full"] == 4
     scores = hist[0][3]
     assert scores["judge"] == {
         "model": "claude-haiku-5-5",
@@ -170,8 +178,9 @@ async def test_rejudge_plans_and_applies(
         "runner_up": 7,
         "reason": "The zodiac belongs in iv.",
     }
-    # The weighing stays beside it: every book open to the leaf, the full v not among them.
-    assert [b["number"] for b in scores["books"]] == [1, 2, 3, 4, 6, 7]
+    # The weighing stays beside it: every book open to the leaf, which is every book once
+    # the chart is loose and v has room again.
+    assert [b["number"] for b in scores["books"]] == [1, 2, 3, 4, 5, 6, 7]
     # A leaf the judge agreed with has no history; nothing was pinned.
     assert sql(
         clean_db, "select count(*) from collection_leaf_history where image_id = %s", ids["beast"]
@@ -180,10 +189,56 @@ async def test_rejudge_plans_and_applies(
     # A re-sort by the scores leaves the judge's books where they are.
     r = await client.post(f"{ADM}/{SLUG}/resort", headers=XHR, json={"dry_run": True})
     for m in r.json()["moves"]:
-        if m["image_id"] in (ids["zodiac"], ids["bath"]):
+        if m["image_id"] in (ids["zodiac"], ids["bath"], ids["chart"]):
             assert m["before"][0] == m["after"][0]
     # Applied once; the same plan again is for a collection that is no longer there.
     assert (await apply(client, plan)).json() == {"detail": "changed"}
+
+
+async def test_rejudge_moves_leaves_into_and_out_of_the_loose_leaves(
+    client: httpx.AsyncClient, clean_db: str, pool: Any
+) -> None:
+    anchored(clean_db)
+    ids = {}
+    for n, (caption, book, pos) in enumerate(
+        [("lamp", 1, 1), ("zodiac", 0, 1), ("beast", 0, 2), ("held", 0, 3)], start=1
+    ):
+        ids[caption] = pictured(clean_db, n, caption, [0.0, 0.0, 0.0, 1.0])
+        leaf(clean_db, ids[caption], book, pos)
+    # The owner's loose leaf stays loose whatever the judge thinks.
+    sql(
+        clean_db, "update collection_leaves set book_pinned = true where image_id = %s", ids["held"]
+    )
+    answers = {"lamp": "none iii", "zodiac": "iv vii", "beast": "none i", "held": "i ii"}
+    assert (await dry(client)).status_code == 409
+    fake = await judging(pool, clean_db, answers)
+    assert sorted(fake.asked) == ["beast", "lamp", "zodiac"]
+    plan = (await dry(client)).json()
+    by = {m["image_id"]: (m["before"], m["after"], m["reason"]) for m in plan["moves"]}
+    # Out of book i into the loose leaves, at the number after the highest; out of them into
+    # book iv, leaving its number a gap. The one the judge left loose keeps its number.
+    assert by == {
+        ids["lamp"]: ([1, 1], [0, 4], "The lamp belongs in none."),
+        ids["zodiac"]: ([0, 1], [4, 1], "The zodiac belongs in iv."),
+    }
+    assert plan["held"] == []
+    assert (await apply(client, plan)).status_code == 200
+    got = places(clean_db)
+    assert got == {
+        ids["lamp"]: (0, 4),
+        ids["zodiac"]: (4, 1),
+        ids["beast"]: (0, 2),
+        ids["held"]: (0, 3),
+    }
+    hist = sql(
+        clean_db,
+        "select image_id, from_book, to_book, chosen_by from collection_leaf_history"
+        " order by image_id",
+    )
+    assert hist == [(ids["lamp"], 1, 0, "judge"), (ids["zodiac"], 0, 4, "judge")]
+    # A re-sort by the scores leaves the loose leaves where they are.
+    r = await client.post(f"{ADM}/{SLUG}/resort", headers=XHR, json={"dry_run": True})
+    assert all(m["image_id"] not in (ids["lamp"], ids["beast"]) for m in r.json()["moves"])
 
 
 async def test_rejudge_keeps_every_slot_a_leaf_already_holds(

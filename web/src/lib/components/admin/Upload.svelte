@@ -263,6 +263,7 @@
 					{#each Array.from({ length: chosen.book_count }, (_, i) => i + 1) as n (n)}
 						<option value={String(n)}>{roman(n)}</option>
 					{/each}
+					{#if chosen.loose_title !== null}<option value="0">{chosen.loose_title}</option>{/if}
 				</select>
 			</label>
 			<label class="field">
@@ -271,7 +272,7 @@
 					class="leaf"
 					type="number"
 					min="1"
-					max={chosen.leaves_per_book}
+					max={filing.book === '0' ? undefined : chosen.leaves_per_book}
 					placeholder="any"
 					bind:value={filing.leaf}
 					disabled={many || !filing.book}

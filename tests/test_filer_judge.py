@@ -14,6 +14,7 @@ import pytest
 from penish import runtime
 from penish.collection import judge, store
 from penish.collection.judge import Failed, Judgement, ShownBook, Texts
+from penish.collection.numerals import LOOSE
 from penish.config import Settings
 from penish.worker import collection_jobs
 from penish.worker.jobs import Job
@@ -102,6 +103,9 @@ def test_prompt_holds_the_rules() -> None:
         "names the subject",
         "never the medium",
         '{"book": "iv", "runner_up": "vii", "reason": "..."}',
+        'goes in none: the book is "none"',
+        "Choose none only then. A leaf that could go in two books goes in one of them.",
+        'or "none" as the book.',
     ):
         assert want in text, want
     assert "\u2014" not in text
@@ -120,14 +124,15 @@ def test_render_shows_the_books_and_the_three_texts() -> None:
         "Analysis:\nSubject: an old man whose limbs are labelled with the twelve signs.",
     ):
         assert want in text, want
-    assert "The leaf goes into one of them" in text
+    assert text.startswith("The books of the codex:\n")
     # Only the books given.
     assert "book ii" not in text and "book v\n" not in text
     # The books come before the leaf, so the leaf is read against them.
     assert text.index("book vii") < text.index("Caption:")
-    # The enum offers exactly the books given.
+    # The enum offers exactly the books given, and none as a book but never a runner-up.
     props = judge.schema(BOOKS)["properties"]
-    assert props["book"]["enum"] == ["i", "iv", "vii"] == props["runner_up"]["enum"]
+    assert props["book"]["enum"] == ["i", "iv", "vii", "none"]
+    assert props["runner_up"]["enum"] == ["i", "iv", "vii"]
 
 
 def test_a_missing_text_is_left_out() -> None:
@@ -142,6 +147,11 @@ def test_check_takes_a_good_answer() -> None:
     assert judge.check(
         {"book": "IV", "runner_up": "vii", "reason": "  A man the  signs govern. "}, BOOKS
     ) == (4, 7, "A man the signs govern.")
+
+
+def test_check_takes_none_as_the_loose_leaves() -> None:
+    raw = {"book": "none", "runner_up": "vii", "reason": "A lamp that lights itself."}
+    assert judge.check(raw, BOOKS) == (LOOSE, 7, "A lamp that lights itself.")
 
 
 def test_check_makes_an_em_dash_two_hyphens() -> None:
@@ -159,6 +169,9 @@ def test_check_makes_an_em_dash_two_hyphens() -> None:
         ({"book": "ii", "runner_up": "i", "reason": "x"}, "no book 2"),
         ({"book": "iv", "runner_up": "ii", "reason": "x"}, "no book 2"),
         ({"book": "iv", "runner_up": "iv", "reason": "x"}, "the same"),
+        # None is a book's answer, never a runner-up's: that is always the nearest book.
+        ({"book": "iv", "runner_up": "none", "reason": "x"}, "no book"),
+        ({"book": "none", "runner_up": "none", "reason": "x"}, "no book"),
         ({"book": "iv", "runner_up": "i", "reason": "   "}, "empty reason"),
         ({"book": "iv", "runner_up": "i", "reason": "a" * 201}, "201 characters"),
     ],
@@ -363,7 +376,9 @@ async def test_a_failed_judge_files_by_score(
     assert row["scores"]["best"] == 1
 
 
-async def test_a_book_that_fills_meanwhile_files_by_score(p: Any, settings: Settings) -> None:
+async def test_a_book_that_fills_meanwhile_leaves_the_leaf_loose(
+    p: Any, settings: Settings
+) -> None:
     await anchors(p, settings)
     await q(p, "update collections set leaves_per_book = 1 returning 1")
     a = await requested(p, settings, 1, e(0))
@@ -381,9 +396,11 @@ async def test_a_book_that_fills_meanwhile_files_by_score(p: Any, settings: Sett
     )
     async with p.connection() as conn:
         assert await store.file_request(conn, a, c["id"], settings, verdict) == "filed"
+    # Not into another book: the judge said it is not theirs. Loose, at the first number.
+    assert (await leaves(p))[a] == (0, 1, False, False)
     row = await filed_row(p, a)
-    assert (row["chosen_by"], row["to_book"]) == ("score", 1)
-    assert row["scores"]["judge"]["error"] == "full"
+    assert (row["chosen_by"], row["to_book"]) == ("judge", 0)
+    assert row["scores"]["judge"]["book"] == 4 and row["scores"]["full"] == 4
 
 
 async def test_judge_off_is_never_asked(p: Any, settings: Settings) -> None:
@@ -619,7 +636,7 @@ async def test_a_book_filling_leaves_every_question_alone(p: Any, settings: Sett
     assert await hashes() == before
 
 
-async def test_a_full_book_is_shown_and_its_judgement_falls_back(
+async def test_a_full_book_is_shown_and_its_judgement_goes_loose(
     p: Any, settings: Settings
 ) -> None:
     await anchors(p, settings)
@@ -638,15 +655,46 @@ async def test_a_full_book_is_shown_and_its_judgement_falls_back(
     await file_with(p, settings, a, client)
     told = client.calls[0]["messages"][0]["content"][0]["text"]
     assert "book iv" in told
+    # Never the loose leaves' row: they are no book to choose.
+    assert "incertae sedis" not in told and "book 0" not in told
+    assert (await leaves(p))[a][0] == 0
+    row = await filed_row(p, a)
+    assert (row["chosen_by"], row["to_book"]) == ("judge", 0)
+    assert row["scores"]["full"] == 4
+
+
+async def test_without_loose_leaves_a_full_judged_book_falls_back(
+    p: Any, settings: Settings
+) -> None:
+    """A collection with no place for loose leaves files as it always did."""
+    await anchors(p, settings)
+    await q(p, "update collections set leaves_per_book = 1 returning 1")
+    await q(p, "delete from collection_books where number = 0 returning 1")
+    c = await collection(p)
+    other = await picture(p, settings, 2, e(3))
+    await q(
+        p,
+        "insert into collection_leaves (image_id, collection_id, book, position)"
+        " values (%s, %s, 4, 1) returning 1",
+        other,
+        c["id"],
+    )
+    a = await requested(p, settings, 1, e(0))
+    await file_with(p, settings, a, FakeJudge(GOOD))
     assert (await leaves(p))[a][0] == 1
     row = await filed_row(p, a)
     assert (row["chosen_by"], row["to_book"]) == ("score", 1)
     assert row["scores"]["judge"]["error"] == "full"
 
 
-async def test_rejudging_holds_a_leaf_judged_into_a_full_book(p: Any, settings: Settings) -> None:
+@pytest.mark.parametrize("loose", [True, False])
+async def test_rejudging_a_leaf_judged_into_a_full_book(
+    p: Any, settings: Settings, loose: bool
+) -> None:
     await anchors(p, settings)
     await q(p, "update collections set leaves_per_book = 1 returning 1")
+    if not loose:
+        await q(p, "delete from collection_books where number = 0 returning 1")
     c = await collection(p)
     a = await picture(p, settings, 1, e(0))
     b = await picture(p, settings, 2, e(3))
@@ -674,8 +722,103 @@ async def test_rejudging_holds_a_leaf_judged_into_a_full_book(p: Any, settings: 
     assert all("book iv" in x["messages"][0]["content"][0]["text"] for x in client.calls)
     async with p.connection() as conn:
         plan = await store.judge_plan(conn, c, settings, runtime.getter(p, settings))
-    assert [(h.image_id, h.before, h.book, h.why) for h in plan.held] == [(a, (1, 1), 4, "full")]
-    assert all(m.image_id != a or m.after == (1, 1) for m in plan.moves)
+    if not loose:
+        held = [(h.image_id, h.before, h.book, h.why) for h in plan.held]
+        assert held == [(a, (1, 1), 4, "full")]
+        assert all(m.image_id != a or m.after == (1, 1) for m in plan.moves)
+        return
+    # The judge said it is not book i's; iv has no room, so it is loose.
+    assert plan.held == []
+    m = next(m for m in plan.moves if m.image_id == a)
+    assert (m.before, m.after, m.chosen_by) == ((1, 1), (0, 1), "judge")
+    assert m.scores is not None and m.scores["full"] == 4
+
+
+# -- the loose leaves ---------------------------------------------------------------------
+
+NONE = '{"book": "none", "runner_up": "vii", "reason": "A lamp that lights itself."}'
+
+
+async def test_the_judge_says_none_and_the_leaf_is_loose(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    a = await requested(p, settings, 1, e(0))
+    b = await requested(p, settings, 2, e(1))
+    await file_with(p, settings, a, FakeJudge(NONE))
+    await file_with(p, settings, b, FakeJudge(NONE))
+    # Loose in the order they came, never laid along a chain.
+    got = await leaves(p)
+    assert (got[a], got[b]) == ((0, 1, False, False), (0, 2, False, False))
+    row = await filed_row(p, a)
+    assert (row["chosen_by"], row["to_book"], row["to_position"]) == ("judge", 0, 1)
+    assert row["scores"]["judge"] == {
+        "model": "claude-haiku-5-5",
+        "book": 0,
+        "runner_up": 7,
+        "reason": "A lamp that lights itself.",
+    }
+    # The scores are kept as for any filing: the books only.
+    assert [x["number"] for x in row["scores"]["books"]] == [1, 2, 3, 4, 5, 6, 7]
+    kept = await q(p, "select book, runner_up from collection_judgements order by id")
+    assert kept == [{"book": 0, "runner_up": 7}, {"book": 0, "runner_up": 7}]
+
+
+async def test_every_book_full_files_loose_by_score(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    await runtime.put(p, "filer.judge", False)
+    await q(p, "update collections set leaves_per_book = 1 returning 1")
+    c = await collection(p)
+    for n in range(1, 8):
+        other = await picture(p, settings, 10 + n, e(n - 1))
+        await q(
+            p,
+            "insert into collection_leaves (image_id, collection_id, book, position)"
+            " values (%s, %s, %s, 1) returning 1",
+            other,
+            c["id"],
+            n,
+        )
+    a = await requested(p, settings, 1, e(0))
+    await file_with(p, settings, a, FakeJudge())
+    assert (await leaves(p))[a] == (0, 1, False, False)
+    row = await filed_row(p, a)
+    assert (row["chosen_by"], row["to_book"]) == ("score", 0)
+    async with p.connection() as conn:
+        assert await q(p, "select count(*)::int as n from collection_requests") == [{"n": 0}]
+        # Without a place for loose leaves it is refused, as it always was.
+        await conn.execute("delete from collection_leaves where book = 0")
+        await conn.execute("delete from collection_books where number = 0")
+        b = await requested(p, settings, 2, e(1))
+        assert await store.file_request(conn, b, c["id"], settings) == "every book is full"
+
+
+async def test_choose_takes_none_and_overflows(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    c = await collection(p)
+    async with p.connection() as conn:
+        state = await store.load(conn, c, settings)
+    assert state.loose_title == "incertae sedis"
+    assert [b.number for b in state.shape.books] == [1, 2, 3, 4, 5, 6, 7]
+    vec = np.asarray(e(0))
+    got = store.choose(state, 99, vec, frozenset(), None, Judgement(LOOSE, 7, "r", "m"))
+    assert (got.book, got.chosen_by) == (LOOSE, "judge")
+    # The owner may put a leaf there by hand.
+    got = store.choose(state, 99, vec, frozenset(), LOOSE, None)
+    assert (got.book, got.chosen_by) == (LOOSE, "owner")
+
+
+async def test_a_resort_never_moves_a_loose_leaf(p: Any, settings: Settings) -> None:
+    await anchors(p, settings)
+    c = await collection(p)
+    a = await requested(p, settings, 1, e(3))
+    await file_with(p, settings, a, FakeJudge(NONE))
+    # Two filed by score in book iv, where the loose leaf would score best too.
+    for n in (2, 3):
+        b = await requested(p, settings, n, e(3))
+        await file_with(p, settings, b, FakeJudge(REFUSE))
+    async with p.connection() as conn:
+        moves = await store.resort(conn, c, settings, dry_run=False)
+    assert all(m.image_id != a for m in moves)
+    assert (await leaves(p))[a] == (0, 1, False, False)
 
 
 # -- the guard against paying from a test ------------------------------------------------

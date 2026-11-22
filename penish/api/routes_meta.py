@@ -2,6 +2,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from penish.collection.numerals import LOOSE, book_name
 from penish.config import get_settings
 
 router = APIRouter()
@@ -51,7 +52,9 @@ async def haiku(request: Request) -> dict[str, Any]:
 # shifts it caused in its book.
 _CHANGED = """
     select c.slug as collection, c.abbrev, c.abbrev_latin, i.slug, h.to_book, h.to_position,
-           h.from_book, h.from_position
+           h.from_book, h.from_position,
+           (select b.title from collection_books b
+             where b.collection_id = c.id and b.number = %s) as loose_title
       from collection_leaf_history h
       join collections c on c.id = h.collection_id and c.published
       join collection_leaves l on l.image_id = h.image_id and l.collection_id = h.collection_id
@@ -66,9 +69,9 @@ _CHANGED = """
 
 
 async def collection_change(conn: Any) -> dict[str, Any] | None:
-    """`{collection: {slug, abbrev, abbrev_latin}, book, position, slug, from}`, `from`
-    being the leaf's place before (null for a filing), or None for a quiet week."""
-    cur = await conn.execute(_CHANGED)
+    """`{collection: {slug, abbrev, abbrev_latin, loose_title}, book, position, slug, from}`,
+    `from` being the leaf's place before (null for a filing), or None for a quiet week."""
+    cur = await conn.execute(_CHANGED, (LOOSE,))
     r = await cur.fetchone()
     if r is None:
         return None
@@ -77,6 +80,7 @@ async def collection_change(conn: Any) -> dict[str, Any] | None:
             "slug": r["collection"],
             "abbrev": r["abbrev"],
             "abbrev_latin": r["abbrev_latin"],
+            "loose_title": book_name(LOOSE, r["loose_title"]),
         },
         "book": r["to_book"],
         "position": r["to_position"],

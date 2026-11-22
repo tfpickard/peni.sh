@@ -55,7 +55,12 @@
 		{#each c.books as b (b.number)}
 			<li>
 				<a class="label" href="/collections/{c.slug}/{b.number}">
-					book {roman(b.number)}{#if b.title}<span class="title">{b.title}</span>{/if}
+					{#if b.number === 0}
+						<!-- Book 0 is in no book: no numeral, only its title. -->
+						<span class="title">{b.title}</span>
+					{:else}
+						book {roman(b.number)}{#if b.title}<span class="title">{b.title}</span>{/if}
+					{/if}
 					<span>{count(b.leaves.length)}</span>
 				</a>
 				<!-- Only the leaves that survive, in leaf order; the gaps between them are not drawn. -->

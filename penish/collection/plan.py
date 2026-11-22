@@ -7,6 +7,10 @@ A book's centroid blends its written anchor with its real leaves. An empty book 
 anchor; as it fills the leaves take over and the book becomes whatever its pictures are.
 Within a book, leaves sit on a nearest-neighbor chain stretched across the slots, so
 related leaves are adjacent and the gaps fall where the subject jumps.
+
+The loose leaves (book LOOSE) are in no book. `Shape.books` never holds them, so nothing
+scores them, they fill nothing, a re-sort neither takes a leaf there nor out, and their
+numbers run in the order the leaves came rather than along a chain.
 """
 
 from __future__ import annotations
@@ -17,6 +21,8 @@ from dataclasses import dataclass, field, fields
 from typing import Any
 
 import numpy as np
+
+from penish.collection.numerals import LOOSE
 
 # Two of the same picture are distance 0; an unknown pair is treated as unrelated.
 _UNKNOWN = 1.0
@@ -94,6 +100,7 @@ class Book:
 
 @dataclass
 class Shape:
+    # The books proper, never LOOSE.
     books: list[Book]
     cap: int
     tuning: Tuning = field(default_factory=Tuning)
@@ -216,6 +223,9 @@ class _Tally:
             self.add(leaf, where[leaf.image_id])
 
     def add(self, leaf: Leaf, book: int, sign: int = 1) -> None:
+        if book not in self.occupied:
+            # A loose leaf: it pulls no book's centroid and fills none.
+            return
         self.occupied[book] += sign
         if leaf.vec is not None:
             s = self.sums[book]
@@ -312,7 +322,8 @@ def weigh_leaves(
 ) -> dict[int, Weighing | None]:
     """Each leaf as a re-sort sees it: everyone else in their book (`where`, or where they
     are now), and the leaf taken out of its own, so staying put earns no self-similarity.
-    None for a leaf with no vector. `only` limits which leaves are weighed."""
+    None for a leaf with no vector, or with no book open to it. `only` limits which leaves
+    are weighed."""
     where = where if where is not None else {x.image_id: x.book for x in leaves}
     want = set(only) if only is not None else None
     tally = _Tally(shape, leaves, where)
@@ -329,7 +340,9 @@ def weigh_leaves(
         open_ = [
             b.number for b in shape.books if b.number == own or tally.occupied[b.number] < shape.cap
         ]
-        out[x.image_id] = _weighing(tally.terms(shape, x.vec, x.tags, open_))
+        # A leaf in book 0 has no book of its own to stay in, so when every book is full
+        # there is nothing to weigh it against.
+        out[x.image_id] = _weighing(tally.terms(shape, x.vec, x.tags, open_)) if open_ else None
         tally.add(x, own)
     return out
 
@@ -357,7 +370,8 @@ def assign_books(shape: Shape, leaves: list[Leaf]) -> dict[int, int]:
     nothing, so the result is a fixed point and an immediate second re-sort moves nothing
     either. A leaf changes book only when it beats its own book by the margin; without
     that, near-ties would flap on every run. A judged leaf keeps its book: the scores are
-    what the judge was asked to overrule.
+    what the judge was asked to overrule. A loose leaf stays loose: only the owner and the
+    judge put a leaf there or take it out.
     """
     where = {leaf.image_id: leaf.book for leaf in leaves}
     tally = _Tally(shape, leaves, where)
@@ -365,7 +379,10 @@ def assign_books(shape: Shape, leaves: list[Leaf]) -> dict[int, int]:
         (
             leaf
             for leaf in leaves
-            if not leaf.book_pinned and not leaf.judged and leaf.vec is not None
+            if not leaf.book_pinned
+            and not leaf.judged
+            and leaf.vec is not None
+            and leaf.book != LOOSE
         ),
         key=lambda x: x.image_id,
     )
@@ -557,6 +574,27 @@ def positions(book: Book, leaves: list[Leaf], cap: int) -> dict[int, int]:
     return out
 
 
+def accession(leaves: list[Leaf]) -> dict[int, int]:
+    """Numbers for the loose leaves, which have no cap and no chain. A leaf already there
+    keeps its number, and leaving one leaves its gap. An owner's pin takes the number it
+    names, and a leaf the filer put there goes to the end to make room. Every other arrival
+    takes the next number after the highest, in image id order."""
+    out: dict[int, int] = {}
+    rest: list[Leaf] = []
+    for leaf in sorted(leaves, key=lambda x: (not x.pinned, x.image_id)):
+        if leaf.position >= 1 and leaf.position not in out.values():
+            out[leaf.image_id] = leaf.position
+        elif leaf.pinned:
+            raise ValueError(f"pinned leaf {leaf.image_id} has no slot {leaf.position}")
+        else:
+            rest.append(leaf)
+    last = max(out.values(), default=0)
+    for leaf in sorted(rest, key=lambda x: x.image_id):
+        last += 1
+        out[leaf.image_id] = last
+    return out
+
+
 # -- whole plans -------------------------------------------------------------------
 
 
@@ -574,7 +612,8 @@ def lay_books(
     """Positions for the named books, and for any book a leaf moves into, given each
     leaf's book. Every other leaf keeps its place; a book a leaf left keeps its gap.
     `settled`: a leaf already in the book keeps its slot too, and an arrival takes a free
-    one, chosen among the free slots as the filer would choose."""
+    one, chosen among the free slots as the filer would choose. The loose leaves are never
+    laid: an arrival there takes the next number (accession)."""
     redo = set(books) | {where[x.image_id] for x in leaves if where[x.image_id] != x.book}
     out: Placement = {
         x.image_id: (x.book, x.position) for x in leaves if where[x.image_id] not in redo
@@ -597,7 +636,12 @@ def lay_books(
             for x in leaves
             if where[x.image_id] == number
         ]
-        for image_id, pos in positions(shape.book(number), members, shape.cap).items():
+        laid = (
+            accession(members)
+            if number == LOOSE
+            else positions(shape.book(number), members, shape.cap)
+        )
+        for image_id, pos in laid.items():
             out[image_id] = (number, pos)
     return out
 

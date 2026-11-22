@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from penish.api.media import variants_for, variants_for_many
 from penish.api.social import approved_comments, vote_summary, voter_for
 from penish.categories import LABELS, SLUGS
+from penish.collection.numerals import LOOSE, book_name
 from penish.collection.store import leaf_for_image
 from penish.config import get_settings
 from penish.mycelium.store import galleries_for_image, hyphae_for, overgrowth_by_id
@@ -45,7 +46,7 @@ def grid_items(rows: list[dict[str, Any]], overgrowth: Mapping[int, float]) -> l
 
 async def leaf_refs(conn: Any, image_ids: list[int]) -> dict[int, dict[str, Any]]:
     """The leaf line for each of `image_ids` that is a live leaf of a published collection,
-    in one query: `{collection: {slug, abbrev, abbrev_latin}, book, position}`.
+    in one query: `{collection: {slug, abbrev, abbrev_latin, loose_title}, book, position}`.
 
     Strips and covers name only where a leaf is now; its earlier places are for its own page.
     """
@@ -54,14 +55,15 @@ async def leaf_refs(conn: Any, image_ids: list[int]) -> dict[int, dict[str, Any]
     cur = await conn.execute(
         """
         select distinct on (l.image_id) l.image_id, c.slug, c.abbrev, c.abbrev_latin,
-               l.book, l.position
+               l.book, l.position, b.title as loose_title
           from collection_leaves l
+          left join collection_books b on b.collection_id = l.collection_id and b.number = %s
           join collections c on c.id = l.collection_id and c.published
           join images i on i.id = l.image_id
          where l.image_id = any(%s) and i.status = 'live' and i.published_at is not null
          order by l.image_id, c.id
         """,
-        (list(image_ids),),
+        (LOOSE, list(image_ids)),
     )
     return {
         r["image_id"]: {
@@ -69,6 +71,7 @@ async def leaf_refs(conn: Any, image_ids: list[int]) -> dict[int, dict[str, Any]
                 "slug": r["slug"],
                 "abbrev": r["abbrev"],
                 "abbrev_latin": r["abbrev_latin"],
+                "loose_title": book_name(LOOSE, r["loose_title"]),
             },
             "book": r["book"],
             "position": r["position"],

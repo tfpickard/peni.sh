@@ -292,6 +292,34 @@ async def test_job_reads_the_record_and_the_books_notes(p: Any, settings: Settin
     assert "Panel, gesso ground." not in told["text"]
 
 
+def test_facts_for_a_leaf_in_no_book() -> None:
+    def ctx(book: int, previous: tuple[int, int] | None, notes: list[tuple[int, str]]) -> Any:
+        return store.NoteContext(
+            sha256="",
+            crop=None,
+            record=[],
+            book=book,
+            position=4,
+            leaves_per_book=77,
+            loose_title="incertae sedis",
+            note=None,
+            note_source=None,
+            previous=previous,
+            book_notes=notes,
+        )
+
+    told = facts(ctx(0, (3, 14), [(1, "Paper, machine-ruled.")]))
+    assert "This leaf: in no book (incertae sedis), leaf 4." in told
+    assert "Earlier place in the sequence: book iii, leaf 14." in told
+    assert "Notes already written for other leaves of incertae sedis:" in told
+    assert "of 77" not in told
+    told = facts(ctx(3, (0, 2), []))
+    assert "This leaf: book iii, leaf 4 of 77." in told
+    assert "Earlier place in the sequence: in no book (incertae sedis), leaf 2." in told
+    assert "No other leaf of book iii has a note yet." in told
+    assert "No other leaf of incertae sedis has a note yet." in facts(ctx(0, None, []))
+
+
 async def test_unfiled_leaf_is_a_quiet_no_op(p: Any, settings: Settings) -> None:
     c = await collection(p)
     w = Writer()

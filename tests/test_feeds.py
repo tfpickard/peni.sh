@@ -126,6 +126,31 @@ async def test_sitemap_collection_and_its_books(client: httpx.AsyncClient, clean
     assert not book["http://t/collections/pansophicon/4"]
 
 
+async def test_sitemap_lists_the_loose_leaves_only_with_a_leaf(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    _publish(clean_db)
+    loose = "http://t/collections/pansophicon/0"
+    assert loose not in await sitemap(client)
+    _leaf(clean_db, _pic(clean_db, 1, caption="a loose leaf"), 0, 4)
+    urls = await sitemap(client)
+    assert urls[loose].find(f"{SM}lastmod") is not None
+    # After the books, as the collection page has it.
+    mine = [u for u in urls if "/collections/pansophicon/" in u]
+    assert mine[-1] == loose and len(mine) == 8
+
+
+async def test_feed_names_a_loose_leaf_by_its_title(
+    client: httpx.AsyncClient, clean_db: str
+) -> None:
+    _publish(clean_db)
+    one = _pic(clean_db, 1, caption="a lamp", description="It lights itself.")
+    _leaf(clean_db, one, 0, 4)
+    history(clean_db, one, 0, 4, BASE + timedelta(minutes=10))
+    got = entries(await feed(client))
+    assert got[0].findtext(f"{AT}summary") == "ptp incertae sedis, leaf 4\nIt lights itself."
+
+
 async def feed(client: httpx.AsyncClient) -> ET.Element:
     r = await client.get("/feed.xml")
     assert r.status_code == 200

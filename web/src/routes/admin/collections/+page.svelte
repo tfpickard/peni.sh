@@ -426,19 +426,24 @@
 		return () => clearInterval(t);
 	});
 
+	// Book 0 holds the leaves in no book; it is named by its title, never a numeral.
+	const bk = (n: number) => (n === 0 ? (d?.loose_title ?? '') : roman(n));
 	const place = (b: number | null, p: number | null) =>
-		b === null ? '' : p === null ? roman(b) : `${roman(b)} ${p}`;
+		b === null ? '' : p === null ? bk(b) : `${bk(b)} ${p}`;
+	// Every slot of a book, empty ones null, for a pin or move to go to. Book 0 has no cap,
+	// so it draws only its leaves, each labelled with its number.
 	const cells = (b: cols.AdminBook) => {
+		if (b.number === 0) return b.leaves;
 		const out: (cols.AdminLeaf | null)[] = Array(d?.leaves_per_book ?? 0).fill(null);
 		for (const l of b.leaves) out[l.position - 1] = l;
 		return out;
 	};
-	const pair = (x: [number, number] | null) => (x ? `${roman(x[0])} ${x[1]}` : '');
+	const pair = (x: [number, number] | null) => (x ? `${bk(x[0])} ${x[1]}` : '');
 	const when = (s: string) => s.replace('T', ' ').slice(0, 16);
 	// Rounded to three places, where a tiny negative fill would otherwise read -0.000.
 	const n3 = (x: number | null | undefined) =>
 		x === null || x === undefined ? '' : Math.abs(x) < 0.0005 ? '0.000' : x.toFixed(3);
-	const rom = (n: number | null | undefined) => (n === null || n === undefined ? '' : roman(n));
+	const rom = (n: number | null | undefined) => (n === null || n === undefined ? '' : bk(n));
 	// A judged decision reads as the judge's whatever the row's reason, which is the action
 	// that wrote it (a filing is `auto`, re-judging writes `resort`).
 	const kind = (h: cols.HistoryRow) => (h.chosen_by === 'judge' ? 'judge' : h.reason);
@@ -738,15 +743,21 @@
 	{#each d.books as b (b.number)}
 		<section class="book">
 			<h2>
-				book {roman(b.number)}
-				<span class="dim">{b.leaves.length} of {d.leaves_per_book}</span>
-				{#if !b.anchor_text}
-					<span class="dim">no anchor</span>
+				{#if b.number === 0}
+					<!-- Book 0, the leaves in no book: a title, no cap, and no anchor to file by. -->
+					{b.title}
+					<span class="dim">{b.leaves.length} {b.leaves.length === 1 ? 'leaf' : 'leaves'}</span>
 				{:else}
-					<span class:dim={b.anchor_state !== 'stale'} class:hot={b.anchor_state === 'stale'}>
-						{b.anchor_state}
-					</span>
-					{#if b.anchor_embedded_at}<span class="dim">{when(b.anchor_embedded_at)}</span>{/if}
+					book {roman(b.number)}
+					<span class="dim">{b.leaves.length} of {d.leaves_per_book}</span>
+					{#if !b.anchor_text}
+						<span class="dim">no anchor</span>
+					{:else}
+						<span class:dim={b.anchor_state !== 'stale'} class:hot={b.anchor_state === 'stale'}>
+							{b.anchor_state}
+						</span>
+						{#if b.anchor_embedded_at}<span class="dim">{when(b.anchor_embedded_at)}</span>{/if}
+					{/if}
 				{/if}
 			</h2>
 			{#if books[b.number]}
@@ -754,31 +765,33 @@
 					<span class="l">title {@render mark('public')}</span>
 					<input bind:value={books[b.number].title} />
 				</label>
-				<label>
-					<span class="l">anchor {@render mark('filing only')}</span>
-					<Grow min={3} bind:value={books[b.number].anchor_text} />
-				</label>
-				<div class="hints">
-					<span class="l">tag hints {@render mark('filing only')}</span>
-					<div class="chips">
-						{#each books[b.number].tag_hints as h (h)}
-							{@const n = b.hint_leaves[h]}
-							<span class="chip" class:dead={n === 0}>
-								{h}
-								{#if n !== undefined}<span class="count">{n}</span>{/if}
-								<button class="x" aria-label="remove {h}" onclick={() => dropHint(b.number, h)}>x</button>
-							</span>
-						{/each}
-						<input
-							class="add"
-							placeholder="add"
-							aria-label="add tag hint to book {roman(b.number)}"
-							bind:value={books[b.number].adding}
-							onkeydown={(e) => hintKey(e, b.number)}
-							onblur={() => addHints(b.number)}
-						/>
+				{#if b.number !== 0}
+					<label>
+						<span class="l">anchor {@render mark('filing only')}</span>
+						<Grow min={3} bind:value={books[b.number].anchor_text} />
+					</label>
+					<div class="hints">
+						<span class="l">tag hints {@render mark('filing only')}</span>
+						<div class="chips">
+							{#each books[b.number].tag_hints as h (h)}
+								{@const n = b.hint_leaves[h]}
+								<span class="chip" class:dead={n === 0}>
+									{h}
+									{#if n !== undefined}<span class="count">{n}</span>{/if}
+									<button class="x" aria-label="remove {h}" onclick={() => dropHint(b.number, h)}>x</button>
+								</span>
+							{/each}
+							<input
+								class="add"
+								placeholder="add"
+								aria-label="add tag hint to book {roman(b.number)}"
+								bind:value={books[b.number].adding}
+								onkeydown={(e) => hintKey(e, b.number)}
+								onblur={() => addHints(b.number)}
+							/>
+						</div>
 					</div>
-				</div>
+				{/if}
 				<div class="row">
 					<button disabled={!dirty.has(dr.bookKey(b.number)) || saving} onclick={() => saveOne(dr.bookKey(b.number))}
 						>save</button
@@ -793,8 +806,8 @@
 							class="cell"
 							class:sel={picked?.leaf.image_id === l.image_id}
 							class:pin={l.pinned}
-							title="{i + 1} {l.slug ?? ''}"
-							aria-label="leaf {i + 1} {l.slug ?? ''}"
+							title="{l.position} {l.slug ?? ''}"
+							aria-label="leaf {l.position} {l.slug ?? ''}"
 							onclick={() => pick(b.number, l)}
 						>
 							{#if l.thumb}<img src={l.thumb} alt="" loading="lazy" />{/if}
@@ -822,12 +835,13 @@
 							{#each Array.from({ length: d.book_count }, (_, k) => k + 1) as n (n)}
 								<option value={String(n)}>{roman(n)}</option>
 							{/each}
+							{#if d.loose_title !== null}<option value="0">{d.loose_title}</option>{/if}
 						</select>
 						<input
 							class="num"
 							type="number"
 							min="1"
-							max={d.leaves_per_book}
+							max={moveBook === '0' ? undefined : d.leaves_per_book}
 							placeholder="leaf"
 							aria-label="leaf"
 							bind:value={moveLeaf}
@@ -881,6 +895,7 @@
 									>{x.filed.chosen_by ? `by ${x.filed.chosen_by}` : x.filed.reason}</span
 								>
 								{#if x.filed.scores?.judge}<span class="dim">{said(x.filed.scores.judge)}</span>{/if}
+								{#if x.filed.scores?.full}<span class="dim">{rom(x.filed.scores.full)} full</span>{/if}
 								{#if x.judged && x.filed.chosen_by !== 'judge'}<span class="dim">judge since</span>{/if}
 							</div>
 							{#if x.filed.scores?.judge?.reason}<p class="why">{x.filed.scores.judge.reason}</p>{/if}

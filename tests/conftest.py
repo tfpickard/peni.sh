@@ -20,12 +20,14 @@ from penish.db import make_pool
 
 MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
 _UP = re.compile(r"--\s*migrate:up(.*?)(?:--\s*migrate:down|\Z)", re.S)
-# Re-applied after every test, in order: the collection, its owner text, then the rewrite
-# of its books. Without the last, a test would start from the books 018 first wrote.
+# Re-applied after every test, in order: the collection, its owner text, the rewrite of its
+# books, then the row for its loose leaves (book 0). Without the rewrite, a test would start
+# from the books 018 first wrote.
 COLLECTION_SEEDS = (
     MIGRATIONS / "018_seed_pansophicon.sql",
     MIGRATIONS / "020_seed_pansophicon_text.sql",
     MIGRATIONS / "023_pansophicon_of_man.sql",
+    MIGRATIONS / "028_incertae_sedis.sql",
 )
 
 
